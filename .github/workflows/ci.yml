@@ -1,0 +1,93 @@
+# =============================================================================
+#  .github/workflows/ci.yml
+#  Continuous Integration pipeline for the 4-Axis SCARA Robot Control System.
+#
+#  Runs on every push and pull-request to main / develop:
+#    1. black  – code formatting check
+#    2. ruff   – linting (PEP 8, import order, unused imports, etc.)
+#    3. pytest – unit tests (mocked hardware, headless)
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main", "develop"]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Python setup ────────────────────────────────────────────────────────
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      # ── Minimal CI dependencies (no GPU / hardware drivers required) ────────
+      - name: Install CI dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install only the packages needed for lint + tests.
+          # Hardware SDKs (snap7, ultralytics/torch) are replaced by mocks,
+          # so we install lightweight stubs to satisfy imports.
+          pip install \
+            black==24.10.0 \
+            ruff==0.8.4 \
+            pyyaml==6.0.2 \
+            numpy==1.26.4 \
+            pillow==11.0.0 \
+            pytest==8.3.4 \
+            pytest-cov==6.0.0 \
+            opencv-python-headless==4.10.0.84
+
+          # Install mock-friendly stubs for hardware packages
+          pip install python-snap7==1.4 || true
+
+      # ── Black – formatting check ─────────────────────────────────────────────
+      - name: Check code formatting (black)
+        run: |
+          black --check --diff src/ main.py tests/
+
+      # ── Ruff – linting ───────────────────────────────────────────────────────
+      - name: Lint with ruff
+        run: |
+          ruff check src/ main.py tests/
+
+      # ── Pytest – unit tests ──────────────────────────────────────────────────
+      - name: Run unit tests
+        env:
+          # Prevent any X11/display errors in headless CI
+          DISPLAY: ""
+          # Prevent ultralytics telemetry
+          YOLO_TELEMETRY: "False"
+        run: |
+          pytest tests/ \
+            --tb=short \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-fail-under=80 \
+            -v
+
+      # ── Upload coverage report ───────────────────────────────────────────────
+      - name: Upload coverage report
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: .coverage
+          retention-days: 7

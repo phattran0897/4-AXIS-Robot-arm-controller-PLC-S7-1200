@@ -1,0 +1,79 @@
+# =============================================================================
+#  config.yaml – Central configuration for the 4-Axis SCARA Robot System
+#  Edit this file to adapt settings without touching source code.
+# =============================================================================
+
+# ── PLC / Siemens S7-1200 ────────────────────────────────────────────────────
+plc:
+  ip: "192.168.0.1"
+  rack: 0
+  slot: 1
+  db_number: 10
+
+  # Byte offsets inside the Data Block
+  offsets:
+    cmd_word: 0
+    status: 2
+    j1_target: 4
+    j2_target: 8
+    j3_target: 12
+    j4_target: 16
+    motion_done_byte: 20
+    motion_done_bit: 0
+    error_flag_byte: 20
+    error_flag_bit: 1
+
+  # PLC command word values
+  commands:
+    idle: 0
+    home: 1
+    move: 2
+    stop: 3
+
+# ── YOLO / AI Vision ─────────────────────────────────────────────────────────
+yolo:
+  model_path: "my_model/my_model.pt"
+  thresh: 0.70
+
+  # Pixel → millimetre scale factor (calibrate per camera/lens/mounting height)
+  px2mm: 0.50
+
+  # Robot home position in mm (centre of workspace)
+  home_x: 200.0
+  home_y: 0.0
+
+# ── Camera ───────────────────────────────────────────────────────────────────
+camera:
+  default_index: 0
+
+  # Display resolution inside the GUI label (px)
+  display_width: 440
+  display_height: 310
+
+  # Approximate target frame-rate for the AI processing loop
+  fps: 30
+
+  # YOLO inference resolution – smaller = faster inference, larger = more accurate
+  inference_width: 640
+  inference_height: 480
+
+  # Camera read timeout in seconds (watchdog prevents indefinite blocking)
+  read_timeout: 2.0
+
+# ── Kinematics (2-DOF planar IK, arm lengths in mm) ─────────────────────────
+kinematics:
+  l1: 200.0   # Link-1 length
+  l2: 150.0   # Link-2 length
+
+# ── Application / GUI ────────────────────────────────────────────────────────
+app:
+  title: "4-AXIS ROBOT CONTROL SYSTEM"
+  geometry: "1150x700"
+  appearance_mode: "dark"       # "dark" | "light" | "system"
+  color_theme: "blue"
+
+  # Background cyclic PLC polling rate (seconds)
+  plc_poll_interval: 0.10
+
+  # Minimum delay (seconds) after a MOVE command before re-triggering
+  move_cooldown: 1.50
