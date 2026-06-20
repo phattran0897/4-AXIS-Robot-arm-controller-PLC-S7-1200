@@ -15,6 +15,20 @@ from typing import TYPE_CHECKING, Any
 import customtkinter as ctk
 from PIL import ImageTk
 
+from src.ui.theme import (
+    ACCENT,
+    ACCENT_DARK,
+    PANEL_BG,
+    PANEL_BORDER,
+    SUCCESS,
+    WARNING,
+    DANGER,
+    TEXT_PRIMARY,
+    TEXT_SECONDARY,
+    CARD_BG,
+    HEADER_BG,
+)
+
 if TYPE_CHECKING:
     from main import RobotApp
 
@@ -42,9 +56,9 @@ class BasePage(ctk.CTkFrame):
         self,
         parent: ctk.CTkFrame,
         controller: "RobotApp",
-        page_color: str = "#1F6AA5",
+        page_color: str = "#00D4FF",
     ) -> None:
-        super().__init__(parent)
+        super().__init__(parent, fg_color="#0F172A")
         self.controller: "RobotApp" = controller
         self.page_color: str = page_color
 
@@ -110,49 +124,83 @@ class BasePage(ctk.CTkFrame):
         title_color:
             Hex colour string for the selector label.
         """
-        frame = ctk.CTkFrame(parent)
-        frame.grid(row=0, column=column, padx=10, pady=10, sticky="nsew")
-        self.video_label = self.build_camera_selector(frame, title_color)
+        frame = self._create_card(parent)
+        frame.grid(row=0, column=column, padx=8, pady=8, sticky="nsew")
 
-    def build_camera_selector(
-        self,
-        parent_frame: ctk.CTkFrame,
-        title_color: str,
-    ) -> ctk.CTkLabel:
-        """
-        Create the camera-source combo-box row and attach the video label.
+        # Section header
+        header = ctk.CTkFrame(frame, fg_color="transparent")
+        header.pack(fill="x", padx=15, pady=(12, 8))
 
-        Returns the :class:`ctk.CTkLabel` used to display live video.
-        """
-        top = ctk.CTkFrame(parent_frame, fg_color="transparent")
-        top.pack(fill="x", padx=10, pady=5)
+        icon_label = ctk.CTkLabel(
+            header,
+            text="📷",
+            font=ctk.CTkFont(size=18),
+            text_color=title_color,
+        )
+        icon_label.pack(side="left", padx=(0, 8))
 
         ctk.CTkLabel(
-            top,
-            text="Camera Source:",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            header,
+            text="AI VISION",
+            font=ctk.CTkFont(size=14, weight="bold"),
             text_color=title_color,
-        ).pack(side="left", padx=5)
+        ).pack(side="left")
+
+        # Camera selector
+        selector_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        selector_frame.pack(fill="x", padx=15, pady=(0, 8))
+
+        ctk.CTkLabel(
+            selector_frame,
+            text="Source:",
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_SECONDARY,
+        ).pack(side="left")
 
         cam_selector = ctk.CTkComboBox(
-            top,
-            values=["Camera 0 (Default)", "Camera 1 (External)", "Camera 2 (Aux)"],
+            selector_frame,
+            values=["Camera 0", "Camera 1", "Camera 2"],
             command=self.controller.change_camera_source,
-            width=200,
+            width=140,
+            fg_color=PANEL_BG,
+            text_color=TEXT_PRIMARY,
+            button_color=title_color,
+            button_hover_color=title_color,
+            dropdown_fg_color=PANEL_BG,
+            dropdown_text_color=TEXT_PRIMARY,
         )
-        cam_selector.pack(side="right", padx=5)
-        cam_selector.set("Camera 0 (Default)")
+        cam_selector.pack(side="right")
+        cam_selector.set("Camera 0")
 
-        video_label = ctk.CTkLabel(
-            parent_frame,
-            text="Scanning via YOLOv11…",
+        # Video label with modern styling
+        video_container = ctk.CTkFrame(
+            frame,
             fg_color="black",
-            width=440,
-            height=310,
+            corner_radius=8,
+            border_color=PANEL_BORDER,
+            border_width=1,
         )
-        video_label.pack(padx=10, pady=5, expand=True, fill="both")
+        video_container.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        return video_label
+        self.video_label = ctk.CTkLabel(
+            video_container,
+            text="🎥  Initializing AI Vision...",
+            fg_color="black",
+            text_color=TEXT_SECONDARY,
+            font=ctk.CTkFont(size=12),
+        )
+        self.video_label.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def _create_card(self, parent: ctk.CTkFrame) -> ctk.CTkFrame:
+        """Create a modern card with border."""
+        frame = ctk.CTkFrame(
+            parent,
+            fg_color=CARD_BG,
+            border_color=PANEL_BORDER,
+            border_width=1,
+            corner_radius=12,
+        )
+        return frame
 
     def build_status_bar(
         self,
@@ -165,37 +213,58 @@ class BasePage(ctk.CTkFrame):
 
         Returns the error-status :class:`ctk.CTkLabel`.
         """
-        frame_bottom = ctk.CTkFrame(self)
-        frame_bottom.pack(fill="x", side="bottom", padx=30, pady=20)
-
-        lbl_err = ctk.CTkLabel(
-            frame_bottom,
-            text="SYSTEM STABLE",
-            font=ctk.CTkFont(weight="bold"),
-            text_color="green",
+        frame_bottom = ctk.CTkFrame(
+            self,
+            fg_color=HEADER_BG,
+            height=60,
+            corner_radius=0,
         )
-        lbl_err.pack(side="left", padx=20)
+        frame_bottom.pack(fill="x", side="bottom", padx=20, pady=0)
+        frame_bottom.pack_propagate(False)
 
+        # Left: Status
+        status_frame = ctk.CTkFrame(frame_bottom, fg_color="transparent")
+        status_frame.pack(side="left", padx=10, fill="both", expand=True)
+
+        self.lbl_err_status = ctk.CTkLabel(
+            status_frame,
+            text="● SYSTEM STABLE",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=SUCCESS,
+        )
+        self.lbl_err_status.pack(side="left", pady=15)
+
+        # Center: Clear Error button
         ctk.CTkButton(
-            frame_bottom,
-            text="Clear Error",
-            fg_color="red",
-            hover_color="#990000",
-            width=100,
+            status_frame,
+            text="⚠  Clear Error",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color=DANGER,
+            hover_color="#DC2626",
+            text_color="white",
+            width=110,
+            height=32,
+            corner_radius=6,
             command=lambda: self.controller.plc.send_command(
                 self.controller.cfg.plc.commands.idle
             ),
-        ).pack(side="left", padx=10)
+        ).pack(side="left", padx=20, pady=10)
 
+        # Right: Navigate button
         ctk.CTkButton(
             frame_bottom,
             text=navigate_text,
+            font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=navigate_color,
-            width=220,
+            hover_color="#4338CA",
+            text_color="white",
+            width=160,
+            height=36,
+            corner_radius=8,
             command=lambda: self.controller.show_frame(navigate_target),
-        ).pack(side="right", padx=20)
+        ).pack(side="right", padx=15, pady=12)
 
-        return lbl_err
+        return self.lbl_err_status
 
     # ------------------------------------------------------------------
     # Shared status update (called by sub-classes)
@@ -207,7 +276,11 @@ class BasePage(ctk.CTkFrame):
             return
         if data.get("error_flag", False):
             self.lbl_err_status.configure(
-                text="WARNING: SYSTEM ERROR!", text_color="red"
+                text="⚠  WARNING: SYSTEM ERROR!",
+                text_color=DANGER,
             )
         else:
-            self.lbl_err_status.configure(text="SYSTEM STABLE", text_color="green")
+            self.lbl_err_status.configure(
+                text="● SYSTEM STABLE",
+                text_color=SUCCESS,
+            )

@@ -22,10 +22,11 @@ from PIL import ImageTk
 
 from src.ai.yolo_detector import YOLODetector
 from src.config_loader import RobotConfig, load_config
-from src.kinematics import inverse_kinematics
+from src.kinematics import inverse_kinematics, InverseKinematicsError
 from src.plc.plc_controller import PLCController
 from src.ui.page_auto import PageAuto
 from src.ui.page_manual import PageManual
+from src.ui.header import VAAHeader, VAAFooter
 
 # ---------------------------------------------------------------------------
 # Logging (console + rotating file)
@@ -94,15 +95,31 @@ class RobotApp(ctk.CTk):
 
         # ── GUI container + page routing ─────────────────────────────────────
         self._container: ctk.CTkFrame = ctk.CTkFrame(self)
-        self._container.pack(side="top", fill="both", expand=True, padx=10, pady=10)
-        self._container.grid_rowconfigure(0, weight=1)
+        self._container.pack(side="top", fill="both", expand=True, padx=0, pady=0)
+        self._container.grid_rowconfigure(0, weight=0)  # Header
+        self._container.grid_rowconfigure(1, weight=1)  # Content
         self._container.grid_columnconfigure(0, weight=1)
+
+        # Header
+        self.header: VAAHeader = VAAHeader(
+            parent=self._container,
+            controller=self,
+        )
+        self.header.pack(fill="x")
+
+        # Content area (pages)
+        self._content_area: ctk.CTkFrame = ctk.CTkFrame(self._container, fg_color="#0F172A")
+        self._content_area.pack(fill="both", expand=True)
+
+        # Footer
+        self.footer: VAAFooter = VAAFooter(parent=self._container)
+        self.footer.pack(fill="x", side="bottom")
 
         self._current_page: str = "PageAuto"
         self.frames: dict[str, PageAuto | PageManual] = {}
         for PageClass in (PageAuto, PageManual):
             name = PageClass.__name__
-            frame = PageClass(parent=self._container, controller=self)
+            frame = PageClass(parent=self._content_area, controller=self)
             self.frames[name] = frame
             frame.grid(row=0, column=0, sticky="nsew")
 
@@ -135,6 +152,7 @@ class RobotApp(ctk.CTk):
             return
         self._current_page = page_name
         self.frames[page_name].tkraise()
+        self.header.update_active_tab(page_name)
         log.debug("Switched to page: %s", page_name)
 
     # ------------------------------------------------------------------
@@ -230,8 +248,10 @@ class RobotApp(ctk.CTk):
                     )
                     self.plc.send_joint_targets(j1, j2, j3, j4)
                     self.plc.send_command(self.cfg.plc.commands.move)
-                except Exception:
-                    pass
+                except InverseKinematicsError:
+                    log.error("IK failed: unreachable target X=%.2f Y=%.2f", rx, ry)
+                except Exception as exc:
+                    log.error("Unexpected error during defect response: %s", exc)
                 self._stop_event.wait(self.cfg.app.move_cooldown)
 
             self._stop_event.wait(frame_interval)
@@ -239,7 +259,11 @@ class RobotApp(ctk.CTk):
         log.info("AI vision thread exited cleanly.")
 
     def _update_video_label(self, img_tk: ImageTk.PhotoImage) -> None:
-        """Push a new frame to whichever page is currently visible."""
+        """Push a new frame to whichever page is currently visible (thread-safe)."""
+        self.after(0, self._do_update_video, img_tk)
+
+    def _do_update_video(self, img_tk: ImageTk.PhotoImage) -> None:
+        """Internal method to update video label on main thread."""
         page = self.frames.get(self._current_page)
         if page is None:
             return
@@ -273,7 +297,10 @@ class RobotApp(ctk.CTk):
             else:
                 if retry_delay == interval:
                     log.warning("PLC offline – attempting reconnection with backoff…")
-                self.plc.connect()
+                try:
+                    self.plc.connect()
+                except Exception as exc:
+                    log.error("PLC connection failed: %s", exc)
                 retry_delay = min(retry_delay * 2, max_retry_delay)
 
             self._stop_event.wait(retry_delay)
@@ -287,6 +314,12 @@ class RobotApp(ctk.CTk):
                 frame.update_gui_data(data)
             except Exception as exc:
                 log.debug("update_gui_data error on %s: %s", type(frame).__name__, exc)
+
+        # Update footer status
+        plc_connected = self.plc.is_connected()
+        camera_active = self.detector.is_camera_active() if hasattr(self.detector, 'is_camera_active') else False
+        system_ok = not data.get("error_flag", False)
+        self.footer.update_status(plc_connected, camera_active, system_ok)
 
     # ------------------------------------------------------------------
     # Shutdown

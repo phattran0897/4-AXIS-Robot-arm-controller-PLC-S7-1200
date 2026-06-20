@@ -19,8 +19,6 @@ import numpy as np
 from PIL import Image
 from ultralytics import YOLO
 
-from src.kinematics import inverse_kinematics
-
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -235,6 +233,10 @@ class YOLODetector:
         self._stop_read_thread()
         self._release_capture()
         log.info("YOLODetector stopped.")
+
+    def is_camera_active(self) -> bool:
+        """Check if camera is currently active and readable."""
+        return self._cap is not None and self._cap.isOpened()
 
     # ------------------------------------------------------------------
     # Frame reading (called under lock)
