@@ -67,8 +67,8 @@ kinematics:
 
 # ── Application / GUI ────────────────────────────────────────────────────────
 app:
-  title: "4-AXIS ROBOT CONTROL SYSTEM"
-  geometry: "1150x700"
+  title: "4-AXIS SCARA Robot Control | VAA"
+  geometry: "1200x750"
   appearance_mode: "dark"       # "dark" | "light" | "system"
   color_theme: "blue"
 

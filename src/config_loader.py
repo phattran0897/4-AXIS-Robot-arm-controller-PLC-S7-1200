@@ -44,6 +44,7 @@ class PLCCommands:
     home: int = 1
     move: int = 2
     stop: int = 3
+    grip: int = 4
 
 
 @dataclass(slots=True)

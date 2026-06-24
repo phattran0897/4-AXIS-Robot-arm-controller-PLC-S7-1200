@@ -26,7 +26,7 @@ from src.ui.theme import (
     TEXT_PRIMARY,
     TEXT_SECONDARY,
     CARD_BG,
-    MANUALACCENT,
+    MANUAL_ACCENT,
 )
 
 if TYPE_CHECKING:
@@ -49,8 +49,9 @@ class PageManual(BasePage):
     """
 
     def __init__(self, parent: ctk.CTkFrame, controller: "RobotApp") -> None:
-        super().__init__(parent, controller, page_color=MANUALACCENT)
+        super().__init__(parent, controller, page_color=MANUAL_ACCENT)
         self._kine_mode: str = "Forward"
+        self._kine_entries: dict = {}  # Store IK entry widgets
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -95,7 +96,7 @@ class PageManual(BasePage):
             header,
             text="🎯",
             font=ctk.CTkFont(size=20),
-            text_color=MANUALACCENT,
+            text_color=MANUAL_ACCENT,
         )
         icon_label.pack(side="left", padx=(0, 8))
 
@@ -103,7 +104,7 @@ class PageManual(BasePage):
             header,
             text="KINEMATICS INPUT",
             font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=MANUALACCENT,
+            text_color=MANUAL_ACCENT,
         ).pack(side="left")
 
         # Mode toggle
@@ -187,17 +188,65 @@ class PageManual(BasePage):
         )
         self.ent_j4.pack(pady=6, fill="x")
 
+        # Inverse Kinematics entries (X, Y, Z) - initially hidden
+        self._ik_frame = ctk.CTkFrame(entry_frame, fg_color="transparent")
+
+        self.ent_x = ctk.CTkEntry(
+            self._ik_frame,
+            placeholder_text="X - Target X (mm)",
+            font=entry_font,
+            fg_color=entry_bg,
+            text_color=entry_fg,
+            border_color=PANEL_BORDER,
+            height=38,
+            corner_radius=8,
+        )
+        self.ent_x.pack(pady=6, fill="x")
+
+        self.ent_y = ctk.CTkEntry(
+            self._ik_frame,
+            placeholder_text="Y - Target Y (mm)",
+            font=entry_font,
+            fg_color=entry_bg,
+            text_color=entry_fg,
+            border_color=PANEL_BORDER,
+            height=38,
+            corner_radius=8,
+        )
+        self.ent_y.pack(pady=6, fill="x")
+
+        self.ent_z = ctk.CTkEntry(
+            self._ik_frame,
+            placeholder_text="Z - Target Z (mm)",
+            font=entry_font,
+            fg_color=entry_bg,
+            text_color=entry_fg,
+            border_color=PANEL_BORDER,
+            height=38,
+            corner_radius=8,
+        )
+        self.ent_z.pack(pady=6, fill="x")
+
+        # IK result display
+        self.lbl_ik_result = ctk.CTkLabel(
+            self._ik_frame,
+            text="IK Result: --",
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_SECONDARY,
+        )
+        self.lbl_ik_result.pack(pady=10)
+
         # Send button
         ctk.CTkButton(
             entry_frame,
-            text="✈  SEND JOINT TARGETS",
+            text="✈  SEND TARGETS",
             font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color=MANUALACCENT,
+            fg_color=MANUAL_ACCENT,
             hover_color="#9333EA",
             text_color="white",
             height=42,
             corner_radius=8,
-            command=self._send_manual_positions,
+            command=self._send_positions,
         ).pack(pady=10, fill="x")
 
     def _build_actuator_panel(self, parent: ctk.CTkFrame) -> None:
@@ -213,7 +262,7 @@ class PageManual(BasePage):
             header,
             text="🦾",
             font=ctk.CTkFont(size=20),
-            text_color=MANUALACCENT,
+            text_color=MANUAL_ACCENT,
         )
         icon_label.pack(side="left", padx=(0, 8))
 
@@ -221,7 +270,7 @@ class PageManual(BasePage):
             header,
             text="ACTUATOR CONTROL",
             font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=MANUALACCENT,
+            text_color=MANUAL_ACCENT,
         ).pack(side="left")
 
         # Buttons container
@@ -254,7 +303,7 @@ class PageManual(BasePage):
             height=45,
             corner_radius=8,
             command=lambda: self.controller.plc.send_command(
-                self.controller.cfg.plc.commands.move
+                self.controller.cfg.plc.commands.grip
             ),
         ).pack(fill="x", pady=5)
 
@@ -278,7 +327,7 @@ class PageManual(BasePage):
             btn_frame,
             text="⏹  STOP",
             font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color=_DANGER,
+            fg_color=DANGER,
             hover_color="#DC2626",
             text_color="white",
             height=45,
@@ -292,7 +341,7 @@ class PageManual(BasePage):
         """Create a modern card with border."""
         frame = ctk.CTkFrame(
             parent,
-            fg_color=_CARD_BG,
+            fg_color=CARD_BG,
             border_color=PANEL_BORDER,
             border_width=1,
             corner_radius=12,
@@ -310,15 +359,28 @@ class PageManual(BasePage):
                 text="▶ INVERSE KINEMATICS",
                 text_color="#3B82F6",
             )
+            # Hide FK entries, show IK entries
+            self._fk_frame.pack_forget()
+            self._ik_frame.pack(fill="both", expand=True)
         else:
             self._kine_mode = "Forward"
             self.lbl_kine_mode.configure(
                 text="▶ FORWARD KINEMATICS",
                 text_color=SUCCESS,
             )
+            # Hide IK entries, show FK entries
+            self._ik_frame.pack_forget()
+            self._fk_frame.pack(fill="both", expand=True)
 
-    def _send_manual_positions(self) -> None:
-        """Parse entry fields and dispatch joint targets to the PLC."""
+    def _send_positions(self) -> None:
+        """Parse entry fields and dispatch joint targets or compute IK."""
+        if self._kine_mode == "Forward":
+            self._send_forward_kinematics()
+        else:
+            self._send_inverse_kinematics()
+
+    def _send_forward_kinematics(self) -> None:
+        """Send joint angles directly to PLC."""
         try:
             j1 = float(self.ent_j1.get().strip()) if self.ent_j1.get().strip() else 0.0
             j2 = float(self.ent_j2.get().strip()) if self.ent_j2.get().strip() else 0.0
@@ -331,29 +393,75 @@ class PageManual(BasePage):
             )
             return
 
-        # Validate joint angle ranges to prevent damage or PLC faults
-        if not (-180.0 <= j1 <= 180.0):
-            messagebox.showerror("Input Error", f"J1 must be between -180° and 180° (got {j1}°)")
-            return
-        if not (-180.0 <= j2 <= 180.0):
-            messagebox.showerror("Input Error", f"J2 must be between -180° and 180° (got {j2}°)")
-            return
-        if not (-180.0 <= j3 <= 180.0):
-            messagebox.showerror("Input Error", f"J3 must be between -180° and 180° (got {j3}°)")
-            return
-        if not (-360.0 <= j4 <= 360.0):
-            messagebox.showerror("Input Error", f"J4 must be between -360° and 360° (got {j4}°)")
+        if not self._validate_joint_angles(j1, j2, j3, j4):
             return
 
         self.controller.plc.send_joint_targets(j1, j2, j3, j4)
-        log.info(
-            "Manual joint targets dispatched: J1=%.2f J2=%.2f J3=%.2f J4=%.2f",
-            j1, j2, j3, j4,
-        )
+        log.info("FK: J1=%.2f J2=%.2f J3=%.2f J4=%.2f", j1, j2, j3, j4)
         messagebox.showinfo(
             "Success",
-            f"Joint targets sent:\nJ1={j1:.2f}°  J2={j2:.2f}°\nJ3={j3:.2f}°  J4={j4:.2f}°",
+            f"Forward Kinematics:\nJ1={j1:.2f}°  J2={j2:.2f}°\nJ3={j3:.2f}°  J4={j4:.2f}°",
         )
+
+    def _send_inverse_kinematics(self) -> None:
+        """Compute joint angles from X, Y, Z using IK and send to PLC."""
+        try:
+            x = float(self.ent_x.get().strip())
+            y = float(self.ent_y.get().strip())
+            z = float(self.ent_z.get().strip())
+        except ValueError:
+            messagebox.showerror(
+                "Input Error",
+                "X, Y, Z fields must contain valid decimal numbers.",
+            )
+            return
+
+        # Use kinematics parameters from config
+        l1 = self.controller.cfg.kinematics.l1
+        l2 = self.controller.cfg.kinematics.l2
+
+        try:
+            j1, j2, j3, j4 = inverse_kinematics(x, y, l1=l1, l2=l2)
+            # Z controls J3 offset (simplified: Z affects wrist angle)
+            j3_adjusted = j3 + (z * 0.1)  # Simple Z compensation
+
+            if not self._validate_joint_angles(j1, j2, j3_adjusted, j4):
+                return
+
+            self.controller.plc.send_joint_targets(j1, j2, j3_adjusted, j4)
+            self.lbl_ik_result.configure(
+                text=f"IK: J1={j1:.1f}° J2={j2:.1f}° J3={j3_adjusted:.1f}° J4={j4:.1f}°",
+                text_color=SUCCESS,
+            )
+            log.info("IK: X=%.2f Y=%.2f Z=%.2f -> J1=%.2f J2=%.2f J3=%.2f J4=%.2f",
+                     x, y, z, j1, j2, j3_adjusted, j4)
+            messagebox.showinfo(
+                "Success",
+                f"Inverse Kinematics:\nX={x:.2f}mm  Y={y:.2f}mm  Z={z:.2f}mm\n"
+                f"J1={j1:.2f}°  J2={j2:.2f}°\nJ3={j3_adjusted:.2f}°  J4={j4:.2f}°",
+            )
+        except Exception as exc:
+            self.lbl_ik_result.configure(
+                text=f"IK Error: {exc}",
+                text_color=DANGER,
+            )
+            messagebox.showerror("IK Error", f"Cannot compute inverse kinematics:\n{exc}")
+
+    def _validate_joint_angles(self, j1: float, j2: float, j3: float, j4: float) -> bool:
+        """Validate joint angle ranges to prevent damage or PLC faults."""
+        if not (-180.0 <= j1 <= 180.0):
+            messagebox.showerror("Input Error", f"J1 must be between -180° and 180° (got {j1}°)")
+            return False
+        if not (-180.0 <= j2 <= 180.0):
+            messagebox.showerror("Input Error", f"J2 must be between -180° and 180° (got {j2}°)")
+            return False
+        if not (-180.0 <= j3 <= 180.0):
+            messagebox.showerror("Input Error", f"J3 must be between -180° and 180° (got {j3}°)")
+            return False
+        if not (-360.0 <= j4 <= 360.0):
+            messagebox.showerror("Input Error", f"J4 must be between -360° and 360° (got {j4}°)")
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # BasePage contract

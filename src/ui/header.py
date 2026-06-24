@@ -6,8 +6,16 @@ Provides a consistent header component across all pages.
 
 from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING
+
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
+
+if TYPE_CHECKING:
+    from main import RobotApp
+
+log = logging.getLogger(__name__)
 
 
 # Brand colors
@@ -32,8 +40,8 @@ class VAAHeader(ctk.CTkFrame):
 
     def __init__(
         self,
-        parent,
-        controller,
+        parent: ctk.CTkFrame,
+        controller: "RobotApp",
         current_page: str = "PageAuto",
     ) -> None:
         super().__init__(
@@ -78,8 +86,8 @@ class VAAHeader(ctk.CTkFrame):
             self._logo_tk = ctk.CTkImage(logo_img, size=(140, 50))
             logo_label = ctk.CTkLabel(left_frame, image=self._logo_tk, text="")
             logo_label.pack(side="left", padx=(0, 15))
-        except (FileNotFoundError, OSError, Image.UnidentifiedImageError):
-            pass  # Skip logo if not found or invalid
+        except (FileNotFoundError, OSError, Image.UnidentifiedImageError) as exc:
+            log.debug("Logo not loaded: %s (%s)", logo_path, exc)
 
         # Text branding (beside logo)
         text_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
@@ -172,7 +180,7 @@ class VAAFooter(ctk.CTkFrame):
     Professional footer with status indicators and version info.
     """
 
-    def __init__(self, parent) -> None:
+    def __init__(self, parent: ctk.CTkFrame) -> None:
         super().__init__(
             parent,
             fg_color=VAA_PRIMARY,

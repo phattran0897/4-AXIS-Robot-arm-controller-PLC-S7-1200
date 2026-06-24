@@ -8,6 +8,7 @@ robot status and writing motion commands to a Siemens S7-1200 PLC.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import snap7
@@ -42,6 +43,7 @@ class PLCController:
         self._cfg: PLCConfig = cfg
         self._client: snap7.client.Client = snap7.client.Client()
         self._db_read_size: int = compute_db_read_size(cfg.offsets)
+        self._last_read_time: float = 0.0
         log.info(
             "PLCController created – target %s rack=%d slot=%d db=%d read_size=%d",
             cfg.ip,
@@ -65,18 +67,24 @@ class PLCController:
             ``True`` on success.
         """
         try:
-            if not self._client.get_connected():
-                self._client.connect(
-                    self._cfg.ip,
-                    self._cfg.rack,
-                    self._cfg.slot,
-                )
+            if self._client.get_connected():
+                return True
+            self._client.connect(
+                self._cfg.ip,
+                self._cfg.rack,
+                self._cfg.slot,
+            )
             connected: bool = self._client.get_connected()
             if connected:
                 log.info("PLC connected (%s).", self._cfg.ip)
+            else:
+                log.warning(
+                    "PLC connection handshake failed (%s).",
+                    self._cfg.ip,
+                )
             return connected
         except Exception as exc:
-            log.error("PLC connection failed: %s", exc)
+            log.error("PLC connection failed (%s): %s", self._cfg.ip, exc)
             return False
 
     def disconnect(self) -> None:
@@ -129,6 +137,8 @@ class PLCController:
         except Exception as exc:
             log.error("DB read error: %s", exc)
             return {}
+        finally:
+            self._last_read_time = time.monotonic()
 
     # ------------------------------------------------------------------
     # Data Block writes
@@ -218,14 +228,15 @@ class PLCController:
             return
         off = self._cfg.offsets
         try:
-            # Build a single buffer spanning from cmd_word through j4_target
-            buf = bytearray(off.j4_target + 4)
+            # Calculate safe buffer size to cover all fields
+            buf_size = max(off.j4_target + 4, off.cmd_word + 2) + 1
+            buf = bytearray(buf_size)
             set_int(buf, off.cmd_word, cmd)
             set_real(buf, off.j1_target, j1)
             set_real(buf, off.j2_target, j2)
             set_real(buf, off.j3_target, j3)
             set_real(buf, off.j4_target, j4)
-            self._client.db_write(self._cfg.db_number, off.cmd_word, buf)
+            self._client.db_write(self._cfg.db_number, off.cmd_word, bytes(buf))
             log.debug(
                 "Atomic write – cmd=%d J1=%.2f J2=%.2f J3=%.2f J4=%.2f",
                 cmd, j1, j2, j3, j4,

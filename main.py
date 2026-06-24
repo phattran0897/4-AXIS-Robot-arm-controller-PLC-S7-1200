@@ -52,7 +52,7 @@ log = _robot_log
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_THREAD_JOIN_TIMEOUT: float = 3.0
+_THREAD_JOIN_TIMEOUT: float = 5.0
 _CAMERA_SWITCH_DEBOUNCE: float = 0.5   # seconds
 
 
@@ -287,6 +287,7 @@ class RobotApp(ctk.CTk):
         interval: float = self.cfg.app.plc_poll_interval
         retry_delay: float = interval
         max_retry_delay: float = 30.0
+        consecutive_failures: int = 0
 
         while not self._stop_event.is_set():
             if self.plc.is_connected():
@@ -294,9 +295,14 @@ class RobotApp(ctk.CTk):
                 if data:
                     self.after(0, self._dispatch_plc_data, data)
                 retry_delay = interval
+                consecutive_failures = 0
             else:
-                if retry_delay == interval:
-                    log.warning("PLC offline – attempting reconnection with backoff…")
+                consecutive_failures += 1
+                if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
+                    log.warning(
+                        "PLC offline – attempting reconnection (attempt %d, backoff %.1fs)…",
+                        consecutive_failures, retry_delay
+                    )
                 try:
                     self.plc.connect()
                 except Exception as exc:

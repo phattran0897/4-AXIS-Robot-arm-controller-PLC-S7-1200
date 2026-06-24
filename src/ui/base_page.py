@@ -157,9 +157,16 @@ class BasePage(ctk.CTkFrame):
             text_color=TEXT_SECONDARY,
         ).pack(side="left")
 
+        # Populate camera options dynamically
+        available_cameras = self.controller.detector.available_cameras(max_index=5)
+        if available_cameras:
+            cam_values = [str(i) for i in available_cameras]
+        else:
+            cam_values = ["No Camera"]
+
         cam_selector = ctk.CTkComboBox(
             selector_frame,
-            values=["Camera 0", "Camera 1", "Camera 2"],
+            values=cam_values,
             command=self.controller.change_camera_source,
             width=140,
             fg_color=PANEL_BG,
@@ -170,7 +177,10 @@ class BasePage(ctk.CTkFrame):
             dropdown_text_color=TEXT_PRIMARY,
         )
         cam_selector.pack(side="right")
-        cam_selector.set("Camera 0")
+        if cam_values and cam_values[0] != "No Camera":
+            cam_selector.set(f"Camera {cam_values[0]} (Default)")
+        else:
+            cam_selector.set("No Camera")
 
         # Video label with modern styling
         video_container = ctk.CTkFrame(

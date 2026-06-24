@@ -126,6 +126,8 @@ class YOLODetector:
         self._read_queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=1)
         self._read_thread: threading.Thread | None = None
         self._read_stop = threading.Event()
+        self._dropped_frames: int = 0
+        self._last_drop_warning: float = 0.0
 
         log.info(
             "YOLODetector initialised – model=%s thresh=%.2f px2mm=%.3f "
@@ -360,6 +362,7 @@ class YOLODetector:
 
     def _camera_read_loop(self) -> None:
         """Background thread: continuously read frames into the queue."""
+        import time
         while not self._read_stop.is_set():
             if self._cap is None:
                 break
@@ -369,8 +372,17 @@ class YOLODetector:
             # Non-blocking put; drop the old frame if inference is slow
             try:
                 self._read_queue.put_nowait(frame)
+                self._dropped_frames = 0
             except queue.Full:
-                pass
+                self._dropped_frames += 1
+                # Log warning every 5 seconds if frames are being dropped
+                current_time = time.time()
+                if self._dropped_frames > 10 and (current_time - self._last_drop_warning) > 5.0:
+                    log.warning(
+                        "Frame drops detected (%d consecutive). Consider reducing inference load.",
+                        self._dropped_frames
+                    )
+                    self._last_drop_warning = current_time
 
     def _stop_read_thread(self) -> None:
         """Signal and join the camera read thread."""
@@ -419,6 +431,7 @@ class YOLODetector:
         has_defect = False
         robot_x = self.home_x
         robot_y = self.home_y
+        detection_count = 0
 
         for i in range(len(boxes)):
             xyxy: np.ndarray = boxes[i].xyxy.cpu().numpy().squeeze()
@@ -439,12 +452,15 @@ class YOLODetector:
                 robot_y = self.home_y + (defect_cy - frame_cy) * self.px2mm
                 has_defect = True
 
+            detection_count += 1
+
             cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), _BBOX_COLOR, _BBOX_THICKNESS)
             cv2.circle(frame, (int(defect_cx), int(defect_cy)), _CENTROID_RADIUS, _CENTROID_COLOR, -1)
+            # Draw per-detection coordinates
             cv2.putText(
                 frame,
-                f"X:{robot_x:.1f} Y:{robot_y:.1f}",
-                (xmin, ymax + _TEXT_Y_OFFSET),
+                f"#{detection_count} X:{robot_x:.1f} Y:{robot_y:.1f}",
+                (xmin, max(ymin, ymax + _TEXT_Y_OFFSET)),
                 _TEXT_FONT,
                 _TEXT_SCALE,
                 _TEXT_COLOR,
