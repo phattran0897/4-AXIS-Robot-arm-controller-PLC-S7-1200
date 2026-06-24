@@ -1,6 +1,0 @@
-2026-06-09 07:46:33,945 [WARNING] RobotApp – PLC offline – attempting reconnection with backoff…
-2026-06-09 07:46:33,946 [INFO] RobotApp – RobotApp initialised – all threads started.
-2026-06-09 07:47:05,842 [INFO] RobotApp – Shutdown initiated…
-2026-06-09 07:47:06,295 [INFO] RobotApp – PLC poll thread exited cleanly.
-2026-06-09 07:47:09,307 [WARNING] RobotApp – Thread 'AIVisionThread' did not exit within timeout.
-2026-06-09 07:47:09,308 [INFO] RobotApp – All threads stopped. Destroying window.
