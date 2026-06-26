@@ -236,7 +236,7 @@ class PLCController:
             set_real(buf, off.j2_target, j2)
             set_real(buf, off.j3_target, j3)
             set_real(buf, off.j4_target, j4)
-            self._client.db_write(self._cfg.db_number, off.cmd_word, bytes(buf))
+            self._client.db_write(self._cfg.db_number, off.cmd_word, buf)
             log.debug(
                 "Atomic write – cmd=%d J1=%.2f J2=%.2f J3=%.2f J4=%.2f",
                 cmd, j1, j2, j3, j4,

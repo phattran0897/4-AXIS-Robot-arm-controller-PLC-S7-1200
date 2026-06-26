@@ -93,6 +93,14 @@ class RobotApp(ctk.CTk):
         # ── Camera switch debounce ───────────────────────────────────────────
         self._camera_switch_timer: threading.Timer | None = None
 
+        # ── Stability tracking (AI vision loop) ──────────────────────────────
+        self._vision_stable: bool = False      # True once stable target is sent
+        self._vision_lock_x: float = 0.0      # locked X (mm)
+        self._vision_lock_y: float = 0.0      # locked Y (mm)
+        self._vision_stable_count: int = 0    # consecutive stable frames
+        self._vision_prev_x: float = 0.0
+        self._vision_prev_y: float = 0.0
+
         # ── GUI container + page routing ─────────────────────────────────────
         self._container: ctk.CTkFrame = ctk.CTkFrame(self)
         self._container.pack(side="top", fill="both", expand=True, padx=0, pady=0)
@@ -208,9 +216,18 @@ class RobotApp(ctk.CTk):
 
         Lock is held only during the fast frame-read step.
         YOLO inference runs unlocked, so camera switches are not blocked.
+
+        Stability tracking: once a stable target is sent to the PLC, further
+        sends are suppressed until the object moves significantly or disappears,
+        reducing PLC traffic and eliminating jitter-driven duplicate commands.
+
         Runs until ``_stop_event`` is set.
         """
+        import math as _math
+
         cam_cfg = self.cfg.camera
+        yolo_cfg = self.cfg.yolo
+
         if not self.detector.start_camera(cam_cfg.default_index):
             log.error(
                 "Cannot open default camera (index %d).", cam_cfg.default_index
@@ -236,27 +253,77 @@ class RobotApp(ctk.CTk):
                     pil_img = ImageTk.PhotoImage(image=pil)
                     self._update_video_label(pil_img)
 
-            # ── Step 3: PLC dispatch on defect (unlocked read of shared state) ─
+            # ── Step 3: PLC dispatch with stability tracking ───────────────
             has_defect, rx, ry = last_detection
-            if has_defect and self.plc.is_connected():
-                log.info("Defect detected at robot coords X=%.2f Y=%.2f", rx, ry)
-                try:
-                    j1, j2, j3, j4 = inverse_kinematics(
-                        rx, ry,
-                        l1=self.cfg.kinematics.l1,
-                        l2=self.cfg.kinematics.l2,
-                    )
-                    self.plc.send_joint_targets(j1, j2, j3, j4)
-                    self.plc.send_command(self.cfg.plc.commands.move)
-                except InverseKinematicsError:
-                    log.error("IK failed: unreachable target X=%.2f Y=%.2f", rx, ry)
-                except Exception as exc:
-                    log.error("Unexpected error during defect response: %s", exc)
-                self._stop_event.wait(self.cfg.app.move_cooldown)
+
+            if not has_defect:
+                # Object disappeared – reset stability so next detection triggers send
+                if self._vision_stable:
+                    log.info("Target lost – resetting stable lock.")
+                self._vision_stable = False
+                self._vision_stable_count = 0
+
+            elif has_defect and self.plc.is_connected():
+                if self._vision_stable:
+                    # Already locked: only re-trigger if object moved significantly
+                    dist = _math.hypot(rx - self._vision_lock_x, ry - self._vision_lock_y)
+                    if dist > yolo_cfg.stable_threshold_mm:
+                        log.info(
+                            "Target moved %.2f mm (was locked at X=%.2f Y=%.2f, "
+                            "now X=%.2f Y=%.2f) – re-sending.",
+                            dist, self._vision_lock_x, self._vision_lock_y, rx, ry
+                        )
+                        self._vision_stable = False
+                        self._vision_stable_count = 0
+                    # else: still stable – skip send, no log spam
+
+                if not self._vision_stable:
+                    # Compute distance from previous frame's position
+                    dist = _math.hypot(rx - self._vision_prev_x, ry - self._vision_prev_y)
+
+                    if dist <= yolo_cfg.stable_threshold_mm:
+                        self._vision_stable_count += 1
+                    else:
+                        self._vision_stable_count = 0
+
+                    self._vision_prev_x = rx
+                    self._vision_prev_y = ry
+
+                    if self._vision_stable_count >= yolo_cfg.stable_frames:
+                        # Stable enough – send once and lock
+                        self._dispatch_target_to_plc(rx, ry)
+                        self._vision_stable = True
+                        self._vision_lock_x = rx
+                        self._vision_lock_y = ry
+                        self._vision_stable_count = 0
+                        log.info(
+                            "Target stable for %d frames – sent to PLC (X=%.2f Y=%.2f).",
+                            yolo_cfg.stable_frames, rx, ry
+                        )
+                    else:
+                        log.debug(
+                            "Stability: %d/%d frames (dist=%.2f mm)",
+                            self._vision_stable_count, yolo_cfg.stable_frames, dist
+                        )
 
             self._stop_event.wait(frame_interval)
 
         log.info("AI vision thread exited cleanly.")
+
+    def _dispatch_target_to_plc(self, rx: float, ry: float) -> None:
+        """Compute IK and send joint targets + move command to the PLC."""
+        try:
+            j1, j2, j3, j4 = inverse_kinematics(
+                rx, ry,
+                l1=self.cfg.kinematics.l1,
+                l2=self.cfg.kinematics.l2,
+            )
+            self.plc.send_joint_targets(j1, j2, j3, j4)
+            self.plc.send_command(self.cfg.plc.commands.move)
+        except InverseKinematicsError:
+            log.error("IK failed: unreachable target X=%.2f Y=%.2f", rx, ry)
+        except Exception as exc:
+            log.error("Unexpected error during defect response: %s", exc)
 
     def _update_video_label(self, img_tk: ImageTk.PhotoImage) -> None:
         """Push a new frame to whichever page is currently visible (thread-safe)."""

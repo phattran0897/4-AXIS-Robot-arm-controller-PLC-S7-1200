@@ -42,6 +42,13 @@ yolo:
   home_x: 200.0
   home_y: 0.0
 
+  # ── Stability tracking ─────────────────────────────────────────────────────
+  # Maximum distance (mm) between consecutive frames to count as "stable"
+  stable_threshold_mm: 2.0
+
+  # Number of consecutive stable frames before locking position
+  stable_frames: 5
+
 # ── Camera ───────────────────────────────────────────────────────────────────
 camera:
   default_index: 0

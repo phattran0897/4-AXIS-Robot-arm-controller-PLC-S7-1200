@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import customtkinter as ctk
 from tkinter import messagebox
 
-from src.kinematics import inverse_kinematics
+from src.kinematics import forward_kinematics, inverse_kinematics
 from src.ui.base_page import BasePage
 from src.ui.theme import (
     ACCENT,
@@ -51,7 +51,6 @@ class PageManual(BasePage):
     def __init__(self, parent: ctk.CTkFrame, controller: "RobotApp") -> None:
         super().__init__(parent, controller, page_color=MANUAL_ACCENT)
         self._kine_mode: str = "Forward"
-        self._kine_entries: dict = {}  # Store IK entry widgets
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -140,8 +139,12 @@ class PageManual(BasePage):
         entry_bg = "#1E293B"
         entry_fg = TEXT_PRIMARY
 
+        # Forward Kinematics entries (J1, J2, J3, J4) - initially visible
+        self._fk_frame = ctk.CTkFrame(entry_frame, fg_color="transparent")
+        self._fk_frame.pack(fill="both", expand=True)
+
         self.ent_j1 = ctk.CTkEntry(
-            entry_frame,
+            self._fk_frame,
             placeholder_text="J1 - Base angle (°)",
             font=entry_font,
             fg_color=entry_bg,
@@ -153,7 +156,7 @@ class PageManual(BasePage):
         self.ent_j1.pack(pady=6, fill="x")
 
         self.ent_j2 = ctk.CTkEntry(
-            entry_frame,
+            self._fk_frame,
             placeholder_text="J2 - Shoulder angle (°)",
             font=entry_font,
             fg_color=entry_bg,
@@ -165,7 +168,7 @@ class PageManual(BasePage):
         self.ent_j2.pack(pady=6, fill="x")
 
         self.ent_j3 = ctk.CTkEntry(
-            entry_frame,
+            self._fk_frame,
             placeholder_text="J3 - Elbow angle (°)",
             font=entry_font,
             fg_color=entry_bg,
@@ -177,7 +180,7 @@ class PageManual(BasePage):
         self.ent_j3.pack(pady=6, fill="x")
 
         self.ent_j4 = ctk.CTkEntry(
-            entry_frame,
+            self._fk_frame,
             placeholder_text="J4 - Wrist angle (°)",
             font=entry_font,
             fg_color=entry_bg,
@@ -187,6 +190,15 @@ class PageManual(BasePage):
             corner_radius=8,
         )
         self.ent_j4.pack(pady=6, fill="x")
+
+        # FK verification result
+        self.lbl_fk_result = ctk.CTkLabel(
+            self._fk_frame,
+            text="FK Result: --",
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_SECONDARY,
+        )
+        self.lbl_fk_result.pack(pady=10)
 
         # Inverse Kinematics entries (X, Y, Z) - initially hidden
         self._ik_frame = ctk.CTkFrame(entry_frame, fg_color="transparent")

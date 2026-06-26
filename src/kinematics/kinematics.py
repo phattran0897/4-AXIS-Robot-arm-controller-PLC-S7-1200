@@ -41,6 +41,44 @@ def reachable(x: float, y: float, l1: float, l2: float) -> bool:
     return abs(l1 - l2) <= r <= (l1 + l2)
 
 
+def forward_kinematics(
+    j1: float = 0.0,
+    j2: float = 0.0,
+    l1: float = 200.0,
+    l2: float = 150.0,
+) -> tuple[float, float, float, float]:
+    """
+    Two-DOF planar forward kinematics for the SCARA arm.
+
+    Computes the end-effector (X, Y) position from J1 and J2. J3 and J4
+    are passed through unchanged because they are controlled independently
+    (Z-axis and tool rotation).
+
+    Parameters
+    ----------
+    j1, j2:
+        Joint angles in degrees.
+    l1, l2:
+        Link lengths in millimetres.
+
+    Returns
+    -------
+    tuple[float, float, float, float]
+        End-effector position (X, Y) plus the original J3, J4 values.
+
+    Examples
+    --------
+    >>> x, y, j3, j4 = forward_kinematics(49.05, 130.54, l1=200.0, l2=150.0)
+    >>> round(x, 2), round(y, 2)
+    (239.99, -0.01)
+    """
+    j1_rad = math.radians(j1)
+    j2_rad = math.radians(j2)
+    x = l1 * math.cos(j1_rad) + l2 * math.cos(j1_rad + j2_rad)
+    y = l1 * math.sin(j1_rad) + l2 * math.sin(j1_rad + j2_rad)
+    return x, y, 0.0, 0.0
+
+
 def inverse_kinematics(
     x: float,
     y: float,

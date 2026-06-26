@@ -205,6 +205,7 @@ class YOLODetector:
             ``True`` if the new camera opened successfully.
         """
         self._stop_read_thread()
+        self._release_capture()
         log.info("Switching camera → index %d", new_idx)
         return self.start_camera(new_idx)
 
@@ -326,6 +327,7 @@ class YOLODetector:
             has_defect=has_defect,
             robot_x=robot_x,
             robot_y=robot_y,
+            annotated_frame=inference_frame,
             _bgr_frame=inference_frame,
         )
 

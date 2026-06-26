@@ -64,6 +64,9 @@ class YOLOConfig:
     px2mm: float = 0.50
     home_x: float = 200.0
     home_y: float = 0.0
+    # Stability tracking: stop re-dispatching once object is stable
+    stable_threshold_mm: float = 2.0   # max distance (mm) between frames to count as stable
+    stable_frames: int = 5             # number of consecutive stable frames before locking
 
 
 @dataclass(slots=True)
@@ -206,6 +209,8 @@ def load_config(path: str | None = None) -> RobotConfig:
         px2mm=float(yolo_raw.get("px2mm", 0.50)),
         home_x=float(yolo_raw.get("home_x", 200.0)),
         home_y=float(yolo_raw.get("home_y", 0.0)),
+        stable_threshold_mm=float(yolo_raw.get("stable_threshold_mm", 2.0)),
+        stable_frames=int(yolo_raw.get("stable_frames", 5)),
     )
 
     # ── Camera ──────────────────────────────────────────────────────────────
