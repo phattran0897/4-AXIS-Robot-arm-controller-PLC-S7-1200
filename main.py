@@ -187,7 +187,7 @@ class RobotApp(ctk.CTk):
     def _do_change_camera(self, choice_str: str) -> None:
         """Actually perform the camera switch (called after debounce)."""
         try:
-            idx: int = int(choice_str.split(" ")[1])
+            idx: int = int(choice_str.strip().split()[0])
         except (IndexError, ValueError) as exc:
             log.error("Cannot parse camera index from '%s': %s", choice_str, exc)
             return
