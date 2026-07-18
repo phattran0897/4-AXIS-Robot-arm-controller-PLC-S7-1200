@@ -1,0 +1,26 @@
+# =============================================================================
+#  requirements.txt – Pinned production dependencies
+#  Install with: pip install -r requirements.txt
+# =============================================================================
+
+# ── Computer Vision / AI ─────────────────────────────────────────────────────
+ultralytics==8.3.40          # YOLOv8 / YOLOv11 inference engine
+opencv-python==4.10.0.84     # Camera capture, frame processing, annotations
+
+# ── PLC Communication ────────────────────────────────────────────────────────
+python-snap7==1.4            # Siemens S7-1200 / S7-1500 via ISO-on-TCP
+
+# ── GUI ──────────────────────────────────────────────────────────────────────
+customtkinter==5.2.2         # Modern Tk-based UI framework
+pillow==11.0.0               # PIL / ImageTk for video frame rendering
+
+# ── Configuration ────────────────────────────────────────────────────────────
+pyyaml==6.0.2                # YAML config file parsing
+
+# ── Core scientific (pulled transitively by ultralytics; pinned for stability)
+numpy==1.26.4
+torch==2.5.1                 # PyTorch CPU/GPU backend for YOLO
+
+# ── Development / CI tools (not required at runtime) ─────────────────────────
+black==24.10.0               # Code formatter
+ruff==0.8.4                  # Fast Python linter (replaces flake8 + isort)

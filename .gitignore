@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+robot_app.log
+assets/
+
+# IDE
+.vscode/
+.idea/
+
+# Virtual environments
+venv/
+.env/
+
+# pytest
+.pytest_cache/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Gemini agent
+.gemini/

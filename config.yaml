@@ -1,0 +1,125 @@
+# =============================================================================
+#  config.yaml – Central configuration for the 4-Axis Industrial Robot System
+#  Edit this file to adapt settings without touching source code.
+# =============================================================================
+
+# ── PLC / Siemens S7-1200 ────────────────────────────────────────────────────
+plc:
+  ip: "192.168.0.1"
+  rack: 0
+  slot: 1
+  db_number: 5
+
+  # Byte offsets inside the Data Block
+  offsets:
+    cmd_word: 0
+    status: 2
+    j1_target: 4
+    j2_target: 8
+    j3_target: 12
+    j4_target: 16
+    motion_done_byte: 20
+    motion_done_bit: 0
+    error_flag_byte: 20
+    error_flag_bit: 1
+    phan_loai_hang_byte: 78
+    phan_loai_hang_bit: 0
+    hang_tot_byte: 78
+    hang_tot_bit: 1
+    hang_xau_byte: 78
+    hang_xau_bit: 2
+
+  # PLC command word values
+  commands:
+    idle: 0
+    home: 1
+    move: 2
+    stop: 3
+
+# ── YOLO / AI Vision ─────────────────────────────────────────────────────────
+yolo:
+  model_path: "my_model/my_model.pt"
+  thresh: 0.70
+
+  # Pixel → millimetre scale factor (calibrate per camera/lens/mounting height)
+  px2mm: 0.50
+
+  # Robot home position in mm (centre of workspace)
+  home_x: 200.0
+  home_y: 0.0
+
+  # ── Stability tracking ─────────────────────────────────────────────────────
+  # Maximum distance (mm) between consecutive frames to count as "stable"
+  stable_threshold_mm: 2.0
+
+  # Number of consecutive stable frames before locking position
+  stable_frames: 5
+
+# ── Camera ───────────────────────────────────────────────────────────────────
+camera:
+  default_index: 0
+
+  # Display resolution inside the GUI label (px)
+  display_width: 440
+  display_height: 310
+
+  # Approximate target frame-rate for the AI processing loop
+  fps: 60
+
+  # YOLO inference resolution – smaller = faster inference, larger = more accurate
+  inference_width: 640
+  inference_height: 480
+
+  # Camera read timeout in seconds (watchdog prevents indefinite blocking)
+  read_timeout: 2.0
+
+# ── Kinematics (4-DOF Articulated Arm – DH Parameters) ───────────────────────
+kinematics:
+  # DH link parameters (mm)
+  d1: 100.0    # Base height
+  a2: 106.0    # Link 2 length
+  a3: 103.0    # Link 3 length
+  a4: 85.0     # Link 4 / end-effector length
+
+  # Joint angle limits (degrees)
+  j1_min: -180.0
+  j1_max: 180.0
+  j2_min: 0.0
+  j2_max: 250.0
+  j3_min: 0.0
+  j3_max: 200.0
+  j4_min: -180.0
+  j4_max: 180.0
+
+  # Default end-effector pitch angle for IK (degrees)
+  default_phi: 0.0
+
+# ── Application / GUI ────────────────────────────────────────────────────────
+app:
+  title: "4-AXIS Industrial Robot Control | VAA"
+  geometry: "1280x820"
+  appearance_mode: "dark"       # "dark" | "light" | "system"
+  color_theme: "blue"
+
+  # Background cyclic PLC polling rate (seconds)
+  plc_poll_interval: 0.10
+
+  # Minimum delay (seconds) after a MOVE command before re-triggering
+  move_cooldown: 1.50
+
+# ── Sort Positions ──────────────────────────────────────────────────────────
+sort_positions:
+  place_good:
+    x: 150.0
+    y: 100.0
+    z_down: -50.0
+    z_up: 0.0
+  place_bad:
+    x: -150.0
+    y: 100.0
+    z_down: -50.0
+    z_up: 0.0
+  pick_z_down: -50.0
+  pick_z_up: 0.0
+  gripper_delay: 0.5
+
