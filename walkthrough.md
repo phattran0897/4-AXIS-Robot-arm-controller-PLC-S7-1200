@@ -11,7 +11,15 @@ This walkthrough summarizes the technical details of the command handshake synch
   - Added a shortcut check to instantly return if targets are already met (meaning `motion_done` remains `True` after the wait) to avoid timeouts.
   - Keeps polling status until `motion_done` is `True` for actual physical moves.
 
-### 2. Test Verification Mismatch
+### 2. Error Resetting Mechanism
+- **File**: [sorting_controller.py](file:///d:/New%20folder/1234/src/robot/sorting_controller.py)
+  - Added `clear_error` method to reset the internal controller state to `RobotState.IDLE`, allowing recovery from motion timeouts or connection drops.
+- **File**: [main.py](file:///d:/New%20folder/1234/main.py)
+  - Exposed `clear_all_errors` on `RobotApp` which calls the PLC's idle command and invokes `clear_error()` on the sorting controller.
+- **File**: [base_page.py](file:///d:/New%20folder/1234/src/ui/base_page.py)
+  - Updated the "Clear Error" GUI button command to call the `clear_all_errors` handler on `RobotApp`.
+
+### 3. Test Verification Mismatch
 - **File**: [test_robot_system.py](file:///d:/New%20folder/1234/tests/test_robot_system.py)
   - Updated `TestBasePage::test_update_video_stores_reference` mock configuration checks to match the actual page configure arguments (`text=""` and `image=fake_tk`).
 
@@ -26,5 +34,5 @@ python -m pytest tests/ -v
 ```
 **Results**: All 32 unit and integration tests passed successfully:
 ```
-============================= 32 passed in 11.39s =============================
+============================= 32 passed in 10.87s =============================
 ```

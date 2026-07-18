@@ -38,16 +38,20 @@ _robot_log = logging.getLogger("RobotApp")
 _robot_log.setLevel(logging.INFO)
 
 _console = logging.StreamHandler()
-_console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s – %(message)s"))
+_console.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s – %(message)s")
+)
 _robot_log.addHandler(_console)
 
 _log_file = RotatingFileHandler(
     "robot_app.log",
-    maxBytes=5_000_000,   # 5 MB per file
+    maxBytes=5_000_000,  # 5 MB per file
     backupCount=3,
     encoding="utf-8",
 )
-_log_file.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s – %(message)s"))
+_log_file.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s – %(message)s")
+)
 _robot_log.addHandler(_log_file)
 
 log = _robot_log
@@ -56,7 +60,7 @@ log = _robot_log
 # Constants
 # ---------------------------------------------------------------------------
 _THREAD_JOIN_TIMEOUT: float = 5.0
-_CAMERA_SWITCH_DEBOUNCE: float = 0.5   # seconds
+_CAMERA_SWITCH_DEBOUNCE: float = 0.5  # seconds
 
 
 class RobotApp(ctk.CTk):
@@ -104,12 +108,12 @@ class RobotApp(ctk.CTk):
 
         # ── Object Lock tracking (AI vision loop) ────────────────────────────
         self._lock_start_time: float | None = None  # monotonic time lock started
-        self._lock_duration: float = 2.5            # seconds to hold lock
-        self._lock_tolerance: float = 15.0          # max position drift (mm)
-        self._lock_target_x: float = 0.0            # locked X position (mm)
-        self._lock_target_y: float = 0.0            # locked Y position (mm)
-        self._lock_class_id: int = 0                # locked class ID
-        self._is_locked: bool = False               # lock confirmed flag
+        self._lock_duration: float = 2.5  # seconds to hold lock
+        self._lock_tolerance: float = 15.0  # max position drift (mm)
+        self._lock_target_x: float = 0.0  # locked X position (mm)
+        self._lock_target_y: float = 0.0  # locked Y position (mm)
+        self._lock_class_id: int = 0  # locked class ID
+        self._is_locked: bool = False  # lock confirmed flag
 
         # ── GUI container + page routing ─────────────────────────────────────
         self._container: ctk.CTkFrame = ctk.CTkFrame(self)
@@ -126,7 +130,9 @@ class RobotApp(ctk.CTk):
         self.header.pack(fill="x")
 
         # Content area (pages)
-        self._content_area: ctk.CTkFrame = ctk.CTkFrame(self._container, fg_color="#0F172A")
+        self._content_area: ctk.CTkFrame = ctk.CTkFrame(
+            self._container, fg_color="#0F172A"
+        )
         self._content_area.pack(fill="both", expand=True)
         self._content_area.grid_rowconfigure(0, weight=1)
         self._content_area.grid_columnconfigure(0, weight=1)
@@ -144,7 +150,7 @@ class RobotApp(ctk.CTk):
         # Title / header line
         console_header = ctk.CTkFrame(self.tx_console_frame, fg_color="transparent")
         console_header.pack(fill="x", padx=12, pady=(8, 4))
-        
+
         ctk.CTkLabel(
             console_header,
             text="💻  PLC TRANSMISSION TELEMETRY",
@@ -212,7 +218,7 @@ class RobotApp(ctk.CTk):
         self.header.update_active_tab(page_name)
         log.debug("Switched to page: %s", page_name)
         if page_name == "PageAuto":
-            self.plc.send_pulse(0, 2)   # AUTO_MODE (offset 0.2)
+            self.plc.send_pulse(0, 2)  # AUTO_MODE (offset 0.2)
         elif page_name == "PageManual":
             self.plc.send_pulse(16, 0)  # MANUAL_MODE (offset 16.0)
 
@@ -241,7 +247,8 @@ class RobotApp(ctk.CTk):
         """Actually perform the camera switch (called after debounce)."""
         try:
             import re
-            match = re.search(r'\d+', choice_str)
+
+            match = re.search(r"\d+", choice_str)
             if not match:
                 raise ValueError("No digits found in string")
             idx: int = int(match.group())
@@ -255,6 +262,7 @@ class RobotApp(ctk.CTk):
             log.info("Camera switched to index %d.", idx)
         else:
             from tkinter import messagebox
+
             messagebox.showerror(
                 "Hardware Error",
                 f"Cannot open camera at index {idx}.\n"
@@ -280,7 +288,6 @@ class RobotApp(ctk.CTk):
         import math as _math
 
         cam_cfg = self.cfg.camera
-        yolo_cfg = self.cfg.yolo
 
         try:
             if not self.detector.start_camera(cam_cfg.default_index):
@@ -310,7 +317,11 @@ class RobotApp(ctk.CTk):
                         has_defect, rx, ry, class_id = last_detection
                         annotated = result.annotated_frame
 
-                        if has_defect and self.plc.is_connected() and self._sorter.is_idle():
+                        if (
+                            has_defect
+                            and self.plc.is_connected()
+                            and self._sorter.is_idle()
+                        ):
                             now = time.monotonic()
 
                             if self._lock_start_time is None:
@@ -322,7 +333,9 @@ class RobotApp(ctk.CTk):
                                 self._is_locked = False
                                 log.info(
                                     "Object detected – starting lock (X=%.2f Y=%.2f class=%d)",
-                                    rx, ry, class_id,
+                                    rx,
+                                    ry,
+                                    class_id,
                                 )
                             else:
                                 # ── Ongoing lock: check position stability ──────────
@@ -335,7 +348,8 @@ class RobotApp(ctk.CTk):
                                     # Object moved too much – restart lock
                                     log.info(
                                         "Lock reset – object drifted %.1fmm (tolerance=%.1fmm)",
-                                        drift, self._lock_tolerance,
+                                        drift,
+                                        self._lock_tolerance,
                                     )
                                     self._lock_start_time = now
                                     self._lock_target_x = rx
@@ -346,7 +360,10 @@ class RobotApp(ctk.CTk):
                                     # Position stable – check if lock duration met
                                     elapsed = now - self._lock_start_time
 
-                                    if elapsed >= self._lock_duration and not self._is_locked:
+                                    if (
+                                        elapsed >= self._lock_duration
+                                        and not self._is_locked
+                                    ):
                                         # ── Lock confirmed → dispatch to PLC ────────
                                         self._is_locked = True
                                         # Model class mapping: 0 = Defect (BAD), 1 = Good (GOOD)
@@ -375,7 +392,10 @@ class RobotApp(ctk.CTk):
                                         self._sort_thread.start()
 
                             # ── Draw lock overlay on the frame ──────────────────────
-                            if annotated is not None and self._lock_start_time is not None:
+                            if (
+                                annotated is not None
+                                and self._lock_start_time is not None
+                            ):
                                 elapsed = now - self._lock_start_time
                                 progress = min(elapsed / self._lock_duration, 1.0)
                                 self.detector.draw_lock_overlay(
@@ -384,22 +404,33 @@ class RobotApp(ctk.CTk):
 
                         else:
                             # No defect or sorter busy – reset lock state
-                            if self._lock_start_time is not None and not self._is_locked:
+                            if (
+                                self._lock_start_time is not None
+                                and not self._is_locked
+                            ):
                                 log.info("Lock cancelled – object lost or sorter busy.")
                             if not self._is_locked:
                                 self._lock_start_time = None
 
                         # ── Step 4: Update GUI video label ──────────────────────────
-                        pil = result.to_pil(cam_cfg.display_width, cam_cfg.display_height)
+                        pil = result.to_pil(
+                            cam_cfg.display_width, cam_cfg.display_height
+                        )
                         if pil is not None:
                             self._update_video_label(pil)
 
                     except Exception as frame_exc:
-                        log.error("Exception during frame processing: %s", frame_exc, exc_info=True)
+                        log.error(
+                            "Exception during frame processing: %s",
+                            frame_exc,
+                            exc_info=True,
+                        )
 
                 self._stop_event.wait(frame_interval)
         except Exception as thread_exc:
-            log.critical("AIVisionThread crashed with exception: %s", thread_exc, exc_info=True)
+            log.critical(
+                "AIVisionThread crashed with exception: %s", thread_exc, exc_info=True
+            )
 
         log.info("AI vision thread exited cleanly.")
 
@@ -415,6 +446,11 @@ class RobotApp(ctk.CTk):
             # Reset lock state so next detection can start fresh
             self._lock_start_time = None
             self._is_locked = False
+
+    def clear_all_errors(self) -> None:
+        """Clear errors on PLC and reset sorting controller state."""
+        self.plc.send_command(self.cfg.plc.commands.idle)
+        self._sorter.clear_error()
 
     def _dispatch_target_to_plc(self, rx: float, ry: float) -> None:
         """Compute IK and send joint targets + move command to the PLC."""
@@ -449,6 +485,7 @@ class RobotApp(ctk.CTk):
 
     def log_tx(self, message: str) -> None:
         """Append a timestamped message to the transmission telemetry log (thread-safe)."""
+
         def _append():
             timestamp = time.strftime("%H:%M:%S")
             self.tx_textbox.configure(state="normal")
@@ -459,6 +496,7 @@ class RobotApp(ctk.CTk):
             if len(lines) > 100:
                 self.tx_textbox.delete("1.0", f"{len(lines) - 100}.0")
             self.tx_textbox.configure(state="disabled")
+
         self.after(0, _append)
 
     # ------------------------------------------------------------------
@@ -490,7 +528,8 @@ class RobotApp(ctk.CTk):
                 if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
                     log.warning(
                         "PLC offline – attempting reconnection (attempt %d, backoff %.1fs)…",
-                        consecutive_failures, retry_delay
+                        consecutive_failures,
+                        retry_delay,
                     )
                 try:
                     self.plc.connect()
@@ -512,7 +551,11 @@ class RobotApp(ctk.CTk):
 
         # Update footer status
         plc_connected = self.plc.is_connected()
-        camera_active = self.detector.is_camera_active() if hasattr(self.detector, 'is_camera_active') else False
+        camera_active = (
+            self.detector.is_camera_active()
+            if hasattr(self.detector, "is_camera_active")
+            else False
+        )
         system_ok = not data.get("error_flag", False)
         self.footer.update_status(plc_connected, camera_active, system_ok)
 

@@ -89,6 +89,12 @@ class SortingController:
         self._counter_bad = 0
         log.info("Sorting counters reset to zero.")
 
+    def clear_error(self) -> None:
+        """Reset the internal controller state to IDLE after an error has been resolved."""
+        self._state = RobotState.IDLE
+        self._last_sort_result = None
+        log.info("SortingController error state cleared; reset to IDLE.")
+
     def _ik(self, x: float, y: float, z: float) -> tuple[float, float, float, float]:
         """
         Compute 4-DOF articulated-arm inverse kinematics.

@@ -15,12 +15,9 @@ from typing import TYPE_CHECKING, Any
 import customtkinter as ctk
 
 from src.ui.theme import (
-    ACCENT,
-    ACCENT_DARK,
     PANEL_BG,
     PANEL_BORDER,
     SUCCESS,
-    WARNING,
     DANGER,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
@@ -258,9 +255,7 @@ class BasePage(ctk.CTkFrame):
             width=110,
             height=32,
             corner_radius=8,
-            command=lambda: self.controller.plc.send_command(
-                self.controller.cfg.plc.commands.idle
-            ),
+            command=self.controller.clear_all_errors,
         ).pack(side="left", padx=20, pady=12)
 
         # Right: Navigate button
