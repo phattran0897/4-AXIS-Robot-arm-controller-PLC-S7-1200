@@ -18,12 +18,9 @@ Test coverage areas
 
 from __future__ import annotations
 
-import math
 import os
-import sys
 import tempfile
 import textwrap
-import threading
 import unittest
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -37,6 +34,7 @@ import numpy as np
 _HAVE_SNAP7 = False
 try:
     import snap7  # noqa: F401
+
     _HAVE_SNAP7 = True
 except ImportError:
     pass
@@ -44,6 +42,7 @@ except ImportError:
 _HAVE_CV2 = False
 try:
     import cv2  # noqa: F401
+
     _HAVE_CV2 = True
 except ImportError:
     pass
@@ -51,6 +50,7 @@ except ImportError:
 _HAVE_CUSTOMTKINTER = False
 try:
     import customtkinter  # noqa: F401
+
     _HAVE_CUSTOMTKINTER = True
 except ImportError:
     pass
@@ -59,6 +59,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers – build minimal configs without touching the filesystem
 # ---------------------------------------------------------------------------
+
 
 def _make_robot_config() -> "RobotConfig":  # noqa: F821
     from src.config_loader import (
@@ -113,6 +114,7 @@ def _make_robot_config() -> "RobotConfig":  # noqa: F821
 # 1 – Config Loader
 # ===========================================================================
 
+
 class TestConfigLoader(unittest.TestCase):
     """Tests for src/config_loader.py"""
 
@@ -126,7 +128,8 @@ class TestConfigLoader(unittest.TestCase):
     # ── TC-01 ────────────────────────────────────────────────────────────────
     def test_load_full_config_parses_all_sections(self) -> None:
         """A fully-populated config.yaml must map to the correct dataclass fields."""
-        path = self._write_yaml("""
+        path = self._write_yaml(
+            """
             plc:
               ip: "10.0.0.1"
               rack: 1
@@ -166,9 +169,11 @@ class TestConfigLoader(unittest.TestCase):
               color_theme: "green"
               plc_poll_interval: 0.05
               move_cooldown: 2.0
-        """)
+        """
+        )
         try:
             from src.config_loader import load_config
+
             cfg = load_config(path)
             self.assertEqual(cfg.plc.ip, "10.0.0.1")
             self.assertEqual(cfg.plc.rack, 1)
@@ -190,6 +195,7 @@ class TestConfigLoader(unittest.TestCase):
     def test_missing_config_file_raises_file_not_found(self) -> None:
         """load_config() must raise FileNotFoundError for a non-existent path."""
         from src.config_loader import load_config
+
         with self.assertRaises(FileNotFoundError):
             load_config("/tmp/this_file_does_not_exist_xyz.yaml")
 
@@ -199,6 +205,7 @@ class TestConfigLoader(unittest.TestCase):
         path = self._write_yaml("plc:\n  ip: '192.168.1.50'\n")
         try:
             from src.config_loader import load_config
+
             cfg = load_config(path)
             self.assertEqual(cfg.plc.ip, "192.168.1.50")
             self.assertEqual(cfg.plc.rack, 0)
@@ -214,6 +221,7 @@ class TestConfigLoader(unittest.TestCase):
 # 2 – Inverse Kinematics (tests the standalone module)
 # ===========================================================================
 
+
 class TestInverseKinematicsModule(unittest.TestCase):
     """Tests for src/kinematics/kinematics.py (4-DOF articulated robot arm)"""
 
@@ -221,6 +229,7 @@ class TestInverseKinematicsModule(unittest.TestCase):
     def test_fk_all_zeros(self) -> None:
         """FK at all-zero joints must give (294, 0, 100)."""
         from src.kinematics import forward_kinematics
+
         x, y, z = forward_kinematics(0.0, 0.0, 0.0, 0.0)
         # r = 106 + 103 + 85 = 294, z = 100
         self.assertAlmostEqual(x, 294.0, places=1)
@@ -231,6 +240,7 @@ class TestInverseKinematicsModule(unittest.TestCase):
     def test_fk_ik_round_trip(self) -> None:
         """FK → IK → FK must return the same position."""
         from src.kinematics import forward_kinematics, inverse_kinematics
+
         # Pick specific joint angles
         j1, j2, j3, j4 = 30.0, 20.0, -15.0, -5.0
         x, y, z = forward_kinematics(j1, j2, j3, j4)
@@ -245,12 +255,14 @@ class TestInverseKinematicsModule(unittest.TestCase):
     def test_ik_at_rotation_centre_raises_workspace_error(self) -> None:
         """IK must raise WorkspaceError when target is at rotation centre."""
         from src.kinematics import inverse_kinematics, WorkspaceError
+
         with self.assertRaises(WorkspaceError):
             inverse_kinematics(0.0, 0.0, 100.0)
 
     def test_ik_base_rotation(self) -> None:
         """IK for equal X, Y must give θ₁ = 45°."""
         from src.kinematics import forward_kinematics, inverse_kinematics
+
         # Get a reachable point at 45° by computing FK with θ₁=45°
         x, y, z = forward_kinematics(45.0, 0.0, 0.0, 0.0)
         j1, j2, j3, j4 = inverse_kinematics(x, y, z, phi=0.0)
@@ -259,6 +271,7 @@ class TestInverseKinematicsModule(unittest.TestCase):
     def test_ik_unreachable_point_raises_workspace_error(self) -> None:
         """IK must raise WorkspaceError for a point beyond max reach."""
         from src.kinematics import inverse_kinematics, WorkspaceError
+
         with self.assertRaises(WorkspaceError):
             # Max reach = 106+103+85 = 294 mm, so 500 mm is unreachable
             inverse_kinematics(500.0, 0.0, 100.0, phi=0.0)
@@ -266,6 +279,7 @@ class TestInverseKinematicsModule(unittest.TestCase):
     def test_reachable_function(self) -> None:
         """reachable() must correctly classify in/out-of-workspace points."""
         from src.kinematics import reachable
+
         # All-zero joints reach (294, 0, 100) → should be reachable
         self.assertTrue(reachable(294.0, 0.0, 100.0, phi=0.0))
         # Way too far out
@@ -274,6 +288,7 @@ class TestInverseKinematicsModule(unittest.TestCase):
     def test_fk_with_base_rotation(self) -> None:
         """FK with θ₁=90° should swap X and Y (X≈0, Y=r)."""
         from src.kinematics import forward_kinematics
+
         x, y, z = forward_kinematics(90.0, 0.0, 0.0, 0.0)
         self.assertAlmostEqual(x, 0.0, places=1)
         self.assertAlmostEqual(y, 294.0, places=1)
@@ -284,6 +299,7 @@ class TestInverseKinematicsModule(unittest.TestCase):
 # 3 – PLCController  (run only when snap7 is available)
 # ===========================================================================
 
+
 @unittest.skipUnless(_HAVE_SNAP7, "snap7 not installed")
 class TestPLCController(unittest.TestCase):
     """Tests for src/plc/plc_controller.py"""
@@ -291,6 +307,7 @@ class TestPLCController(unittest.TestCase):
     def _make_controller(self) -> tuple[Any, MagicMock]:
         """Return (PLCController, mock_snap7_client)."""
         from src.plc.plc_controller import PLCController
+
         cfg = _make_robot_config().plc
         ctrl = PLCController(cfg)
         mock_client = MagicMock()
@@ -317,14 +334,15 @@ class TestPLCController(unittest.TestCase):
     def test_read_status_parses_db_bytes(self) -> None:
         """read_status() must decode byte array into the expected dict keys."""
         from snap7.util import set_bool, set_real
+
         ctrl, mock_client = self._make_controller()
         mock_client.get_connected.return_value = True
 
         raw = bytearray(80)
         set_bool(raw, 0, 2, True)  # auto_mode
-        set_real(raw, 4, 45.0)     # j1_target (offset 4)
-        set_real(raw, 8, 30.0)     # j2_target (offset 8)
-        set_real(raw, 12, 15.0)    # j3_target (offset 12)
+        set_real(raw, 4, 45.0)  # j1_target (offset 4)
+        set_real(raw, 8, 30.0)  # j2_target (offset 8)
+        set_real(raw, 12, 15.0)  # j3_target (offset 12)
         mock_client.db_read.return_value = raw
 
         data = ctrl.read_status()
@@ -352,6 +370,7 @@ class TestPLCController(unittest.TestCase):
 
         ctrl.send_command(2)  # CMD MOVE pulses START_AUTO (0, 0)
         import time
+
         time.sleep(0.2)
 
         self.assertGreaterEqual(mock_client.db_write.call_count, 1)
@@ -378,7 +397,9 @@ class TestPLCController(unittest.TestCase):
 
         # Targets are written synchronously to offset j1_target (default=4)
         target_offset = ctrl._cfg.offsets.j1_target
-        mock_client.db_write.assert_any_call(ctrl._cfg.db_number, target_offset, unittest.mock.ANY)
+        mock_client.db_write.assert_any_call(
+            ctrl._cfg.db_number, target_offset, unittest.mock.ANY
+        )
         # Verify the written buffer has length 16 (4 × REAL = J1-J4)
         for call in mock_client.db_write.call_args_list:
             db, offset, buf = call[0]
@@ -394,12 +415,15 @@ class TestPLCController(unittest.TestCase):
         ctrl.send_joint_targets_and_command(10.0, 20.0, 30.0, 0.0, cmd=2)
 
         target_offset = ctrl._cfg.offsets.j1_target
-        mock_client.db_write.assert_any_call(ctrl._cfg.db_number, target_offset, unittest.mock.ANY)
+        mock_client.db_write.assert_any_call(
+            ctrl._cfg.db_number, target_offset, unittest.mock.ANY
+        )
 
 
 # ===========================================================================
 # 4 – YOLODetector  (run only when cv2 is available)
 # ===========================================================================
+
 
 @unittest.skipUnless(_HAVE_CV2, "opencv-python not installed")
 class TestYOLODetector(unittest.TestCase):
@@ -413,6 +437,7 @@ class TestYOLODetector(unittest.TestCase):
         """read_frame() must return None when VideoCapture is not open."""
         with patch("src.ai.yolo_detector.YOLO"):
             from src.ai.yolo_detector import YOLODetector
+
             with patch("os.path.isfile", return_value=True):
                 detector = YOLODetector(model_path="fake.pt", thresh=0.5)
         detector._cap = None
@@ -427,10 +452,14 @@ class TestYOLODetector(unittest.TestCase):
         with patch("src.ai.yolo_detector.YOLO") as mock_yolo_cls:
             mock_yolo_cls.return_value.return_value = [mock_result]
             from src.ai.yolo_detector import YOLODetector
+
             with patch("os.path.isfile", return_value=True):
                 detector = YOLODetector(
-                    model_path="fake.pt", thresh=0.5, px2mm=0.5,
-                    home_x=200.0, home_y=0.0,
+                    model_path="fake.pt",
+                    thresh=0.5,
+                    px2mm=0.5,
+                    home_x=200.0,
+                    home_y=0.0,
                 )
 
         frame = self._make_frame()
@@ -455,10 +484,14 @@ class TestYOLODetector(unittest.TestCase):
         with patch("src.ai.yolo_detector.YOLO") as mock_yolo_cls:
             mock_yolo_cls.return_value.return_value = [mock_result]
             from src.ai.yolo_detector import YOLODetector
+
             with patch("os.path.isfile", return_value=True):
                 detector = YOLODetector(
-                    model_path="fake.pt", thresh=0.5, px2mm=0.5,
-                    home_x=200.0, home_y=0.0,
+                    model_path="fake.pt",
+                    thresh=0.5,
+                    px2mm=0.5,
+                    home_x=200.0,
+                    home_y=0.0,
                 )
 
         frame = self._make_frame(h=480, w=640)
@@ -473,13 +506,15 @@ class TestYOLODetector(unittest.TestCase):
         old_cap = MagicMock()
         old_cap.isOpened.return_value = True
 
-        with patch("src.ai.yolo_detector.YOLO"), \
-             patch("cv2.VideoCapture") as mock_cap_cls:
+        with patch("src.ai.yolo_detector.YOLO"), patch(
+            "cv2.VideoCapture"
+        ) as mock_cap_cls:
             new_cap = MagicMock()
             new_cap.isOpened.return_value = True
             mock_cap_cls.return_value = new_cap
 
             from src.ai.yolo_detector import YOLODetector
+
             with patch("os.path.isfile", return_value=True):
                 detector = YOLODetector(model_path="fake.pt", thresh=0.5)
             detector._cap = old_cap
@@ -497,10 +532,14 @@ class TestYOLODetector(unittest.TestCase):
         with patch("src.ai.yolo_detector.YOLO") as mock_yolo_cls:
             mock_yolo_cls.return_value.return_value = [mock_result]
             from src.ai.yolo_detector import YOLODetector
+
             with patch("os.path.isfile", return_value=True):
                 detector = YOLODetector(
-                    model_path="fake.pt", thresh=0.5, px2mm=0.5,
-                    home_x=200.0, home_y=0.0,
+                    model_path="fake.pt",
+                    thresh=0.5,
+                    px2mm=0.5,
+                    home_x=200.0,
+                    home_y=0.0,
                 )
 
         frame = self._make_frame()
@@ -512,9 +551,11 @@ class TestYOLODetector(unittest.TestCase):
 
     def test_model_path_resolved_relative_to_project(self) -> None:
         """Model path not found must raise FileNotFoundError."""
-        with patch("os.path.isabs", return_value=False), \
-             patch("os.path.isfile", return_value=False):
+        with patch("os.path.isabs", return_value=False), patch(
+            "os.path.isfile", return_value=False
+        ):
             from src.ai.yolo_detector import YOLODetector
+
             with self.assertRaises(FileNotFoundError):
                 YOLODetector(model_path="models/best.pt", thresh=0.5)
 
@@ -522,6 +563,7 @@ class TestYOLODetector(unittest.TestCase):
 # ===========================================================================
 # 5 – BasePage  (run only when customtkinter is available)
 # ===========================================================================
+
 
 @unittest.skipUnless(_HAVE_CUSTOMTKINTER, "customtkinter not installed")
 class TestBasePage(unittest.TestCase):
@@ -539,12 +581,13 @@ class TestBasePage(unittest.TestCase):
         page.update_video(fake_tk)
 
         self.assertIs(page._current_tk_image, fake_tk)
-        page.video_label.configure.assert_called_once_with(image=fake_tk)
+        page.video_label.configure.assert_called_once_with(text="", image=fake_tk)
 
 
 # ===========================================================================
 # 6 – PLC DB read-size computation
 # ===========================================================================
+
 
 class TestPLCDbReadSize(unittest.TestCase):
     """Test the DB read-size auto-computation."""
@@ -564,6 +607,7 @@ class TestPLCDbReadSize(unittest.TestCase):
 # 7 – SortingController
 # ===========================================================================
 
+
 class TestSortingController(unittest.TestCase):
     """Tests for src/robot/sorting_controller.py"""
 
@@ -571,6 +615,7 @@ class TestSortingController(unittest.TestCase):
         """IK on reachable point must return non-zero angles."""
         from src.config_loader import KinematicsConfig, SortPositionsConfig, PLCCommands
         from src.robot.sorting_controller import SortingController
+
         positions = SortPositionsConfig()
         kinematics = KinematicsConfig()
         plc_commands = PLCCommands()
@@ -584,6 +629,7 @@ class TestSortingController(unittest.TestCase):
         """IK on unreachable point must return (0.0, 0.0, 0.0, 0.0)."""
         from src.config_loader import KinematicsConfig, SortPositionsConfig, PLCCommands
         from src.robot.sorting_controller import SortingController
+
         positions = SortPositionsConfig()
         kinematics = KinematicsConfig()
         plc_commands = PLCCommands()
@@ -599,6 +645,7 @@ class TestSortingController(unittest.TestCase):
         """execute_sort() must call the PLC with targets and correct commands sequentially."""
         from src.config_loader import KinematicsConfig, SortPositionsConfig, PLCCommands
         from src.robot.sorting_controller import SortingController, SortResult
+
         positions = SortPositionsConfig()
         kinematics = KinematicsConfig()
         plc_commands = PLCCommands()
@@ -622,6 +669,7 @@ class TestSortingController(unittest.TestCase):
         """execute_sort() with SortResult.GOOD must increment only counter_good."""
         from src.config_loader import KinematicsConfig, SortPositionsConfig, PLCCommands
         from src.robot.sorting_controller import SortingController, SortResult
+
         positions = SortPositionsConfig()
         kinematics = KinematicsConfig()
         plc_commands = PLCCommands()
@@ -639,6 +687,7 @@ class TestSortingController(unittest.TestCase):
         """execute_sort() with SortResult.BAD must increment only counter_bad."""
         from src.config_loader import KinematicsConfig, SortPositionsConfig, PLCCommands
         from src.robot.sorting_controller import SortingController, SortResult
+
         positions = SortPositionsConfig()
         kinematics = KinematicsConfig()
         plc_commands = PLCCommands()
@@ -656,6 +705,7 @@ class TestSortingController(unittest.TestCase):
         """reset_counters() must clear good and bad sorting counts to zero."""
         from src.config_loader import KinematicsConfig, SortPositionsConfig, PLCCommands
         from src.robot.sorting_controller import SortingController, SortResult
+
         positions = SortPositionsConfig()
         kinematics = KinematicsConfig()
         plc_commands = PLCCommands()
@@ -680,4 +730,3 @@ class TestSortingController(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-

@@ -5,7 +5,6 @@ src/robot/sorting_controller.py – Automated pick-and-place sorting controller.
 from __future__ import annotations
 
 import logging
-import math
 import threading
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -95,15 +94,14 @@ class SortingController:
         Compute 4-DOF articulated-arm inverse kinematics.
         """
         from src.kinematics import inverse_kinematics, InverseKinematicsError
+
         try:
             return inverse_kinematics(x, y, z, phi=self.kinematics.default_phi)
         except InverseKinematicsError as exc:
             log.warning("IK failed for target (%.2f, %.2f, %.2f): %s", x, y, z, exc)
             return 0.0, 0.0, 0.0, 0.0
 
-    def execute_sort(
-        self, pick_x: float, pick_y: float, result: SortResult
-    ) -> None:
+    def execute_sort(self, pick_x: float, pick_y: float, result: SortResult) -> None:
         """Execute a complete pick-and-place sorting cycle."""
         log.info(
             "Starting sort cycle: Pick=(%.2f, %.2f), Result=%s",
@@ -155,8 +153,19 @@ class SortingController:
         # Calculate joints for z_down
         j1_down, j2_down, j3_down, j4_down = self._ik(x, y, self.positions.pick_z_down)
 
-        log.info("Picking target (%.2f, %.2f) -> Up: [%.2f, %.2f, %.2f, %.2f], Down: [%.2f, %.2f, %.2f, %.2f]",
-                 x, y, j1_up, j2_up, j3_up, j4_up, j1_down, j2_down, j3_down, j4_down)
+        log.info(
+            "Picking target (%.2f, %.2f) -> Up: [%.2f, %.2f, %.2f, %.2f], Down: [%.2f, %.2f, %.2f, %.2f]",
+            x,
+            y,
+            j1_up,
+            j2_up,
+            j3_up,
+            j4_up,
+            j1_down,
+            j2_down,
+            j3_down,
+            j4_down,
+        )
 
         # Move to XY at z_up
         self._move_and_wait(j1_up, j2_up, j3_up, j4_up)
@@ -186,8 +195,18 @@ class SortingController:
         # Calculate joints for z_down
         j1_down, j2_down, j3_down, j4_down = self._ik(target.x, target.y, target.z_down)
 
-        log.info("Placing target to %s -> Up: [%.2f, %.2f, %.2f, %.2f], Down: [%.2f, %.2f, %.2f, %.2f]",
-                 result.name, j1_up, j2_up, j3_up, j4_up, j1_down, j2_down, j3_down, j4_down)
+        log.info(
+            "Placing target to %s -> Up: [%.2f, %.2f, %.2f, %.2f], Down: [%.2f, %.2f, %.2f, %.2f]",
+            result.name,
+            j1_up,
+            j2_up,
+            j3_up,
+            j4_up,
+            j1_down,
+            j2_down,
+            j3_down,
+            j4_down,
+        )
 
         # Move to placement XY at z_up
         self._move_and_wait(j1_up, j2_up, j3_up, j4_up)
@@ -225,25 +244,33 @@ class SortingController:
         self.plc.send_joint_targets_and_command(j1, j2, j3, j4, target_cmd)
 
         import time
+
         t_start = time.monotonic()
 
+        # 1. Wait a short time (e.g. 200ms) for the PLC to receive the command
+        # and transition 'motion_done' to False.
+        self._wait_event.wait(0.2)
+
+        # 2. Check if motion is already done (or didn't register a state change because targets were already met)
+        status = self.plc.read_status()
+        if status and status.get("motion_done", False):
+            log.info(
+                "Motion completed immediately (targets already met or simulation mode)."
+            )
+            return
+
+        # 3. Loop until motion_done becomes True (with timeout)
         while True:
             if time.monotonic() - t_start > timeout:
-                raise TimeoutError(
-                    f"Motion timeout ({timeout}s) exceeded during move."
-                )
+                raise TimeoutError(f"Motion timeout ({timeout}s) exceeded during move.")
 
             status = self.plc.read_status()
             if not status:
                 # If PLC disconnects during cycle, abort immediately
-                raise RuntimeError(
-                    "PLC offline during active pick-and-place motion."
-                )
+                raise RuntimeError("PLC offline during active pick-and-place motion.")
 
             if status.get("error_flag", False):
-                raise RuntimeError(
-                    "PLC error flag activated during active motion."
-                )
+                raise RuntimeError("PLC error flag activated during active motion.")
 
             if status.get("motion_done", False):
                 break
