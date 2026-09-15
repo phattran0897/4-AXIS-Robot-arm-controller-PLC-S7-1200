@@ -14,10 +14,10 @@ plc:
   offsets:
     cmd_word: 0
     status: 2
-    j1_target: 4
-    j2_target: 8
-    j3_target: 12
-    j4_target: 16
+    j1_target: 42
+    j2_target: 46
+    j3_target: 50
+    j4_target: -1  # Not mapped in PLC Image, set to -1 to ignore
     motion_done_byte: 20
     motion_done_bit: 0
     error_flag_byte: 20
@@ -35,11 +35,12 @@ plc:
     home: 1
     move: 2
     stop: 3
+    grip: 4
 
 # ── YOLO / AI Vision ─────────────────────────────────────────────────────────
 yolo:
   model_path: "my_model/my_model.pt"
-  thresh: 0.70
+  thresh: 0.50
 
   # Pixel → millimetre scale factor (calibrate per camera/lens/mounting height)
   px2mm: 0.50
@@ -48,12 +49,12 @@ yolo:
   home_x: 200.0
   home_y: 0.0
 
-  # ── Stability tracking ─────────────────────────────────────────────────────
-  # Maximum distance (mm) between consecutive frames to count as "stable"
-  stable_threshold_mm: 2.0
-
-  # Number of consecutive stable frames before locking position
-  stable_frames: 5
+  # ── Manual Capture ROI ─────────────────────────────────────────────────────
+  # Region of Interest for manual cropping (X, Y, Width, Height)
+  roi_x: 190
+  roi_y: 100
+  roi_width: 200
+  roi_height: 190
 
 # ── Camera ───────────────────────────────────────────────────────────────────
 camera:
@@ -66,6 +67,9 @@ camera:
   # Approximate target frame-rate for the AI processing loop
   fps: 60
 
+  # GUI preview redraw rate (decoupled from camera fps to reduce CPU load)
+  preview_fps: 20
+
   # YOLO inference resolution – smaller = faster inference, larger = more accurate
   inference_width: 640
   inference_height: 480
@@ -76,10 +80,11 @@ camera:
 # ── Kinematics (4-DOF Articulated Arm – DH Parameters) ───────────────────────
 kinematics:
   # DH link parameters (mm)
-  d1: 100.0    # Base height
-  a2: 106.0    # Link 2 length
-  a3: 103.0    # Link 3 length
-  a4: 85.0     # Link 4 / end-effector length
+  a1: 40.0     # Base horizontal offset
+  d1: 300.0    # Base height
+  a2: 190.0    # Link 2 length
+  a3: 110.0    # Link 3 length
+  a4: 65.0     # Link 4 / end-effector length
 
   # Joint angle limits (degrees)
   j1_min: -180.0
@@ -112,14 +117,14 @@ sort_positions:
   place_good:
     x: 150.0
     y: 100.0
-    z_down: -50.0
-    z_up: 0.0
+    z_down: 80.0
+    z_up: 150.0
   place_bad:
     x: -150.0
     y: 100.0
-    z_down: -50.0
-    z_up: 0.0
-  pick_z_down: -50.0
-  pick_z_up: 0.0
+    z_down: 80.0
+    z_up: 150.0
+  pick_z_down: 80.0
+  pick_z_up: 150.0
   gripper_delay: 0.5
 

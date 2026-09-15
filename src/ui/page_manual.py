@@ -13,17 +13,21 @@ from typing import TYPE_CHECKING, Any
 import customtkinter as ctk
 from tkinter import messagebox
 
-from src.kinematics import forward_kinematics, inverse_kinematics
+from src.kinematics import JOINT_LIMITS, forward_kinematics, inverse_kinematics
+from src.plc.plc_controller import ADDR
 from src.ui.base_page import BasePage
 from src.ui.theme import (
     ACCENT,
+    DANGER,
+    DANGER_HOVER,
+    ENTRY_BG,
+    INFO,
+    MANUAL_ACCENT,
     PANEL_BORDER,
     SUCCESS,
-    DANGER,
+    SUCCESS_HOVER,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
-    CARD_BG,
-    MANUAL_ACCENT,
 )
 
 if TYPE_CHECKING:
@@ -41,7 +45,7 @@ class PageManual(BasePage):
     ┌─────────────────────────────────────────────────────────────────┐
     │  Column 0              │  Column 1           │  Column 2       │
     │  Kinematics Input       │  Actuator Control   │  Camera Feed   │
-    │  (FK/IK Toggle)        │  (Home/Gripper)    │               │
+    │  (FK/IK Toggle)        │  (Home/Gripper)     │                │
     └─────────────────────────────────────────────────────────────────┘
     """
 
@@ -53,6 +57,16 @@ class PageManual(BasePage):
         self._last_ik_result: tuple[float, float, float, float] | None = None
         self._last_fk_coords: tuple[float, float, float] | None = None
         self._last_ik_coords: tuple[float, float, float] | None = None
+        # JOG toggle states and button references (keys == PLC bit addresses)
+        self._jog_states: dict[tuple[int, int], bool] = {
+            ADDR.JOG_J1_LEFT: False,
+            ADDR.JOG_J1_RIGHT: False,
+            ADDR.JOG_J2_UP: False,
+            ADDR.JOG_J2_DOWN: False,
+            ADDR.JOG_J3_UP: False,
+            ADDR.JOG_J3_DOWN: False,
+        }
+        self._jog_buttons: dict[tuple[int, int], ctk.CTkButton] = {}
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -61,11 +75,7 @@ class PageManual(BasePage):
 
     def _build_ui(self) -> None:
         # Status bar first (packed side="bottom", fill="x")
-        self.lbl_err_status = self.build_status_bar(
-            navigate_text="<< AUTO MODE <<",
-            navigate_target="PageAuto",
-            navigate_color="#4F46E5",
-        )
+        self.lbl_err_status = self.build_status_bar()
 
         # Main content area
         main_layout = ctk.CTkFrame(self, fg_color="transparent")
@@ -89,24 +99,7 @@ class PageManual(BasePage):
         frame = self._create_card(parent)
         frame.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
 
-        # Section header
-        header = ctk.CTkFrame(frame, fg_color="transparent")
-        header.pack(fill="x", padx=15, pady=(15, 10))
-
-        icon_label = ctk.CTkLabel(
-            header,
-            text="🎯",
-            font=ctk.CTkFont(size=20),
-            text_color=MANUAL_ACCENT,
-        )
-        icon_label.pack(side="left", padx=(0, 8))
-
-        ctk.CTkLabel(
-            header,
-            text="KINEMATICS INPUT",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=MANUAL_ACCENT,
-        ).pack(side="left")
+        self.build_section_header(frame, "🎯", "KINEMATICS INPUT", MANUAL_ACCENT)
 
         # Mode toggle – two buttons: THUẬN (16.5) and NGHỊCH (16.6)
         mode_frame = ctk.CTkFrame(frame, fg_color="transparent")
@@ -129,7 +122,7 @@ class PageManual(BasePage):
             text="THUẬN",
             font=ctk.CTkFont(size=10, weight="bold"),
             fg_color=SUCCESS,
-            hover_color="#059669",
+            hover_color=SUCCESS_HOVER,
             text_color="white",
             width=70,
             height=28,
@@ -159,7 +152,7 @@ class PageManual(BasePage):
         entry_frame.pack(fill="both", expand=True, padx=15, pady=10)
 
         entry_font = ctk.CTkFont(size=12)
-        entry_bg = "#1E293B"
+        entry_bg = ENTRY_BG
         entry_fg = TEXT_PRIMARY
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -186,57 +179,18 @@ class PageManual(BasePage):
             text_color=MANUAL_ACCENT,
         ).pack(anchor="w", pady=(0, 4))
 
-        self.ent_j1 = ctk.CTkEntry(
-            fk_left,
-            placeholder_text="θ₁ - Base (°)",
-            font=entry_font,
-            fg_color=entry_bg,
-            text_color=entry_fg,
-            placeholder_text_color=TEXT_SECONDARY,
-            border_color=PANEL_BORDER,
-            height=36,
-            corner_radius=10,
+        self.ent_j1 = self._make_joint_entry(
+            fk_left, "θ₁ - Base (°)", entry_font, entry_bg, entry_fg
         )
-        self.ent_j1.pack(pady=3, fill="x")
-
-        self.ent_j2 = ctk.CTkEntry(
-            fk_left,
-            placeholder_text="θ₂ - Shoulder (°)",
-            font=entry_font,
-            fg_color=entry_bg,
-            text_color=entry_fg,
-            placeholder_text_color=TEXT_SECONDARY,
-            border_color=PANEL_BORDER,
-            height=36,
-            corner_radius=10,
+        self.ent_j2 = self._make_joint_entry(
+            fk_left, "θ₂ - Shoulder (°)", entry_font, entry_bg, entry_fg
         )
-        self.ent_j2.pack(pady=3, fill="x")
-
-        self.ent_j3 = ctk.CTkEntry(
-            fk_left,
-            placeholder_text="θ₃ - Elbow (°)",
-            font=entry_font,
-            fg_color=entry_bg,
-            text_color=entry_fg,
-            placeholder_text_color=TEXT_SECONDARY,
-            border_color=PANEL_BORDER,
-            height=36,
-            corner_radius=10,
+        self.ent_j3 = self._make_joint_entry(
+            fk_left, "θ₃ - Elbow (°)", entry_font, entry_bg, entry_fg
         )
-        self.ent_j3.pack(pady=3, fill="x")
-
-        self.ent_j4 = ctk.CTkEntry(
-            fk_left,
-            placeholder_text="θ₄ - Wrist (°)",
-            font=entry_font,
-            fg_color=entry_bg,
-            text_color=entry_fg,
-            placeholder_text_color=TEXT_SECONDARY,
-            border_color=PANEL_BORDER,
-            height=36,
-            corner_radius=10,
+        self.ent_j4 = self._make_joint_entry(
+            fk_left, "θ₄ - Wrist (°)", entry_font, entry_bg, entry_fg
         )
-        self.ent_j4.pack(pady=3, fill="x")
 
         # ── FK Right Column: RESULT ──
         fk_right = ctk.CTkFrame(fk_columns, fg_color="transparent")
@@ -249,12 +203,9 @@ class PageManual(BasePage):
             text_color=SUCCESS,
         ).pack(anchor="w", pady=(0, 4))
 
-        result_bg = "#0F172A"
-        result_font = ctk.CTkFont(size=13, weight="bold")
-
-        self.lbl_fk_x = self._create_result_row(fk_right, "X", "--- mm", result_bg, result_font)
-        self.lbl_fk_y = self._create_result_row(fk_right, "Y", "--- mm", result_bg, result_font)
-        self.lbl_fk_z = self._create_result_row(fk_right, "Z", "--- mm", result_bg, result_font)
+        self.lbl_fk_x = self.create_data_row(fk_right, "X", "--- mm", SUCCESS)
+        self.lbl_fk_y = self.create_data_row(fk_right, "Y", "--- mm", SUCCESS)
+        self.lbl_fk_z = self.create_data_row(fk_right, "Z", "--- mm", SUCCESS)
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # INVERSE KINEMATICS – 2-column layout (Input X,Y,Z | Result J1-J4)
@@ -278,44 +229,15 @@ class PageManual(BasePage):
             text_color=MANUAL_ACCENT,
         ).pack(anchor="w", pady=(0, 4))
 
-        self.ent_x = ctk.CTkEntry(
-            ik_left,
-            placeholder_text="X (mm)",
-            font=entry_font,
-            fg_color=entry_bg,
-            text_color=entry_fg,
-            placeholder_text_color=TEXT_SECONDARY,
-            border_color=PANEL_BORDER,
-            height=36,
-            corner_radius=10,
+        self.ent_x = self._make_coord_entry(
+            ik_left, "X (mm)", entry_font, entry_bg, entry_fg
         )
-        self.ent_x.pack(pady=4, fill="x")
-
-        self.ent_y = ctk.CTkEntry(
-            ik_left,
-            placeholder_text="Y (mm)",
-            font=entry_font,
-            fg_color=entry_bg,
-            text_color=entry_fg,
-            placeholder_text_color=TEXT_SECONDARY,
-            border_color=PANEL_BORDER,
-            height=36,
-            corner_radius=10,
+        self.ent_y = self._make_coord_entry(
+            ik_left, "Y (mm)", entry_font, entry_bg, entry_fg
         )
-        self.ent_y.pack(pady=4, fill="x")
-
-        self.ent_z = ctk.CTkEntry(
-            ik_left,
-            placeholder_text="Z (0-150 mm)",
-            font=entry_font,
-            fg_color=entry_bg,
-            text_color=entry_fg,
-            placeholder_text_color=TEXT_SECONDARY,
-            border_color=PANEL_BORDER,
-            height=36,
-            corner_radius=10,
+        self.ent_z = self._make_coord_entry(
+            ik_left, "Z (mm)", entry_font, entry_bg, entry_fg
         )
-        self.ent_z.pack(pady=4, fill="x")
 
         # ── IK Right Column: RESULT ──
         ik_right = ctk.CTkFrame(ik_columns, fg_color="transparent")
@@ -328,9 +250,10 @@ class PageManual(BasePage):
             text_color=SUCCESS,
         ).pack(anchor="w", pady=(0, 4))
 
-        self.lbl_ik_j1 = self._create_result_row(ik_right, "θ₁", "--- °", result_bg, result_font)
-        self.lbl_ik_j2 = self._create_result_row(ik_right, "θ₂", "--- °", result_bg, result_font)
-        self.lbl_ik_j3 = self._create_result_row(ik_right, "θ₃", "--- °", result_bg, result_font)
+        self.lbl_ik_j1 = self.create_data_row(ik_right, "θ₁", "--- °", SUCCESS)
+        self.lbl_ik_j2 = self.create_data_row(ik_right, "θ₂", "--- °", SUCCESS)
+        self.lbl_ik_j3 = self.create_data_row(ik_right, "θ₃", "--- °", SUCCESS)
+        self.lbl_ik_j4 = self.create_data_row(ik_right, "θ₄", "--- °", SUCCESS)
 
         # ── Action buttons row ──────────────────────────────────────────
         btn_row = ctk.CTkFrame(entry_frame, fg_color="transparent")
@@ -341,9 +264,9 @@ class PageManual(BasePage):
         # CALCULATE button
         ctk.CTkButton(
             btn_row,
-            text="🔢  CALCULATE",
+            text="🔢   CALCULATE",
             font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="#3B82F6",
+            fg_color=INFO,
             hover_color="#2563EB",
             text_color="white",
             height=42,
@@ -354,7 +277,7 @@ class PageManual(BasePage):
         # SEND TARGETS button
         ctk.CTkButton(
             btn_row,
-            text="✈  SEND",
+            text="✈   SEND",
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=MANUAL_ACCENT,
             hover_color="#9333EA",
@@ -364,138 +287,216 @@ class PageManual(BasePage):
             command=self._send_positions,
         ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
-    def _create_result_row(
+    def _make_joint_entry(
         self,
         parent: ctk.CTkFrame,
-        label: str,
-        value: str,
-        bg: str,
+        placeholder: str,
         font: ctk.CTkFont,
-    ) -> ctk.CTkLabel:
-        """Create a styled result display row and return the value label."""
-        row = ctk.CTkFrame(
+        bg: str,
+        fg: str,
+    ) -> ctk.CTkEntry:
+        """Create one styled joint-angle entry field."""
+        entry = ctk.CTkEntry(
             parent,
-            fg_color="#090E1A",  # Darker premium interior background
-            corner_radius=8,
+            placeholder_text=placeholder,
+            font=font,
+            fg_color=bg,
+            text_color=fg,
+            placeholder_text_color=TEXT_SECONDARY,
             border_color=PANEL_BORDER,
-            border_width=1,
+            height=36,
+            corner_radius=10,
         )
-        row.pack(fill="x", pady=4, ipady=4)
+        entry.pack(pady=3, fill="x")
+        return entry
 
-        ctk.CTkLabel(
-            row,
-            text=label,
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=MANUAL_ACCENT,  # Vibrant purple manual accent
-            width=25,
-        ).pack(side="left", padx=(8, 4))
-
-        val_label = ctk.CTkLabel(
-            row,
-            text=value,
-            font=ctk.CTkFont(family="Consolas", size=14, weight="bold"),
-            text_color=TEXT_PRIMARY,
+    def _make_coord_entry(
+        self,
+        parent: ctk.CTkFrame,
+        placeholder: str,
+        font: ctk.CTkFont,
+        bg: str,
+        fg: str,
+    ) -> ctk.CTkEntry:
+        """Create one styled Cartesian coordinate entry field."""
+        entry = ctk.CTkEntry(
+            parent,
+            placeholder_text=placeholder,
+            font=font,
+            fg_color=bg,
+            text_color=fg,
+            placeholder_text_color=TEXT_SECONDARY,
+            border_color=PANEL_BORDER,
+            height=36,
+            corner_radius=10,
         )
-        val_label.pack(side="right", padx=8)
-
-        return val_label
+        entry.pack(pady=4, fill="x")
+        return entry
 
     def _build_actuator_panel(self, parent: ctk.CTkFrame) -> None:
         """Build the actuator/gripper control panel."""
         frame = self._create_card(parent)
         frame.grid(row=0, column=1, padx=8, pady=8, sticky="nsew")
 
-        # Section header
-        header = ctk.CTkFrame(frame, fg_color="transparent")
-        header.pack(fill="x", padx=15, pady=(15, 10))
-
-        icon_label = ctk.CTkLabel(
-            header,
-            text="🦾",
-            font=ctk.CTkFont(size=20),
-            text_color=MANUAL_ACCENT,
-        )
-        icon_label.pack(side="left", padx=(0, 8))
-
-        ctk.CTkLabel(
-            header,
-            text="ACTUATOR CONTROL",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=MANUAL_ACCENT,
-        ).pack(side="left")
+        self.build_section_header(frame, "🦾", "ACTUATOR CONTROL", MANUAL_ACCENT)
 
         # Buttons container
         btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_frame.pack(fill="both", expand=True, padx=15, pady=10)
+        btn_frame.pack(fill="both", expand=True, padx=15, pady=(6, 12))
 
         # HOME button
         ctk.CTkButton(
             btn_frame,
-            text="🏠  MOVE TO HOME",
+            text="🏠   MOVE TO HOME",
             font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color="#4F46E5",
-            hover_color="#4338CA",
+            fg_color=INFO,
+            hover_color="#2563EB",
             text_color="white",
-            height=45,
+            height=46,
             corner_radius=10,
-            command=lambda: self.controller.plc.send_pulse(16, 1),
-        ).pack(fill="x", pady=(5, 10))
+            command=lambda: self.controller.plc.send_pulse(*ADDR.MOVE_TO_HOME),
+        ).pack(fill="x", pady=(4, 10))
 
-        # Unified Grip/Release Row
+        # Pick / Release row
         grip_frame = ctk.CTkFrame(btn_frame, fg_color="transparent")
         grip_frame.pack(fill="x", pady=5)
         grip_frame.grid_columnconfigure(0, weight=1, uniform="grip")
         grip_frame.grid_columnconfigure(1, weight=1, uniform="grip")
 
-        # GRIP button
+        # PICK button (GAP_VAT – close gripper & pick)
         ctk.CTkButton(
             grip_frame,
-            text="✊  GRIP (CLOSE)",
+            text="✊   GẮP VẬT",
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=SUCCESS,
-            hover_color="#059669",
+            hover_color=SUCCESS_HOVER,
             text_color="white",
-            height=45,
+            height=46,
             corner_radius=10,
-            command=lambda: self.controller.plc.send_pulse(16, 2),
+            command=lambda: self.controller.plc.send_pulse(*ADDR.GAP_VAT),
         ).grid(row=0, column=0, padx=(0, 4), sticky="nsew")
 
-        # RELEASE button
+        # RELEASE button (NHA_VAT – open gripper & release)
         ctk.CTkButton(
             grip_frame,
-            text="🖐  RELEASE (OPEN)",
+            text="🖐   NHẢ VẬT",
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color="#475569",
             hover_color="#64748B",
             text_color="white",
-            height=45,
+            height=46,
             corner_radius=10,
-            command=lambda: self.controller.plc.send_pulse(16, 3),
+            command=lambda: self.controller.plc.send_pulse(*ADDR.NHA_VAT),
         ).grid(row=0, column=1, padx=(4, 0), sticky="nsew")
 
         # STOP button
         ctk.CTkButton(
             btn_frame,
-            text="⏹  STOP ROBOT",
+            text="⏹   STOP ROBOT",
             font=ctk.CTkFont(size=13, weight="bold"),
             fg_color=DANGER,
-            hover_color="#DC2626",
+            hover_color=DANGER_HOVER,
             text_color="white",
-            height=45,
+            height=46,
             corner_radius=10,
-            command=lambda: self.controller.plc.send_pulse(16, 4),
+            command=lambda: self.controller.plc.send_pulse(*ADDR.STOP_ROBOT),
         ).pack(fill="x", pady=(10, 5))
 
-    def _create_card(self, parent: ctk.CTkFrame) -> ctk.CTkFrame:
-        """Create a modern card with border."""
-        frame = ctk.CTkFrame(
-            parent,
-            fg_color=CARD_BG,
-            border_color=PANEL_BORDER,
-            border_width=1,
-            corner_radius=12,
-        )
-        return frame
+        # ── JOG CONTROL section ─────────────────────────────────────────
+        jog_header = ctk.CTkFrame(btn_frame, fg_color="transparent")
+        jog_header.pack(fill="x", pady=(14, 5))
+
+        ctk.CTkLabel(
+            jog_header,
+            text="🕹",
+            font=ctk.CTkFont(size=16),
+            text_color=MANUAL_ACCENT,
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkLabel(
+            jog_header,
+            text="JOG CONTROL",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=MANUAL_ACCENT,
+        ).pack(side="left")
+
+        # JOG button definitions: (label_left, addr_left, label_right, addr_right)
+        jog_rows = [
+            ("J1", "◀ QUAY TRÁI", ADDR.JOG_J1_LEFT, "QUAY PHẢI ▶", ADDR.JOG_J1_RIGHT),
+            ("J2", "▲ LÊN", ADDR.JOG_J2_UP, "XUỐNG ▼", ADDR.JOG_J2_DOWN),
+            ("J3", "▲ LÊN", ADDR.JOG_J3_UP, "XUỐNG ▼", ADDR.JOG_J3_DOWN),
+        ]
+
+        for axis, lbl_l, addr_l, lbl_r, addr_r in jog_rows:
+            # Axis label
+            ctk.CTkLabel(
+                btn_frame,
+                text=axis,
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color=TEXT_SECONDARY,
+            ).pack(anchor="w", pady=(6, 1))
+
+            row_frame = ctk.CTkFrame(btn_frame, fg_color="transparent")
+            row_frame.pack(fill="x", pady=1)
+            row_frame.grid_columnconfigure(0, weight=1, uniform="jog")
+            row_frame.grid_columnconfigure(1, weight=1, uniform="jog")
+
+            # Left button
+            btn_left = ctk.CTkButton(
+                row_frame,
+                text=f"{lbl_l} [OFF]",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color="#475569",
+                hover_color="#64748B",
+                text_color="white",
+                height=38,
+                corner_radius=8,
+                command=lambda a=addr_l, t=lbl_l: self._toggle_jog(a, t),
+            )
+            btn_left.grid(row=0, column=0, padx=(0, 3), sticky="nsew")
+            self._jog_buttons[addr_l] = btn_left
+
+            # Right button
+            btn_right = ctk.CTkButton(
+                row_frame,
+                text=f"{lbl_r} [OFF]",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color="#475569",
+                hover_color="#64748B",
+                text_color="white",
+                height=38,
+                corner_radius=8,
+                command=lambda a=addr_r, t=lbl_r: self._toggle_jog(a, t),
+            )
+            btn_right.grid(row=0, column=1, padx=(3, 0), sticky="nsew")
+            self._jog_buttons[addr_r] = btn_right
+
+    def _toggle_jog(self, addr: tuple[int, int], label: str) -> None:
+        """Toggle a JOG button state and send the new value to PLC."""
+        new_state = not self._jog_states[addr]
+        self._jog_states[addr] = new_state
+        self.controller.plc.write_bit(addr[0], addr[1], new_state)
+
+        btn = self._jog_buttons[addr]
+        if new_state:
+            btn.configure(
+                text=f"{label} [ON]",
+                fg_color=SUCCESS,
+                hover_color=SUCCESS_HOVER,
+            )
+        else:
+            btn.configure(
+                text=f"{label} [OFF]",
+                fg_color="#475569",
+                hover_color="#64748B",
+            )
+        log.info("JOG toggle %d.%d → %s", addr[0], addr[1], new_state)
+        try:
+            self.controller.log_tx(
+                f"JOG {label} → {'ON' if new_state else 'OFF'} (DB {addr[0]}.{addr[1]})"
+            )
+        except Exception:
+            pass  # log_tx may not exist in test/mock contexts
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -511,18 +512,23 @@ class PageManual(BasePage):
             )
             # Update button styles
             self.btn_thuan.configure(
-                fg_color=SUCCESS, hover_color="#059669",
-                text_color="white", border_width=0,
+                fg_color=SUCCESS,
+                hover_color=SUCCESS_HOVER,
+                text_color="white",
+                border_width=0,
             )
             self.btn_nghich.configure(
-                fg_color="transparent", hover_color="#475569",
-                text_color=TEXT_PRIMARY, border_color="#475569", border_width=1,
+                fg_color="transparent",
+                hover_color="#475569",
+                text_color=TEXT_PRIMARY,
+                border_color="#475569",
+                border_width=1,
             )
             # Hide IK entries, show FK entries
             self._ik_frame.pack_forget()
             self._fk_frame.pack(fill="both", expand=True)
         # Always pulse PLC bit 16.5 (DONG_HOC_THUAN)
-        self.controller.plc.send_pulse(16, 5)
+        self.controller.plc.send_pulse(*ADDR.KINE_FORWARD)
 
     def _select_inverse_mode(self) -> None:
         """Switch to Inverse Kinematics mode and pulse PLC address 16.6."""
@@ -530,22 +536,27 @@ class PageManual(BasePage):
             self._kine_mode = "Inverse"
             self.lbl_kine_mode.configure(
                 text="▶ INVERSE KINEMATICS",
-                text_color="#3B82F6",
+                text_color=INFO,
             )
             # Update button styles
             self.btn_nghich.configure(
-                fg_color="#3B82F6", hover_color="#2563EB",
-                text_color="white", border_width=0,
+                fg_color=INFO,
+                hover_color="#2563EB",
+                text_color="white",
+                border_width=0,
             )
             self.btn_thuan.configure(
-                fg_color="transparent", hover_color="#475569",
-                text_color=TEXT_PRIMARY, border_color="#475569", border_width=1,
+                fg_color="transparent",
+                hover_color="#475569",
+                text_color=TEXT_PRIMARY,
+                border_color="#475569",
+                border_width=1,
             )
             # Hide FK entries, show IK entries
             self._fk_frame.pack_forget()
             self._ik_frame.pack(fill="both", expand=True)
         # Always pulse PLC bit 16.6 (DONG_HOC_NGHICH)
-        self.controller.plc.send_pulse(16, 6)
+        self.controller.plc.send_pulse(*ADDR.KINE_INVERSE)
 
     def _calculate(self) -> None:
         """Calculate kinematics and display results in the result column."""
@@ -554,13 +565,19 @@ class PageManual(BasePage):
         else:
             self._calculate_inverse()
 
+    @staticmethod
+    def _entry_float(entry: Any, default: float = 0.0) -> float:
+        """Parse an entry's contents as float; empty string → *default*."""
+        text = entry.get().strip()
+        return float(text) if text else default
+
     def _calculate_forward(self) -> None:
         """Compute FK from θ₁(°), θ₂(°), θ₃(°), θ₄(°) and display X, Y, Z."""
         try:
-            j1 = float(self.ent_j1.get().strip()) if self.ent_j1.get().strip() else 0.0
-            j2 = float(self.ent_j2.get().strip()) if self.ent_j2.get().strip() else 0.0
-            j3 = float(self.ent_j3.get().strip()) if self.ent_j3.get().strip() else 0.0
-            j4 = float(self.ent_j4.get().strip()) if self.ent_j4.get().strip() else 0.0
+            j1 = self._entry_float(self.ent_j1)
+            j2 = self._entry_float(self.ent_j2)
+            j3 = self._entry_float(self.ent_j3)
+            j4 = self._entry_float(self.ent_j4)
         except ValueError:
             messagebox.showerror(
                 "Input Error",
@@ -583,8 +600,28 @@ class PageManual(BasePage):
         self.lbl_fk_y.configure(text=f"{y:.2f} mm", text_color=SUCCESS)
         self.lbl_fk_z.configure(text=f"{z:.2f} mm", text_color=SUCCESS)
 
-        log.info("FK Calculate: θ₁=%.2f° θ₂=%.2f° θ₃=%.2f° θ₄=%.2f° → X=%.2f Y=%.2f Z=%.2f",
-                 j1, j2, j3, j4, x, y, z)
+        # Tự động gán kết quả FK sang làm đầu vào chờ sẵn cho phần IK
+        for entry, value in ((self.ent_x, x), (self.ent_y, y), (self.ent_z, z)):
+            entry.delete(0, "end")
+            entry.insert(0, f"{value:.2f}")
+
+        log.info(
+            "FK Calculate: θ₁=%.2f° θ₂=%.2f° θ₃=%.2f° θ₄=%.2f° → X=%.2f Y=%.2f Z=%.2f",
+            j1,
+            j2,
+            j3,
+            j4,
+            x,
+            y,
+            z,
+        )
+        try:
+            self.controller.log_tx(
+                f"FK Calc: J=[{j1:.1f}, {j2:.1f}, {j3:.1f}, {j4:.1f}]° → "
+                f"XYZ=[{x:.1f}, {y:.1f}, {z:.1f}]mm"
+            )
+        except Exception:
+            pass
 
     def _calculate_inverse(self) -> None:
         """Compute IK from X, Y, Z inputs and display θ₁, θ₂, θ₃, θ₄."""
@@ -601,27 +638,48 @@ class PageManual(BasePage):
 
         try:
             # IK: (X, Y, Z) → (θ₁°, θ₂°, θ₃°, θ₄°)
-            j1, j2, j3, j4 = inverse_kinematics(x, y, z, phi=self.controller.cfg.kinematics.default_phi)
+            j1, j2, j3, j4 = inverse_kinematics(
+                x, y, z, phi=self.controller.cfg.kinematics.default_phi
+            )
 
             # Store computed result for later sending
             self._last_ik_result = (j1, j2, j3, j4)
             self._last_ik_coords = (x, y, z)
 
             # Update result labels
-            self.lbl_ik_j1.configure(text=f"{j1:.2f} °", text_color=SUCCESS)
-            self.lbl_ik_j2.configure(text=f"{j2:.2f} °", text_color=SUCCESS)
-            self.lbl_ik_j3.configure(text=f"{j3:.2f} °", text_color=SUCCESS)
+            for label, value in (
+                (self.lbl_ik_j1, j1),
+                (self.lbl_ik_j2, j2),
+                (self.lbl_ik_j3, j3),
+                (self.lbl_ik_j4, j4),
+            ):
+                label.configure(text=f"{value:.2f} °", text_color=SUCCESS)
 
-            log.info("IK Calculate: X=%.2f Y=%.2f Z=%.2f → θ₁=%.2f° θ₂=%.2f° θ₃=%.2f° θ₄=%.2f°",
-                     x, y, z, j1, j2, j3, j4)
+            log.info(
+                "IK Calculate: X=%.2f Y=%.2f Z=%.2f → "
+                "θ₁=%.2f° θ₂=%.2f° θ₃=%.2f° θ₄=%.2f°",
+                x,
+                y,
+                z,
+                j1,
+                j2,
+                j3,
+                j4,
+            )
 
         except Exception as exc:
-            self.lbl_ik_j1.configure(text="ERR", text_color=DANGER)
-            self.lbl_ik_j2.configure(text="ERR", text_color=DANGER)
-            self.lbl_ik_j3.configure(text="ERR", text_color=DANGER)
+            for label in (
+                self.lbl_ik_j1,
+                self.lbl_ik_j2,
+                self.lbl_ik_j3,
+                self.lbl_ik_j4,
+            ):
+                label.configure(text="ERR", text_color=DANGER)
             self._last_ik_result = None
             self._last_ik_coords = None
-            messagebox.showerror("IK Error", f"Cannot compute inverse kinematics:\n{exc}")
+            messagebox.showerror(
+                "IK Error", f"Cannot compute inverse kinematics:\n{exc}"
+            )
 
     def _send_positions(self) -> None:
         """Send the last computed results to PLC."""
@@ -646,10 +704,26 @@ class PageManual(BasePage):
             return
 
         self.controller.plc.send_forward_kinematics_data(j1, j2, j3, x, y, z)
-        log.info("FK Send: θ₁=%.2f° θ₂=%.2f° θ₃=%.2f° (XY HT = [%.2f, %.2f, %.2f])", j1, j2, j3, x, y, z)
+        log.info(
+            "FK Send: θ₁=%.2f° θ₂=%.2f° θ₃=%.2f° (XY HT = [%.2f, %.2f, %.2f])",
+            j1,
+            j2,
+            j3,
+            x,
+            y,
+            z,
+        )
+        try:
+            self.controller.log_tx(
+                f"FK Send → PLC: J=[{j1:.1f}, {j2:.1f}, {j3:.1f}]° "
+                f"XYZ=[{x:.1f}, {y:.1f}, {z:.1f}]mm"
+            )
+        except Exception:
+            pass
         messagebox.showinfo(
             "Success",
-            f"Sent to PLC:\nθ₁={j1:.2f}° (Base)\nθ₂={j2:.2f}° (Shoulder)\nθ₃={j3:.2f}° (Elbow)\n\n"
+            f"Sent to PLC:\nθ₁={j1:.2f}° (Base)\nθ₂={j2:.2f}° (Shoulder)\n"
+            f"θ₃={j3:.2f}° (Elbow)\n\n"
             f"Computed Coordinates (HT):\nX={x:.2f} mm\nY={y:.2f} mm\nZ={z:.2f} mm",
         )
 
@@ -669,27 +743,44 @@ class PageManual(BasePage):
             return
 
         self.controller.plc.send_inverse_kinematics_data(x, y, z, j1, j2, j3)
-        log.info("IK Send: XYZ=[%.2f, %.2f, %.2f] (Theta HT = [%.2f, %.2f, %.2f])", x, y, z, j1, j2, j3)
+        log.info(
+            "IK Send: XYZ=[%.2f, %.2f, %.2f] (Theta HT = [%.2f, %.2f, %.2f])",
+            x,
+            y,
+            z,
+            j1,
+            j2,
+            j3,
+        )
+        try:
+            self.controller.log_tx(
+                f"IK Send → PLC: XYZ=[{x:.1f}, {y:.1f}, {z:.1f}]mm "
+                f"J=[{j1:.1f}, {j2:.1f}, {j3:.1f}]°"
+            )
+        except Exception:
+            pass
         messagebox.showinfo(
             "Success",
             f"Sent to PLC:\nCoordinates:\nX={x:.2f} mm\nY={y:.2f} mm\nZ={z:.2f} mm\n\n"
-            f"Computed Joint Angles (HT):\nθ₁={j1:.2f}° (Base)\nθ₂={j2:.2f}° (Shoulder)\nθ₃={j3:.2f}° (Elbow)",
+            f"Computed Joint Angles (HT):\nθ₁={j1:.2f}° (Base)\n"
+            f"θ₂={j2:.2f}° (Shoulder)\nθ₃={j3:.2f}° (Elbow)",
         )
 
     def _validate_joints(self, j1: float, j2: float, j3: float, j4: float) -> bool:
-        """Validate joint angle ranges to prevent damage or PLC faults."""
-        if not (-180.0 <= j1 <= 180.0):
-            messagebox.showerror("Input Error", f"θ₁ must be between -180° and 180° (got {j1:.2f}°)")
-            return False
-        if not (0.0 <= j2 <= 250.0):
-            messagebox.showerror("Input Error", f"θ₂ must be between 0° and 250° (got {j2:.2f}°)")
-            return False
-        if not (0.0 <= j3 <= 200.0):
-            messagebox.showerror("Input Error", f"θ₃ must be between 0° and 200° (got {j3:.2f}°)")
-            return False
-        if not (-180.0 <= j4 <= 180.0):
-            messagebox.showerror("Input Error", f"θ₄ must be between -180° and 180° (got {j4:.2f}°)")
-            return False
+        """
+        Validate joint angle ranges against the configured limits
+        (config.yaml → kinematics module) to prevent damage or PLC faults.
+        """
+        names = ("θ₁", "θ₂", "θ₃", "θ₄")
+        keys = ("j1", "j2", "j3", "j4")
+        for name, key, value in zip(names, keys, (j1, j2, j3, j4)):
+            low, high = JOINT_LIMITS[key]
+            if not (low <= value <= high):
+                messagebox.showerror(
+                    "Input Error",
+                    f"{name} must be between {low:g}° and {high:g}° (got {value:.2f}°)",
+                )
+                return False
         return True
 
     # ------------------------------------------------------------------

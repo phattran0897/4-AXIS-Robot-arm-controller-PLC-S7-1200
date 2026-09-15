@@ -5,11 +5,12 @@ robotic pick-and-sort using **YOLOv11**, a **Siemens S7-1200 PLC**, and a
 **CustomTkinter** GUI.
 
 ```
-Camera → YOLODetector (YOLO inference)
-                ↓ defect coords (mm)
-        Inverse Kinematics
+Camera → YOLODetector (YOLO inference on ROI crop)
+                ↓ class (GOOD/BAD) + defect coords (mm)
+        Inverse Kinematics (config-driven DH parameters)
                 ↓ joint angles
-        PLCController (snap7) → S7-1200 → SCARA Robot
+        SortingController (cycle orchestration + safety polling)
+        PLCController (snap7) → S7-1200 → 4-DOF Robot
 ```
 
 ---
@@ -20,11 +21,12 @@ Camera → YOLODetector (YOLO inference)
 2. [Prerequisites](#prerequisites)
 3. [Installation](#installation)
 4. [Configuration](#configuration)
-5. [Running the Application](#running-the-application)
-6. [Project Structure](#project-structure)
-7. [Running Tests](#running-tests)
-8. [CI Pipeline](#ci-pipeline)
-9. [Key Design Decisions](#key-design-decisions)
+5. [PLC Address Map](#plc-address-map)
+6. [Running the Application](#running-the-application)
+7. [Project Structure](#project-structure)
+8. [Running Tests](#running-tests)
+9. [CI Pipeline](#ci-pipeline)
+10. [Key Design Decisions](#key-design-decisions)
 
 ---
 
@@ -38,18 +40,25 @@ Camera → YOLODetector (YOLO inference)
 │   ├── config_loader.py         # Typed YAML loader (dataclasses, __slots__)
 │   ├── kinematics/
 │   │   ├── __init__.py
-│   │   └── kinematics.py        # 2-DOF planar IK with workspace validation
+│   │   └── kinematics.py        # 4-DOF FK / geometric IK, workspace validation
 │   ├── ai/
 │   │   └── yolo_detector.py     # Camera + YOLO; read/annotate split, watchdog
 │   ├── plc/
-│   │   └── plc_controller.py    # snap7 S7-1200 wrapper; atomic writes
+│   │   └── plc_controller.py    # snap7 S7-1200 wrapper; ADDR map; atomic writes
+│   ├── robot/
+│   │   └── sorting_controller.py # Pick-and-place FSM + PLC health monitoring
 │   └── ui/
-│       ├── base_page.py         # Abstract CTkFrame (deduplicated helpers)
+│       ├── theme.py             # Central colour palette
+│       ├── base_page.py         # Abstract CTkFrame (cards, headers, status bar)
+│       ├── header.py            # VAAHeader branding + VAAFooter status chips
 │       ├── page_auto.py         # Automatic mode page
-│       └── page_manual.py       # Manual mode page
+│       └── page_manual.py       # Manual mode page (FK/IK, JOG)
 ├── tests/
-│   └── test_robot_system.py     # 26 test cases; hardware tests skipped without SDKs
+│   ├── test_robot_system.py     # Config, IK, PLC, YOLO, sorting (mocked hw)
+│   └── test_page_manual.py      # Manual-page JOG/validation logic
+├── test_gui_no_plc.py           # Full GUI with MockPLCController (no hardware)
 ├── requirements.txt
+├── requirements-dev.txt
 └── .github/workflows/ci.yml     # GitHub Actions: lint + test
 ```
 
@@ -59,11 +68,20 @@ Camera → YOLODetector (YOLO inference)
 |--------|---------|----------|
 | Main (Tk) | GUI event loop | `on_closing()` → `_stop_event.set()` |
 | `PLCPollThread` | Cyclic PLC read at 10 Hz | Wakes on `_stop_event` |
-| `AIVisionThread` | YOLO inference + PLC dispatch | Wakes on `_stop_event` |
+| `AIVisionThread` | Frame capture + ROI overlay + YOLO dispatch | Wakes on `_stop_event` |
+| `SortCycleThread` | One pick-and-place cycle at a time | Joins on shutdown |
 
 `threading.Event._stop_event` is used instead of a raw boolean so threads
 wake **immediately** on shutdown rather than sleeping through their full
 interval.
+
+### Safety interlocks
+
+* A sort cycle is **refused** while the PLC error flag is active.
+* During every waypoint the sort controller polls the PLC and aborts
+  immediately if the PLC goes offline or raises its error flag.
+* A post-sort cooldown (3 s) suppresses immediate re-triggering on the
+  same part, and only one `SortCycleThread` may run at a time.
 
 ---
 
@@ -74,8 +92,8 @@ interval.
 | Python | ≥ 3.11 |
 | Siemens S7-1200 PLC | Firmware ≥ V4.x, PUT/GET enabled |
 | USB camera | Any OpenCV-compatible device |
-| YOLO model | `best.pt` trained with Ultralytics YOLOv8/v11 |
-| OS | Windows 10/11, Ubuntu 22.04+ |
+| YOLO model | `my_model/my_model.pt` trained with Ultralytics YOLOv8/v11 |
+| OS | Windows 10/11 (primary), Linux supported via CAP_ANY backend |
 
 ---
 
@@ -95,64 +113,73 @@ source .venv/bin/activate
 
 # 3. Install dependencies
 pip install -r requirements.txt
+
+# 4. Development / CI tooling (optional)
+pip install -r requirements-dev.txt
 ```
 
-> **GPU acceleration (optional)**  
-> Replace the `torch` line in `requirements.txt` with the CUDA-enabled wheel
-> from [pytorch.org](https://pytorch.org/get-started/locally/).
+> **GPU acceleration (optional)**
+> Uncomment the `torch` line in `requirements.txt` for CPU-only hosts or
+> install the CUDA-enabled wheel from [pytorch.org](https://pytorch.org/get-started/locally/).
 
 ---
 
 ## Configuration
 
-All runtime parameters live in **`config.yaml`**. No source code changes
-are needed for a new installation.
+All runtime parameters live in **`config.yaml`** — including the DH link
+lengths and joint limits used by the kinematics engine. No source code
+changes are needed for a new installation.
 
 ```yaml
 plc:
   ip: "192.168.0.1"     # PLC IP address
   rack: 0
   slot: 1
-  db_number: 10          # Data Block number
+  db_number: 5          # Data Block number
 
-  offsets:               # Byte offsets within the DB
-    cmd_word: 0          # INT  – command register
-    status: 2            # INT  – PLC status word
-    j1_target: 4         # REAL – joint 1 target angle
-    j2_target: 8         # REAL – joint 2 target angle
-    j3_target: 12        # REAL – joint 3 target angle
-    j4_target: 16        # REAL – joint 4 target angle
-    motion_done_byte: 20 # BOOL byte
-    motion_done_bit: 0
-    error_flag_byte: 20
-    error_flag_bit: 1
-
-  commands:
-    idle: 0
-    home: 1
-    move: 2
-    stop: 3
+  offsets:              # Byte offsets within the DB (see Address Map below)
+    j1_target: 42
+    ...
+    phan_loai_hang_byte: 78   # Classification bits
+    hang_tot_byte: 78
+    hang_xau_byte: 78
 
 yolo:
-  model_path: "models/best.pt"   # Path to your trained .pt file
-  thresh: 0.50                   # Confidence threshold (0–1)
-  px2mm: 0.50                    # Pixels → mm calibration factor
-  home_x: 200.0                  # Robot home X in mm
-  home_y: 0.0                    # Robot home Y in mm
+  model_path: "my_model/my_model.pt"
+  thresh: 0.50          # Confidence threshold (0–1)
+  px2mm: 0.50           # Pixels → mm calibration factor
+  home_x: 200.0         # Robot home X in mm
+  home_y: 0.0           # Robot home Y in mm
+  roi_x: 190            # Manual-capture ROI crop (x, y, w, h)
 
 camera:
-  default_index: 0               # OpenCV camera index
-  display_width: 440             # Preview width (px)
-  display_height: 310            # Preview height (px)
-  fps: 30                        # Target inference rate
+  default_index: 0
+  display_width: 440    # Preview width (px)
+  display_height: 310
+  fps: 60               # Camera read rate
+  preview_fps: 20       # GUI redraw rate (decoupled to save CPU)
+  inference_width: 640
+  inference_height: 480
+  read_timeout: 2.0
 
-kinematics:
-  l1: 200.0                      # Link-1 length (mm)
-  l2: 150.0                      # Link-2 length (mm)
+kinematics:             # ← drives the IK/FK engine at start-up
+  a1: 40.0              # Base horizontal offset (mm)
+  d1: 300.0             # Base height (mm)
+  a2: 190.0             # Link 2 length (mm)
+  a3: 110.0             # Link 3 length (mm)
+  a4: 65.0              # End-effector length (mm)
+  j2_min: 0.0           # Joint limits used for UI validation
+  j2_max: 250.0
+  default_phi: 0.0      # Default end-effector pitch for IK
 
 app:
-  plc_poll_interval: 0.10        # Seconds between PLC reads
-  move_cooldown: 1.50            # Seconds to wait after issuing MOVE
+  plc_poll_interval: 0.10
+  move_cooldown: 1.50
+
+sort_positions:
+  place_good: {x: 150.0, y: 100.0, z_down: 80.0, z_up: 150.0}
+  place_bad:  {x: -150.0, y: 100.0, z_down: 80.0, z_up: 150.0}
+  gripper_delay: 0.5
 ```
 
 ### Calibrating `px2mm`
@@ -163,28 +190,61 @@ app:
 
 ---
 
+## PLC Address Map
+
+Hard-wired bit addresses live in one place: the `ADDR` class in
+`src/plc/plc_controller.py`. The GUI and sorting controller reference these
+constants instead of scattering magic numbers.
+
+| Address | Symbol | Meaning |
+|---------|--------|---------|
+| 0.0 | `START_AUTO` | Pulse starts the PLC motion sequence |
+| 0.1 | `PAUSE` | Pause |
+| 0.2 | `AUTO_MODE` | Switch to AUTO mode (pulsed when Auto page opens) |
+| 14.0 | `GRIP` | Gripper close during sort cycle |
+| 16.0 | MANUAL_MODE | Switch to MANUAL mode |
+| 16.1 | `MOVE_TO_HOME` | Return to home position |
+| 16.2 / 16.3 | `GAP_VAT` / `NHA_VAT` | Pick object / release object |
+| 16.4 | `STOP_ROBOT` | Emergency stop |
+| 16.5 / 16.6 | `KINE_FORWARD` / `KINE_INVERSE` | Select forward / inverse kinematics mode |
+| 80.0–80.5 | `JOG_J1..J3_*` | Jog toggles per axis |
+| cfg 20.x | `motion_done`, `error_flag` | Status flags (offsets configurable) |
+| cfg 78.x | classification bits | PHAN_LOAI_HANG / HANG_TOT / HANG_XAU |
+
+Words: 18–40 = FK results block · 42–64 = IK data block · joint targets at
+the configured `offsets.j*_target`.
+
+---
+
 ## Running the Application
 
 ```bash
-python main.py
+python main.py          # Real hardware
+python test_gui_no_plc.py   # Full GUI against an in-memory mock PLC
 ```
 
-The application opens in **Automatic Mode** by default. Use the
-**"SWITCH TO MANUAL >>"** button in the status bar to navigate to Manual Mode.
+The application opens in **Automatic Mode** by default. Use the header
+navigation tabs (or the footer status chips) to switch modes.
 
 ### Automatic Mode
 
-- Live YOLO inference runs continuously.
-- Detected defects trigger inverse-kinematics computation and a `MOVE`
-  command to the PLC.
-- Joint angles are displayed in real time from the cyclic PLC read.
+* Live ROI-overlay camera preview (throttled to `preview_fps`).
+* Press **CHỤP & PHÂN LOẠI** to capture the ROI crop, sharpen it, run YOLO,
+  classify GOOD/BAD, write the classification bits, pulse START_AUTO, and
+  orchestrate the pick-and-place cycle. Cycles are skipped when nothing is
+  detected, while another cycle runs, during the post-sort cooldown, or
+  when the PLC error flag is active.
 
 ### Manual Mode
 
-- Enter joint angles directly (Forward Kinematics) or target XY coordinates
-  (toggle to Inverse Kinematics).
-- Individual gripper GRIP / RELEASE buttons.
-- **MOVE TO HOME** sends `CMD_HOME` to the PLC.
+* Enter joint angles directly (Forward Kinematics) or target XYZ coordinates
+  (toggle to Inverse Kinematics); CALCULATE shows results, SEND transmits
+  them to the PLC.
+* Pick / release buttons, MOVE TO HOME, STOP ROBOT.
+* Per-axis JOG toggles (J1 left/right, J2 up/down, J3 up/down).
+* All inputs are validated against the configured joint limits.
+
+Logs rotate under `logs/robot_app.log` (20 MB × 5 files).
 
 ---
 
@@ -193,34 +253,43 @@ The application opens in **Automatic Mode** by default. Use the
 ```
 src/config_loader.py
 ```
-
-`load_config(path?)` → `RobotConfig` – fully-typed dataclass tree.
-All other modules receive their configuration through constructor injection
-(no global state).
+`load_config(path?)` → `RobotConfig` – fully-typed dataclass tree with
+validation. All other modules receive their configuration through
+constructor injection (no global state), except the kinematics module whose
+DH parameters are configured once at start-up via `configure()`.
 
 ```
 src/plc/plc_controller.py
 ```
-
-`PLCController(cfg)` – wraps `snap7.client.Client`.  All methods guard
-against disconnected state and log errors rather than raising, keeping the
-GUI alive during transient faults.
+`PLCController(cfg)` – wraps `snap7.client.Client` behind an RLock (snap7 is
+not thread-safe). Bit writes that share a byte are grouped into a single
+read-modify-write cycle (`write_bits`) so concurrent writers cannot lose
+each other's changes. Push-button pulses use tracked timers so repeated
+pulses restart rather than stack. All methods guard against disconnected
+state and log errors rather than raising, keeping the GUI alive during
+transient faults.
 
 ```
 src/ai/yolo_detector.py
 ```
+`YOLODetector(model_path, thresh, px2mm, ...)` – owns a single
+`cv2.VideoCapture` plus a keep-newest frame queue fed by a dedicated read
+thread. `process_frame()` returns `(has_defect, robot_x_mm, robot_y_mm,
+PIL.Image)`.
 
-`YOLODetector(model_path, thresh, px2mm, home_x, home_y)` – owns a single
-`cv2.VideoCapture`.  `process_frame()` returns
-`(has_defect, robot_x_mm, robot_y_mm, PIL.Image)`.
+```
+src/robot/sorting_controller.py
+```
+`SortingController(plc, positions, kinematics, commands)` – orchestrates one
+pick-and-place cycle at a time, mirrors commanded waypoints for the GUI, and
+polls PLC health (offline / error flag / motion_done) between steps.
 
 ```
 src/ui/base_page.py
 ```
-
 `BasePage(parent, controller, page_color)` – abstract `CTkFrame` providing
-`build_camera_selector()`, `build_status_bar()`, and
-`_refresh_error_status()` shared by both pages.
+card/section-header factories, `build_camera_selector()`,
+`build_status_bar()`, and `_refresh_error_status()` shared by both pages.
 
 ---
 
@@ -237,41 +306,16 @@ pytest tests/test_robot_system.py::TestPLCController -v
 Tests mock all hardware (`snap7.client.Client`, `cv2.VideoCapture`, YOLO
 model) so they execute in any headless environment without physical devices.
 
-### Test matrix
-
-| ID | Class | What is tested |
-|----|-------|---------------|
-| TC-01 | `TestConfigLoader` | Full YAML parses to correct fields (incl. new camera fields) |
-| TC-02 | `TestConfigLoader` | Missing file → `FileNotFoundError` |
-| TC-03 | `TestConfigLoader` | Partial YAML uses safe defaults (incl. inference/resolution fields) |
-| TC-04 | `TestPLCController` | `connect()` returns `True` on success |
-| TC-05 | `TestPLCController` | `connect()` returns `False` on exception |
-| TC-06 | `TestPLCController` | `read_status()` decodes DB bytes correctly |
-| TC-07 | `TestPLCController` | `read_status()` returns `{}` when offline |
-| TC-08 | `TestPLCController` | `send_command()` writes correct 2-byte buffer |
-| TC-09 | `TestPLCController` | `send_command()` skips when disconnected |
-| TC-10 | `TestPLCController` | `send_joint_targets()` writes 16-byte buffer |
-| TC-11 | `TestPLCController` | `send_joint_targets_and_command()` atomic write |
-| TC-12 | `TestYOLODetector` | `start_camera()` returns `True` on success |
-| TC-13 | `TestYOLODetector` | `read_frame()` returns `None` when no camera |
-| TC-14 | `TestYOLODetector` | `annotate_frame()` – no detections → home coordinates |
-| TC-15 | `TestYOLODetector` | `annotate_frame()` – above-thresh defect → robot coords |
-| TC-16 | `TestYOLODetector` | `switch_camera()` releases previous capture |
-| TC-17 | `TestYOLODetector` | `DetectionResult.to_pil()` resizes and converts |
-| TC-18 | `TestYOLODetector` | Model path not found → `FileNotFoundError` |
-| TC-19 | `TestInverseKinematics` | Reachable point → non-zero joint angles |
-| TC-20 | `TestInverseKinematics` | Out-of-reach point → `WorkspaceError` raised |
-| TC-21 | `TestInverseKinematics` | J3 / J4 are always `0.0` |
-| TC-22 | `TestInverseKinematics` | Negative link length → `ValueError` |
-| TC-23 | `TestInverseKinematics` | Edge-of-workspace (fully extended) |
-| TC-24 | `TestInverseKinematics` | Edge-of-workspace (fully folded) |
-| TC-25 | `TestInverseKinematics` | `reachable()` correctly classifies workspace |
-| TC-26 | `TestBasePage` | `update_video()` stores PhotoImage reference |
-| TC-27 | `TestPLCDbReadSize` | `compute_db_read_size()` rounds up to multiple of 4 |
-
-> Tests TC-04–TC-10 (PLC) and TC-12–TC-18 (YOLO) and TC-26 (BasePage) are
-> skipped when the respective hardware SDK (`snap7`, `cv2`, `customtkinter`)
-> is not installed, allowing the full suite to run in a headless CI environment.
+| Suite | What is covered |
+|-------|-----------------|
+| `TestConfigLoader` | Full/partial YAML parsing, missing file, validation |
+| `TestInverseKinematicsModule` | FK zero pose, FK↔IK round trip, workspace errors, base rotation |
+| `TestPLCController` | Connect/disconnect, DB decode, command pulses, target writes |
+| `TestYOLODetector` | Camera lifecycle, detection→robot coords, PIL conversion |
+| `TestBasePage` | Video-label reference handling |
+| `TestPLCDbReadSize` | DB size rounding |
+| `TestSortingController` | IK fallbacks, PLC call sequence, counters |
+| `test_page_manual.py` | JOG toggling, button feedback, TX logging, joint limits |
 
 ---
 
@@ -299,14 +343,16 @@ replaced by `unittest.mock` stubs at test time.
 |----------|-----------|
 | `threading.Event` for shutdown | Threads wake immediately on stop, eliminating zombie processes |
 | Constructor-injected `RobotConfig` | No global state; fully testable without filesystem access |
+| `configure()` for kinematics | config.yaml DH parameters drive IK/FK – no hardcoded duplicates |
 | `self.after(0, callback)` for GUI updates | Ensures PLC data is dispatched on the Tk main thread (thread-safety) |
-| `BasePage` abstract base class | Eliminates camera-selector and status-bar duplication across pages |
-| `px2mm` in config | Camera-agnostic; recalibrate by changing one value, no code changes |
+| Single `ADDR` address map | Eliminates magic bit numbers scattered across UI code |
+| Atomic `write_bits` grouping | Concurrent writers can no longer clobber shared bytes |
+| Tracked pulse timers | Repeated pulses restart cleanly; disconnect cancels pending resets |
+| `BasePage` abstract base class | Card/header/status-bar helpers shared by all pages |
+| `px2mm` + ROI in config | Camera-agnostic recalibration without code changes |
+| Preview FPS decoupled from camera FPS | Smooth video without wasting CPU on 60 Hz widget redraws |
+| Sort E-stop gate + health polling | Motion is refused/aborted whenever the PLC signals a fault |
+| Post-sort cooldown + single sort thread | Prevents duplicate cycles on the same detection |
 | Bare `except` replaced with typed catches | Prevents silent swallowing of `KeyboardInterrupt` / `SystemExit` |
-| `src/kinematics/` module | Inverse kinematics isolated for unit-testing without GUI dependencies |
-| `read_frame` / `annotate_frame` split | Camera lock held only during fast read; YOLO inference runs unlocked |
-| `DetectionResult` dataclass | Separates detection state from PIL conversion; enables lazy rendering |
 | Exponential backoff for PLC reconnect | Avoids network flood when PLC is offline (max 30 s backoff) |
-| `__slots__` on all dataclasses | Reduces per-instance memory overhead during 10 Hz polling loops |
 | Rotating file log handler | Production-grade log retention without manual rotation |
-| Atomic `send_joint_targets_and_command` | Single `db_write` avoids PLC race condition between targets and command |

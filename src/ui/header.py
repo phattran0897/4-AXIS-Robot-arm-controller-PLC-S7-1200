@@ -1,16 +1,19 @@
 """
 src/ui/header.py – Modern professional header with VAA branding.
 
-Provides a consistent header component across all pages.
+Provides a consistent header and footer component across all pages.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageTk
+
+from src.ui.theme import DANGER, SUCCESS, TEXT_SECONDARY
 
 if TYPE_CHECKING:
     from main import RobotApp
@@ -19,12 +22,46 @@ log = logging.getLogger(__name__)
 
 
 # Brand colors
-VAA_PRIMARY: str = "#0A1628"       # Deep navy
-VAA_ACCENT: str = "#00D4FF"        # Cyan accent
-VAA_SECONDARY: str = "#1E3A5F"    # Medium navy
-VAA_GOLD: str = "#FFD700"          # Gold for highlights
-VAA_TEXT: str = "#FFFFFF"          # White text
-VAA_TEXT_DIM: str = "#94A3B8"      # Dimmed text
+VAA_PRIMARY: str = "#0A1628"  # Deep navy
+VAA_ACCENT: str = "#00D4FF"  # Cyan accent
+VAA_SECONDARY: str = "#1E3A5F"  # Medium navy
+VAA_TEXT: str = "#FFFFFF"  # White text
+VAA_TEXT_DIM: str = "#94A3B8"  # Dimmed text
+
+
+def get_logo_path() -> str:
+    """Filesystem path of the brand logo asset (project-relative)."""
+    return os.path.join(os.path.dirname(__file__), "..", "..", "assets", "vaa_logo.png")
+
+
+def apply_app_icon(window: ctk.CTk | ctk.CTkFrame, path: str | None = None) -> bool:
+    """
+    Register the brand logo as the OS window / taskbar icon.
+
+    Parameters
+    ----------
+    window:
+        The Tk root window (``RobotApp``).
+    path:
+        Explicit icon image path; defaults to :func:`get_logo_path`.
+
+    Returns
+    -------
+    bool
+        ``True`` when the icon was applied.
+    """
+    icon_path = path or get_logo_path()
+    try:
+        img = Image.open(icon_path)
+        photo = ImageTk.PhotoImage(img)
+        window.iconphoto(True, photo)
+        # Keep a reference – Tk does not protect the PhotoImage from GC.
+        window._app_icon_ref = photo
+        log.info("App icon set from %s", icon_path)
+        return True
+    except Exception as exc:  # Missing/corrupt asset must never block start-up
+        log.debug("App icon not applied (%s): %s", icon_path, exc)
+        return False
 
 
 class VAAHeader(ctk.CTkFrame):
@@ -33,8 +70,8 @@ class VAAHeader(ctk.CTkFrame):
 
     Layout:
     ┌─────────────────────────────────────────────────────────────────┐
-    │ [LOGO]  VIETNAM AVIATION ACADEMY          [Auto] [Manual]     │
-    │         4-Axis Robot Control System                               │
+    │ [LOGO]  HỌC VIỆN HÀNG KHÔNG VIỆT NAM     [AUTO] [MANUAL]        │
+    │         4-AXIS ROBOT CONTROL SYSTEM                             │
     └─────────────────────────────────────────────────────────────────┘
     """
 
@@ -47,7 +84,7 @@ class VAAHeader(ctk.CTkFrame):
         super().__init__(
             parent,
             fg_color=VAA_PRIMARY,
-            height=80,
+            height=78,
             corner_radius=0,
         )
         self.controller = controller
@@ -56,126 +93,114 @@ class VAAHeader(ctk.CTkFrame):
 
         self._build_layout(current_page)
 
-    def _create_text_logo(self) -> ImageTk.PhotoImage:
-        """Create a professional text-based VAA logo."""
-        img = Image.new("RGBA", (200, 60), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-
-        # Draw accent line
-        draw.rectangle([0, 50, 200, 54], fill=self._hex_to_rgb(VAA_ACCENT))
-
-        return ImageTk.PhotoImage(img)
-
-    def _hex_to_rgb(self, hex_color: str) -> tuple:
-        """Convert hex to RGB tuple."""
-        hex_color = hex_color.lstrip("#")
-        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-
     def _build_layout(self, current_page: str) -> None:
-        import os
-
         # Left section - Logo + Branding
         left_frame = ctk.CTkFrame(self, fg_color="transparent")
         left_frame.pack(side="left", padx=15, pady=8, fill="both", expand=True)
 
-        # Logo image
-        logo_path = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "vaa_logo.png")
+        # Logo image (optional asset)
+        logo_path = get_logo_path()
         try:
-            logo_img = Image.open(logo_path)
-            orig_w, orig_h = logo_img.size
+            logo_src = Image.open(logo_path)
+            orig_w, orig_h = logo_src.size
             target_h = 50
             target_w = int(orig_w * (target_h / orig_h)) if orig_h > 0 else 140
-            logo_img = logo_img.resize((target_w, target_h), Image.LANCZOS)
+            logo_img = logo_src.resize((target_w, target_h), Image.Resampling.LANCZOS)
             self._logo_tk = ctk.CTkImage(logo_img, size=(target_w, target_h))
             logo_label = ctk.CTkLabel(left_frame, image=self._logo_tk, text="")
             logo_label.pack(side="left", padx=(0, 15))
-        except (FileNotFoundError, OSError, Image.UnidentifiedImageError) as exc:
+        except (OSError, Image.UnidentifiedImageError) as exc:
             log.debug("Logo not loaded: %s (%s)", logo_path, exc)
+            # Accent bar placeholder keeps the brand mark present without an asset
+            ctk.CTkFrame(
+                left_frame, width=6, height=54, fg_color=VAA_ACCENT, corner_radius=3
+            ).pack(side="left", padx=(0, 14), pady=2)
 
         # Text branding (beside logo)
         text_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
         text_frame.pack(side="left", fill="y", pady=2)
 
         # Academy name
-        lbl_academy = ctk.CTkLabel(
+        ctk.CTkLabel(
             text_frame,
             text="HỌC VIỆN HÀNG KHÔNG VIỆT NAM",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=ctk.CTkFont(size=17, weight="bold"),
             text_color=VAA_ACCENT,
-        )
-        lbl_academy.pack(anchor="w")
+        ).pack(anchor="w")
 
-        # English name
-        lbl_english = ctk.CTkLabel(
-            text_frame,
+        # English name + system name on one line for a tighter hierarchy
+        subtitle_row = ctk.CTkFrame(text_frame, fg_color="transparent")
+        subtitle_row.pack(anchor="w", pady=(3, 0))
+
+        ctk.CTkLabel(
+            subtitle_row,
             text="VIETNAM AVIATION ACADEMY",
-            font=ctk.CTkFont(size=11, weight="bold"),
+            font=ctk.CTkFont(size=10, weight="bold"),
             text_color=VAA_TEXT_DIM,
-        )
-        lbl_english.pack(anchor="w")
+        ).pack(side="left")
 
-        # System name
-        lbl_system = ctk.CTkLabel(
-            text_frame,
+        ctk.CTkLabel(
+            subtitle_row,
+            text="  |  ",
+            font=ctk.CTkFont(size=10),
+            text_color="#334155",
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            subtitle_row,
             text="4-AXIS INDUSTRIAL ROBOT CONTROL SYSTEM",
-            font=ctk.CTkFont(size=13, weight="normal"),
+            font=ctk.CTkFont(size=11, weight="normal"),
             text_color=VAA_TEXT,
-        )
-        lbl_system.pack(anchor="w", pady=(5, 0))
+        ).pack(side="left")
 
         # Right section - Navigation tabs
         right_frame = ctk.CTkFrame(self, fg_color="transparent")
         right_frame.pack(side="right", padx=20, pady=10)
 
-        # Navigation buttons
-        self._btn_auto = ctk.CTkButton(
-            right_frame,
-            text="AUTO MODE",
-            width=120,
-            height=36,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color=VAA_SECONDARY if current_page != "PageAuto" else VAA_ACCENT,
-            hover_color=VAA_SECONDARY,
-            text_color=VAA_TEXT if current_page != "PageAuto" else VAA_PRIMARY,
-            corner_radius=8,
-            command=lambda: self.controller.show_frame("PageAuto"),
-        )
-        self._btn_auto.pack(side="left", padx=5)
+        self._btn_auto = self._make_tab(right_frame, "AUTO MODE", "PageAuto")
+        self._btn_auto.pack(side="left", padx=(0, 8))
+        self._btn_manual = self._make_tab(right_frame, "MANUAL MODE", "PageManual")
+        self._btn_manual.pack(side="left")
 
-        self._btn_manual = ctk.CTkButton(
-            right_frame,
-            text="MANUAL MODE",
-            width=120,
-            height=36,
+        # Apply initial highlight
+        self.update_active_tab(current_page)
+
+    def _make_tab(
+        self, parent: ctk.CTkFrame, label: str, page_name: str
+    ) -> ctk.CTkButton:
+        """Create one navigation tab button."""
+        return ctk.CTkButton(
+            parent,
+            text=label,
+            width=126,
+            height=38,
             font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color=VAA_SECONDARY if current_page != "PageManual" else VAA_ACCENT,
+            fg_color=VAA_SECONDARY,
             hover_color=VAA_SECONDARY,
-            text_color=VAA_TEXT if current_page != "PageManual" else VAA_PRIMARY,
-            corner_radius=8,
-            command=lambda: self.controller.show_frame("PageManual"),
+            text_color=VAA_TEXT,
+            corner_radius=9,
+            border_width=0,
+            command=lambda: self.controller.show_frame(page_name),
         )
-        self._btn_manual.pack(side="left", padx=5)
 
     def update_active_tab(self, page_name: str) -> None:
-        """Update tab highlighting based on current page."""
+        """Update tab highlighting based on current page (active tab glows cyan)."""
+        active = {
+            "fg_color": VAA_ACCENT,
+            "hover_color": VAA_ACCENT,
+            "text_color": VAA_PRIMARY,
+        }
+        inactive = {
+            "fg_color": VAA_SECONDARY,
+            "hover_color": "#274B75",
+            "text_color": VAA_TEXT,
+        }
         if page_name == "PageAuto":
-            self._btn_auto.configure(
-                fg_color=VAA_ACCENT,
-                text_color=VAA_PRIMARY,
-            )
-            self._btn_manual.configure(
-                fg_color=VAA_SECONDARY,
-                text_color=VAA_TEXT,
-            )
+            self._btn_auto.configure(**active)
+            self._btn_manual.configure(**inactive)
         else:
-            self._btn_manual.configure(
-                fg_color=VAA_ACCENT,
-                text_color=VAA_PRIMARY,
-            )
-            self._btn_auto.configure(
-                fg_color=VAA_SECONDARY,
-                text_color=VAA_TEXT,
-            )
+            self._btn_manual.configure(**active)
+            self._btn_auto.configure(**inactive)
 
 
 class VAAFooter(ctk.CTkFrame):
@@ -195,61 +220,58 @@ class VAAFooter(ctk.CTkFrame):
 
         self._build_layout()
 
+    @staticmethod
+    def _chip(parent: ctk.CTkFrame, text: str) -> ctk.CTkLabel:
+        """Create one status chip label."""
+        return ctk.CTkLabel(
+            parent,
+            text=text,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=DANGER,
+        )
+
     def _build_layout(self) -> None:
-        # Use pack manager since parent header uses pack (not grid)
+        # Use pack manager since the parent container uses pack (not grid)
         # Left - Status
         left_frame = ctk.CTkFrame(self, fg_color="transparent")
         left_frame.pack(side="left", padx=20, fill="both", expand=True)
 
-        self.lbl_status = ctk.CTkLabel(
-            left_frame,
-            text="● SYSTEM READY",
-            font=ctk.CTkFont(size=11, weight="normal"),
-            text_color="#22C55E",
-        )
+        self.lbl_status = self._chip(left_frame, "● SYSTEM READY")
+        self.lbl_status.configure(text_color=SUCCESS)
         self.lbl_status.pack(side="left", pady=5)
 
-        self.lbl_plc = ctk.CTkLabel(
-            left_frame,
-            text="PLC: DISCONNECTED",
-            font=ctk.CTkFont(size=11, weight="normal"),
-            text_color="#EF4444",
-        )
+        self.lbl_plc = self._chip(left_frame, "PLC: DISCONNECTED")
         self.lbl_plc.pack(side="left", padx=20, pady=5)
 
-        self.lbl_camera = ctk.CTkLabel(
-            left_frame,
-            text="CAM: OFFLINE",
-            font=ctk.CTkFont(size=11, weight="normal"),
-            text_color="#EF4444",
-        )
+        self.lbl_camera = self._chip(left_frame, "CAM: OFFLINE")
         self.lbl_camera.pack(side="left", padx=20, pady=5)
 
         # Right - Version
         right_frame = ctk.CTkFrame(self, fg_color="transparent")
         right_frame.pack(side="right", padx=20)
 
-        lbl_version = ctk.CTkLabel(
+        ctk.CTkLabel(
             right_frame,
-            text="v1.0.0 | VAA Robot System",
+            text="v2.0.0 | VAA Robot System",
             font=ctk.CTkFont(size=10, weight="normal"),
-            text_color=VAA_TEXT_DIM,
-        )
-        lbl_version.pack(side="right", pady=5)
+            text_color=TEXT_SECONDARY,
+        ).pack(side="right", pady=5)
 
-    def update_status(self, plc_connected: bool, camera_active: bool, system_ok: bool) -> None:
+    def update_status(
+        self, plc_connected: bool, camera_active: bool, system_ok: bool
+    ) -> None:
         """Update footer status indicators."""
         if system_ok:
-            self.lbl_status.configure(text="● SYSTEM READY", text_color="#22C55E")
+            self.lbl_status.configure(text="● SYSTEM READY", text_color=SUCCESS)
         else:
-            self.lbl_status.configure(text="● SYSTEM ERROR", text_color="#EF4444")
+            self.lbl_status.configure(text="● SYSTEM ERROR", text_color=DANGER)
 
-        if plc_connected:
-            self.lbl_plc.configure(text="PLC: CONNECTED", text_color="#22C55E")
-        else:
-            self.lbl_plc.configure(text="PLC: DISCONNECTED", text_color="#EF4444")
+        self.lbl_plc.configure(
+            text="PLC: CONNECTED" if plc_connected else "PLC: DISCONNECTED",
+            text_color=SUCCESS if plc_connected else DANGER,
+        )
 
-        if camera_active:
-            self.lbl_camera.configure(text="CAM: ACTIVE", text_color="#22C55E")
-        else:
-            self.lbl_camera.configure(text="CAM: OFFLINE", text_color="#EF4444")
+        self.lbl_camera.configure(
+            text="CAM: ACTIVE" if camera_active else "CAM: OFFLINE",
+            text_color=SUCCESS if camera_active else DANGER,
+        )

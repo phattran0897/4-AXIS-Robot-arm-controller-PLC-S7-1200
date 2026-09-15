@@ -1,19 +1,43 @@
 """
 src/robot/sorting_controller.py – Automated pick-and-place sorting controller.
+
+Contract
+--------
+The S7-1200 PLC executes its internal pick-and-place motion sequence
+autonomously once START_AUTO is pulsed and the classification bits are set.
+This controller orchestrates the *cycle* from the PC side:
+
+1. Writes the classification result (GOOD/BAD) to the PLC.
+2. Pulses START_AUTO so the PLC begins its sequence.
+3. Mirrors the commanded joint targets (computed locally via IK) into the
+   DB for the GUI, while continuously monitoring PLC health (offline /
+   error flag / motion_done) between every step.
+
+If the PLC drops offline or raises its error flag mid-cycle, an exception
+is raised immediately so the caller can stop and surface the fault.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
 from enum import Enum
 from typing import TYPE_CHECKING
+
+from src.kinematics import InverseKinematicsError, inverse_kinematics
+from src.plc.plc_controller import ADDR
 
 if TYPE_CHECKING:
     from src.config_loader import KinematicsConfig, PLCCommands, SortPositionsConfig
     from src.plc.plc_controller import PLCController
 
 log = logging.getLogger(__name__)
+
+#: Assumed worst-case joint speed used to estimate travel times (deg/s).
+_JOINT_SPEED_DPS: float = 45.0
+#: Extra seconds added on top of the estimated travel time before giving up.
+_MOTION_GRACE_S: float = 1.0
 
 
 class SortResult(Enum):
@@ -56,8 +80,40 @@ class SortingController:
         self._counter_bad: int = 0
         self._last_sort_result: SortResult | None = None
 
+        # Commanded joint angles mirrored to the GUI (NOT the motion feedback)
+        self._current_joints: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+        # Last waypoint used as the reference for travel-time estimation
+        self._previous_joints: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+
         # Synchronization event used for precise, mockable delays (avoiding bare time.sleep)
         self._wait_event: threading.Event = threading.Event()
+
+        self._validate_waypoints()
+
+    def _validate_waypoints(self) -> None:
+        """
+        Fail fast when a fixed place waypoint lies outside the reachable
+        workspace (config typo, wrong DH parameters, …).
+
+        Dynamic pick coordinates from the vision system are validated at
+        cycle time by :meth:`_ik` raising on unreachable targets.
+        """
+        phi = self.kinematics.default_phi
+        unreachable: list[str] = []
+        for name, pos in (
+            ("place_good", self.positions.place_good),
+            ("place_bad", self.positions.place_bad),
+        ):
+            for label, z in (("z_up", pos.z_up), ("z_down", pos.z_down)):
+                try:
+                    inverse_kinematics(pos.x, pos.y, z, phi=phi)
+                except InverseKinematicsError:
+                    unreachable.append(f"{name}.{label} (x={pos.x}, y={pos.y}, z={z})")
+        if unreachable:
+            raise ValueError(
+                "Sort waypoints outside the reachable workspace – check "
+                "config.yaml and kinematics DH parameters: " + "; ".join(unreachable)
+            )
 
     @property
     def state(self) -> RobotState:
@@ -79,6 +135,11 @@ class SortingController:
         return self._state == RobotState.IDLE
 
     @property
+    def current_joints(self) -> tuple[float, float, float, float]:
+        """Commanded joint angles computed by IK (for GUI display only)."""
+        return self._current_joints
+
+    @property
     def last_sort_result(self) -> SortResult | None:
         """Get the classification result of the most recent sort cycle."""
         return self._last_sort_result
@@ -93,19 +154,28 @@ class SortingController:
         """Reset the internal controller state to IDLE after an error has been resolved."""
         self._state = RobotState.IDLE
         self._last_sort_result = None
+        # Unblock any _wait_event.wait() calls so the sort thread can exit
+        self._wait_event.set()
+        self._wait_event.clear()
         log.info("SortingController error state cleared; reset to IDLE.")
 
     def _ik(self, x: float, y: float, z: float) -> tuple[float, float, float, float]:
         """
         Compute 4-DOF articulated-arm inverse kinematics.
-        """
-        from src.kinematics import inverse_kinematics, InverseKinematicsError
 
+        Raises
+        ------
+        InverseKinematicsError
+            When the target is unreachable.  Aborting the cycle is the only
+            safe response – substituting a fallback pose such as
+            ``(0, 0, 0, 0)`` would command *real* motion to full horizontal
+            extension while the cycle logic continues as if nothing happened.
+        """
         try:
             return inverse_kinematics(x, y, z, phi=self.kinematics.default_phi)
         except InverseKinematicsError as exc:
-            log.warning("IK failed for target (%.2f, %.2f, %.2f): %s", x, y, z, exc)
-            return 0.0, 0.0, 0.0, 0.0
+            log.error("IK failed for target (%.2f, %.2f, %.2f): %s", x, y, z, exc)
+            raise
 
     def execute_sort(self, pick_x: float, pick_y: float, result: SortResult) -> None:
         """Execute a complete pick-and-place sorting cycle."""
@@ -120,8 +190,11 @@ class SortingController:
             # Store the classification for GUI display
             self._last_sort_result = result
 
-            # 0. Write classification to PLC
+            # 0. Write classification to PLC (atomic bit-group write)
             self.plc.write_classification(result == SortResult.GOOD)
+
+            # TRIGGER PLC TO START ITS INTERNAL MOTION SEQUENCE
+            self.plc.send_pulse(*ADDR.START_AUTO)
 
             # 1. Pick
             self._state = RobotState.MOVING_PICK
@@ -150,44 +223,34 @@ class SortingController:
             self._state = RobotState.ERROR
             self.plc.clear_classification()
             log.error("Error during sorting cycle: %s", exc)
-            raise exc
+            raise
 
     def _pick(self, x: float, y: float) -> None:
-        """Move to coordinates, lower Z, grab, and raise Z."""
-        # Calculate joints for z_up
-        j1_up, j2_up, j3_up, j4_up = self._ik(x, y, self.positions.pick_z_up)
-        # Calculate joints for z_down
-        j1_down, j2_down, j3_down, j4_down = self._ik(x, y, self.positions.pick_z_down)
+        """Mirror pick waypoints, monitor PLC health, actuate the gripper."""
+        j_up = self._ik(x, y, self.positions.pick_z_up)
+        j_down = self._ik(x, y, self.positions.pick_z_down)
 
         log.info(
-            "Picking target (%.2f, %.2f) -> Up: [%.2f, %.2f, %.2f, %.2f], Down: [%.2f, %.2f, %.2f, %.2f]",
+            "Picking target (%.2f, %.2f) -> Up: [%s], Down: [%s]",
             x,
             y,
-            j1_up,
-            j2_up,
-            j3_up,
-            j4_up,
-            j1_down,
-            j2_down,
-            j3_down,
-            j4_down,
+            ", ".join(f"{a:.2f}" for a in j_up),
+            ", ".join(f"{a:.2f}" for a in j_down),
         )
 
-        # Move to XY at z_up
-        self._move_and_wait(j1_up, j2_up, j3_up, j4_up)
-
-        # Lower to z_down
-        self._move_and_wait(j1_down, j2_down, j3_down, j4_down)
+        # Move to XY at z_up, lower to z_down
+        self._move_and_wait(*j_up)
+        self._move_and_wait(*j_down)
 
         # Actuate gripper close
         self._state = RobotState.GRIPPING
         log.info("Closing gripper (GRIP = True)")
-        self.plc.write_bit(14, 0, True)  # Write True to AUTO.GRIP (Offset 14.0)
+        self.plc.write_bit(*ADDR.GRIP, True)
         self._wait_event.wait(self.positions.gripper_delay)
 
         # Raise back to z_up
         self._state = RobotState.MOVING_PICK
-        self._move_and_wait(j1_up, j2_up, j3_up, j4_up)
+        self._move_and_wait(*j_up)
 
     def _place(self, result: SortResult) -> None:
         """Move to designated bin, lower Z, release target, and raise Z."""
@@ -196,45 +259,42 @@ class SortingController:
             if result == SortResult.GOOD
             else self.positions.place_bad
         )
-        # Calculate joints for z_up
-        j1_up, j2_up, j3_up, j4_up = self._ik(target.x, target.y, target.z_up)
-        # Calculate joints for z_down
-        j1_down, j2_down, j3_down, j4_down = self._ik(target.x, target.y, target.z_down)
+        j_up = self._ik(target.x, target.y, target.z_up)
+        j_down = self._ik(target.x, target.y, target.z_down)
 
         log.info(
-            "Placing target to %s -> Up: [%.2f, %.2f, %.2f, %.2f], Down: [%.2f, %.2f, %.2f, %.2f]",
+            "Placing target to %s -> Up: [%s], Down: [%s]",
             result.name,
-            j1_up,
-            j2_up,
-            j3_up,
-            j4_up,
-            j1_down,
-            j2_down,
-            j3_down,
-            j4_down,
+            ", ".join(f"{a:.2f}" for a in j_up),
+            ", ".join(f"{a:.2f}" for a in j_down),
         )
 
-        # Move to placement XY at z_up
-        self._move_and_wait(j1_up, j2_up, j3_up, j4_up)
-
-        # Lower to place z_down
-        self._move_and_wait(j1_down, j2_down, j3_down, j4_down)
+        # Move to placement XY at z_up, lower to z_down
+        self._move_and_wait(*j_up)
+        self._move_and_wait(*j_down)
 
         # Actuate gripper open
         self._state = RobotState.RELEASING
         log.info("Opening gripper (GRIP = False)")
-        self.plc.write_bit(14, 0, False)  # Write False to AUTO.GRIP (Offset 14.0)
+        self.plc.write_bit(*ADDR.GRIP, False)
         self._wait_event.wait(self.positions.gripper_delay)
 
         # Raise back to z_up
         self._state = RobotState.MOVING_PLACE
-        self._move_and_wait(j1_up, j2_up, j3_up, j4_up)
+        self._move_and_wait(*j_up)
 
     def _return_home(self) -> None:
         """Bring all joints back to home coordinates and idle state."""
         log.info("Returning to home (0,0,0,0)")
         self._move_and_wait(0.0, 0.0, 0.0, 0.0, cmd=self.plc_commands.home)
         self._state = RobotState.IDLE
+
+    def _estimate_motion_seconds(
+        self, target: tuple[float, float, float, float]
+    ) -> float:
+        """Estimate travel time from the largest joint delta (deg/s model)."""
+        delta = max(abs(t - c) for t, c in zip(target, self._previous_joints))
+        return max(0.5, delta / _JOINT_SPEED_DPS)
 
     def _move_and_wait(
         self,
@@ -243,42 +303,56 @@ class SortingController:
         j3: float,
         j4: float,
         cmd: int | None = None,
-        timeout: float = 10.0,
+        timeout: float = 30.0,
     ) -> None:
-        """Command joint motion and wait until completed or timed out."""
-        target_cmd = self.plc_commands.move if cmd is None else cmd
-        self.plc.send_joint_targets_and_command(j1, j2, j3, j4, target_cmd)
+        """
+        Mirror one commanded waypoint and supervise the PLC while it moves.
 
-        import time
+        The PLC runs its own internal motion logic, so this method does NOT
+        stream trajectories.  It polls the status DB every 50 ms until the
+        earlier of ``motion_done`` being observed or the estimated travel
+        time (plus grace) elapsing, aborting immediately if the PLC goes
+        offline or raises its error flag.
 
-        t_start = time.monotonic()
+        Parameters
+        ----------
+        j1..j4:
+            Commanded joint angles in degrees (mirrored for the GUI).
+        cmd:
+            Optional legacy command word to pulse (e.g. CMD_HOME).
+        timeout:
+            Absolute upper bound on the wait in seconds.
+        """
+        target = (j1, j2, j3, j4)
+        self._current_joints = target
+        log.info(
+            "Waypoint (commanded): J1=%.2f J2=%.2f J3=%.2f J4=%.2f",
+            j1,
+            j2,
+            j3,
+            j4,
+        )
 
-        # 1. Wait a short time (e.g. 200ms) for the PLC to receive the command
-        # and transition 'motion_done' to False.
-        self._wait_event.wait(0.2)
+        if cmd is not None:
+            self.plc.send_command(cmd)
 
-        # 2. Check if motion is already done (or didn't register a state change because targets were already met)
-        status = self.plc.read_status()
-        if status and status.get("motion_done", False):
-            log.info(
-                "Motion completed immediately (targets already met or simulation mode)."
-            )
-            return
+        estimated = self._estimate_motion_seconds(target)
+        deadline = time.monotonic() + min(timeout, estimated + _MOTION_GRACE_S)
 
-        # 3. Loop until motion_done becomes True (with timeout)
         while True:
-            if time.monotonic() - t_start > timeout:
-                raise TimeoutError(f"Motion timeout ({timeout}s) exceeded during move.")
-
             status = self.plc.read_status()
             if not status:
-                # If PLC disconnects during cycle, abort immediately
                 raise RuntimeError("PLC offline during active pick-and-place motion.")
-
             if status.get("error_flag", False):
                 raise RuntimeError("PLC error flag activated during active motion.")
-
             if status.get("motion_done", False):
                 break
-
+            if time.monotonic() >= deadline:
+                log.debug(
+                    "Motion window elapsed (%.2fs est.) – continuing cycle.",
+                    estimated,
+                )
+                break
             self._wait_event.wait(0.05)
+
+        self._previous_joints = target

@@ -19,13 +19,20 @@ Test coverage areas
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import textwrap
 import unittest
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import numpy as np
+# Ensure the parent directory (project root) is in the Python path
+# This prevents "ModuleNotFoundError: No module named 'src'" when running directly.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+import numpy as np  # noqa: E402  (must follow sys.path setup above)
 
 # ---------------------------------------------------------------------------
 # Conditional import guards – allow tests to run in environments that lack
@@ -158,10 +165,11 @@ class TestConfigLoader(unittest.TestCase):
               inference_height: 320
               read_timeout: 3.0
             kinematics:
-              d1: 100.0
-              a2: 106.0
-              a3: 103.0
-              a4: 85.0
+              a1: 40.0
+              d1: 300.0
+              a2: 190.0
+              a3: 110.0
+              a4: 65.0
             app:
               title: "Test Robot"
               geometry: "800x600"
@@ -185,7 +193,7 @@ class TestConfigLoader(unittest.TestCase):
             self.assertEqual(cfg.camera.inference_width, 480)
             self.assertEqual(cfg.camera.inference_height, 320)
             self.assertAlmostEqual(cfg.camera.read_timeout, 3.0)
-            self.assertAlmostEqual(cfg.kinematics.a2, 106.0)
+            self.assertAlmostEqual(cfg.kinematics.a2, 190.0)
             self.assertEqual(cfg.app.appearance_mode, "light")
             self.assertAlmostEqual(cfg.app.move_cooldown, 2.0)
         finally:
@@ -231,10 +239,10 @@ class TestInverseKinematicsModule(unittest.TestCase):
         from src.kinematics import forward_kinematics
 
         x, y, z = forward_kinematics(0.0, 0.0, 0.0, 0.0)
-        # r = 106 + 103 + 85 = 294, z = 100
-        self.assertAlmostEqual(x, 294.0, places=1)
+        # r = 40 + 190 + 110 + 65 = 405, z = 300
+        self.assertAlmostEqual(x, 405.0, places=1)
         self.assertAlmostEqual(y, 0.0, places=1)
-        self.assertAlmostEqual(z, 100.0, places=1)
+        self.assertAlmostEqual(z, 300.0, places=1)
 
     # ── TC-17 ────────────────────────────────────────────────────────────────
     def test_fk_ik_round_trip(self) -> None:
@@ -257,7 +265,7 @@ class TestInverseKinematicsModule(unittest.TestCase):
         from src.kinematics import inverse_kinematics, WorkspaceError
 
         with self.assertRaises(WorkspaceError):
-            inverse_kinematics(0.0, 0.0, 100.0)
+            inverse_kinematics(0.0, 0.0, 300.0)
 
     def test_ik_base_rotation(self) -> None:
         """IK for equal X, Y must give θ₁ = 45°."""
@@ -273,17 +281,17 @@ class TestInverseKinematicsModule(unittest.TestCase):
         from src.kinematics import inverse_kinematics, WorkspaceError
 
         with self.assertRaises(WorkspaceError):
-            # Max reach = 106+103+85 = 294 mm, so 500 mm is unreachable
-            inverse_kinematics(500.0, 0.0, 100.0, phi=0.0)
+            # Max reach = 40 + 190 + 110 + 65 = 405 mm, so 500 mm is unreachable
+            inverse_kinematics(500.0, 0.0, 300.0, phi=0.0)
 
     def test_reachable_function(self) -> None:
         """reachable() must correctly classify in/out-of-workspace points."""
         from src.kinematics import reachable
 
-        # All-zero joints reach (294, 0, 100) → should be reachable
-        self.assertTrue(reachable(294.0, 0.0, 100.0, phi=0.0))
+        # All-zero joints reach (405, 0, 300) → should be reachable
+        self.assertTrue(reachable(405.0, 0.0, 300.0, phi=0.0))
         # Way too far out
-        self.assertFalse(reachable(500.0, 0.0, 100.0, phi=0.0))
+        self.assertFalse(reachable(700.0, 0.0, 300.0, phi=0.0))
 
     def test_fk_with_base_rotation(self) -> None:
         """FK with θ₁=90° should swap X and Y (X≈0, Y=r)."""
@@ -291,8 +299,8 @@ class TestInverseKinematicsModule(unittest.TestCase):
 
         x, y, z = forward_kinematics(90.0, 0.0, 0.0, 0.0)
         self.assertAlmostEqual(x, 0.0, places=1)
-        self.assertAlmostEqual(y, 294.0, places=1)
-        self.assertAlmostEqual(z, 100.0, places=1)
+        self.assertAlmostEqual(y, 405.0, places=1)
+        self.assertAlmostEqual(z, 300.0, places=1)
 
 
 # ===========================================================================
@@ -477,6 +485,7 @@ class TestYOLODetector(unittest.TestCase):
             np.array([360, 220, 440, 260], dtype=np.float32)
         )
         mock_box.conf.item.return_value = 0.90
+        mock_box.cls.item.return_value = 0
 
         mock_result = MagicMock()
         mock_result.boxes = [mock_box]
@@ -625,9 +634,10 @@ class TestSortingController(unittest.TestCase):
         self.assertNotEqual(j1, 0.0)
         self.assertNotEqual(j2, 0.0)
 
-    def test_ik_unreachable_point_returns_zero_zero(self) -> None:
-        """IK on unreachable point must return (0.0, 0.0, 0.0, 0.0)."""
-        from src.config_loader import KinematicsConfig, SortPositionsConfig, PLCCommands
+    def test_ik_unreachable_point_raises(self) -> None:
+        """IK on unreachable point must RAISE – never return a bogus pose."""
+        from src.config_loader import KinematicsConfig, PLCCommands, SortPositionsConfig
+        from src.kinematics import InverseKinematicsError
         from src.robot.sorting_controller import SortingController
 
         positions = SortPositionsConfig()
@@ -635,11 +645,36 @@ class TestSortingController(unittest.TestCase):
         plc_commands = PLCCommands()
         mock_plc = MagicMock()
         sorter = SortingController(mock_plc, positions, kinematics, plc_commands)
-        j1, j2, j3, j4 = sorter._ik(500.0, 0.0, 100.0)
-        self.assertEqual(j1, 0.0)
-        self.assertEqual(j2, 0.0)
-        self.assertEqual(j3, 0.0)
-        self.assertEqual(j4, 0.0)
+        with self.assertRaises(InverseKinematicsError):
+            sorter._ik(700.0, 0.0, 300.0)
+
+    def test_execute_sort_aborts_on_unreachable_target(self) -> None:
+        """An unreachable pick target must set ERROR and clear classification
+        WITHOUT commanding any motion or closing the gripper."""
+        from src.config_loader import KinematicsConfig, PLCCommands, SortPositionsConfig
+        from src.robot.sorting_controller import (
+            RobotState,
+            SortResult,
+            SortingController,
+        )
+
+        positions = SortPositionsConfig()
+        positions.pick_z_down = 99999.0  # Far outside the workspace
+        kinematics = KinematicsConfig()
+        plc_commands = PLCCommands()
+        mock_plc = MagicMock()
+
+        sorter = SortingController(mock_plc, positions, kinematics, plc_commands)
+        sorter._move_and_wait = MagicMock()  # Must never be reached
+
+        with self.assertRaises(Exception):
+            sorter.execute_sort(150.0, 100.0, SortResult.GOOD)
+
+        self.assertEqual(sorter.state, RobotState.ERROR)
+        mock_plc.clear_classification.assert_called_once()
+        sorter._move_and_wait.assert_not_called()
+        # Gripper must not have been commanded on an aborted cycle
+        mock_plc.write_bit.assert_not_called()
 
     def test_execute_sort_calls_plc_in_correct_sequence(self) -> None:
         """execute_sort() must call the PLC with targets and correct commands sequentially."""
@@ -722,6 +757,377 @@ class TestSortingController(unittest.TestCase):
         sorter.reset_counters()
         self.assertEqual(sorter.counter_good, 0)
         self.assertEqual(sorter.counter_bad, 0)
+
+
+# ---------------------------------------------------------------------------
+# 8 – Regression tests for reviewed bug fixes
+# ---------------------------------------------------------------------------
+
+
+class TestConfigDefaultsRegression(unittest.TestCase):
+    """Regression: loader fallbacks must match dataclass/config.yaml poses."""
+
+    # ── R-01 ────────────────────────────────────────────────────────────────
+    def test_missing_sort_position_keys_use_workspace_safe_defaults(self) -> None:
+        """Empty sort_positions section must fall back to z=80/150, never -50/0."""
+        from src.config_loader import load_config
+
+        path = TestConfigLoader()._write_yaml("sort_positions:\n")
+        try:
+            cfg = load_config(path)
+            self.assertAlmostEqual(cfg.sort_positions.place_good.z_down, 80.0)
+            self.assertAlmostEqual(cfg.sort_positions.place_good.z_up, 150.0)
+            self.assertAlmostEqual(cfg.sort_positions.place_bad.z_down, 80.0)
+            self.assertAlmostEqual(cfg.sort_positions.place_bad.z_up, 150.0)
+            self.assertAlmostEqual(cfg.sort_positions.pick_z_down, 80.0)
+            self.assertAlmostEqual(cfg.sort_positions.pick_z_up, 150.0)
+        finally:
+            os.unlink(path)
+
+    def test_loader_defaults_match_dataclass_defaults(self) -> None:
+        """Every sort-position fallback must equal its dataclass default."""
+        from src.config_loader import SortPositionsConfig, load_config
+
+        path = TestConfigLoader()._write_yaml("")
+        try:
+            cfg = load_config(path)
+            defaults = SortPositionsConfig()
+            self.assertEqual(
+                cfg.sort_positions.place_good.z_down, defaults.place_good.z_down
+            )
+            self.assertEqual(
+                cfg.sort_positions.place_good.z_up, defaults.place_good.z_up
+            )
+            self.assertEqual(cfg.sort_positions.pick_z_down, defaults.pick_z_down)
+            self.assertEqual(cfg.sort_positions.pick_z_up, defaults.pick_z_up)
+        finally:
+            os.unlink(path)
+
+
+class TestKinematicsConfigureRegression(unittest.TestCase):
+    """Regression: configure() must validate before mutating module globals."""
+
+    # ── R-02 ────────────────────────────────────────────────────────────────
+    def test_invalid_link_value_leaves_state_uncorrupted(self) -> None:
+        """A failed configure() call must not partially apply new values."""
+        import src.kinematics.kinematics as kin
+
+        original_a2 = kin.A2
+        with self.assertRaises(ValueError):
+            kin.configure(a2=-5.0)
+        self.assertEqual(kin.A2, original_a2)
+
+    def test_valid_configure_applies_all_values(self) -> None:
+        import src.kinematics.kinematics as kin
+
+        old = (kin.A1, kin.D1, kin.A2, kin.A3, kin.A4)
+        try:
+            kin.configure(a1=41.0, d1=301.0, a2=191.0, a3=111.0, a4=66.0)
+            self.assertEqual(
+                (kin.A1, kin.D1, kin.A2, kin.A3, kin.A4),
+                (41.0, 301.0, 191.0, 111.0, 66.0),
+            )
+        finally:
+            kin.configure(a1=old[0], d1=old[1], a2=old[2], a3=old[3], a4=old[4])
+
+
+@unittest.skipUnless(_HAVE_SNAP7, "snap7 not installed")
+class TestPulseRaceRegression(unittest.TestCase):
+    """Regression: stale pulse resets must not truncate newer pulses."""
+
+    def _make_controller(self) -> tuple[Any, MagicMock]:
+        from src.plc.plc_controller import PLCController
+
+        cfg = _make_robot_config().plc
+        ctrl = PLCController(cfg)
+        mock_client = MagicMock()
+        mock_client.get_connected.return_value = True
+        ctrl._client = mock_client
+        return ctrl, mock_client
+
+    # ── R-03 ────────────────────────────────────────────────────────────────
+    def test_stale_generation_finish_pulse_skips_reset(self) -> None:
+        """_finish_pulse with an outdated generation must NOT write False."""
+        ctrl, mock_client = self._make_controller()
+        mock_client.db_read.return_value = bytearray(1)
+
+        ctrl.send_pulse(0, 0)
+        ctrl.send_pulse(0, 0)  # Supersedes the first pulse (generation bump)
+
+        key = (0, 0)
+        entry = ctrl._pulse_timers[key]
+        stale_generation = entry[1] - 1
+
+        writes_before = mock_client.db_write.call_count
+        ctrl._finish_pulse(0, 0, stale_generation)
+        self.assertEqual(mock_client.db_write.call_count, writes_before)
+        self.assertIn(key, ctrl._pulse_timers)
+
+    def test_current_generation_finish_pulse_resets_bit(self) -> None:
+        ctrl, mock_client = self._make_controller()
+        mock_client.db_read.return_value = bytearray(1)
+
+        ctrl.send_pulse(0, 0)
+        key = (0, 0)
+        generation = ctrl._pulse_timers[key][1]
+
+        ctrl._finish_pulse(0, 0, generation)
+        self.assertNotIn(key, ctrl._pulse_timers)
+        # Last write must be the False reset of byte 0
+        last_call = mock_client.db_write.call_args_list[-1]
+        self.assertEqual(last_call[0][1], 0)
+
+    def test_addr_manual_mode_constant_exists(self) -> None:
+        """MANUAL_MODE must live in ADDR – no magic (16, 0) at call sites."""
+        from src.plc.plc_controller import ADDR
+
+        self.assertEqual(ADDR.MANUAL_MODE, (16, 0))
+        self.assertEqual(ADDR.AUTO_MODE_1, (14, 1))
+
+
+class TestMoveAndWaitRegression(unittest.TestCase):
+    """Regression: _move_and_wait health-supervision loop (previously untested)."""
+
+    def _make_sorter(self) -> tuple[Any, MagicMock]:
+        from src.config_loader import KinematicsConfig, PLCCommands, SortPositionsConfig
+        from src.robot.sorting_controller import SortingController
+
+        mock_plc = MagicMock()
+        sorter = SortingController(
+            mock_plc, SortPositionsConfig(), KinematicsConfig(), PLCCommands()
+        )
+        return sorter, mock_plc
+
+    # ── R-04 ────────────────────────────────────────────────────────────────
+    def test_motion_done_true_returns_quickly(self) -> None:
+        """A motion_done=True status must complete the wait without timeout."""
+        import time as _time
+
+        sorter, mock_plc = self._make_sorter()
+        mock_plc.read_status.return_value = {"motion_done": True, "error_flag": False}
+
+        start = _time.monotonic()
+        sorter._move_and_wait(10.0, 20.0, 30.0, 0.0)
+        elapsed = _time.monotonic() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(sorter._previous_joints, (10.0, 20.0, 30.0, 0.0))
+
+    def test_plc_offline_during_motion_raises(self) -> None:
+        """An empty read_status mid-motion must raise RuntimeError."""
+        sorter, mock_plc = self._make_sorter()
+        mock_plc.read_status.return_value = {}
+
+        with self.assertRaises(RuntimeError):
+            sorter._move_and_wait(10.0, 20.0, 30.0, 0.0)
+
+    def test_error_flag_during_motion_raises_and_records_target(self) -> None:
+        """The error flag must abort the waypoint immediately."""
+        sorter, mock_plc = self._make_sorter()
+        mock_plc.read_status.return_value = {"motion_done": False, "error_flag": True}
+
+        with self.assertRaises(RuntimeError):
+            sorter._move_and_wait(10.0, 20.0, 30.0, 0.0)
+        self.assertEqual(
+            sorter.state.name, "IDLE"
+        )  # execute_sort sets ERROR; raw call must not
+
+    def test_motion_done_transition_breaks_wait(self) -> None:
+        """Polling continues until motion_done flips True, then breaks."""
+        sorter, mock_plc = self._make_sorter()
+        mock_plc.read_status.side_effect = [
+            {"motion_done": False, "error_flag": False},
+            {"motion_done": False, "error_flag": False},
+            {"motion_done": True, "error_flag": False},
+        ]
+
+        sorter._move_and_wait(1.0, 2.0, 3.0, 4.0)
+        self.assertEqual(mock_plc.read_status.call_count, 3)
+
+
+# ===========================================================================
+# 9 – Config range validation (M1): dangerous values must fail fast
+# ===========================================================================
+
+
+class TestConfigRangeValidation(unittest.TestCase):
+    """Out-of-range config values must raise ValueError at load time."""
+
+    def _assert_load_raises(self, yaml_fragment: str) -> None:
+        path = TestConfigLoader()._write_yaml(yaml_fragment)
+        try:
+            from src.config_loader import load_config
+
+            with self.assertRaises(ValueError):
+                load_config(path)
+        finally:
+            os.unlink(path)
+
+    # ── V-01 ────────────────────────────────────────────────────────────────
+    def test_joint_limit_min_ge_max_raises(self) -> None:
+        """Inverted joint limits must be rejected."""
+        self._assert_load_raises("kinematics:\n  j2_min: 100.0\n  j2_max: 50.0\n")
+
+    def test_joint_limit_min_equals_max_raises(self) -> None:
+        self._assert_load_raises("kinematics:\n  j3_min: 10.0\n  j3_max: 10.0\n")
+
+    def test_nonpositive_base_height_raises(self) -> None:
+        self._assert_load_raises("kinematics:\n  d1: 0.0\n")
+
+    # ── V-02 ────────────────────────────────────────────────────────────────
+    def test_plc_bit_offset_above_seven_raises(self) -> None:
+        self._assert_load_raises("plc:\n  offsets:\n    hang_tot_bit: 9\n")
+
+    def test_plc_negative_bit_offset_raises(self) -> None:
+        self._assert_load_raises("plc:\n  offsets:\n    error_flag_bit: -1\n")
+
+    def test_plc_negative_byte_offset_raises(self) -> None:
+        self._assert_load_raises("plc:\n  offsets:\n    motion_done_byte: -5\n")
+
+    def test_j4_sentinel_minus_one_is_allowed(self) -> None:
+        """j4_target = -1 is the documented 'unmapped' sentinel – must pass."""
+        path = TestConfigLoader()._write_yaml("plc:\n  offsets:\n    j4_target: -1\n")
+        try:
+            from src.config_loader import load_config
+
+            cfg = load_config(path)
+            self.assertEqual(cfg.plc.offsets.j4_target, -1)
+        finally:
+            os.unlink(path)
+
+    # ── V-03 ────────────────────────────────────────────────────────────────
+    def test_negative_gripper_delay_raises(self) -> None:
+        self._assert_load_raises("sort_positions:\n  gripper_delay: -1.0\n")
+
+    def test_place_z_down_not_below_z_up_raises(self) -> None:
+        """z_down must be strictly below z_up or the arm never descends."""
+        self._assert_load_raises(
+            "sort_positions:\n" "  place_good:\n    z_down: 200.0\n    z_up: 150.0\n"
+        )
+
+    # ── V-04 ────────────────────────────────────────────────────────────────
+    def test_zero_camera_fps_raises(self) -> None:
+        self._assert_load_raises("camera:\n  fps: 0\n")
+
+    def test_nonpositive_roi_size_raises(self) -> None:
+        self._assert_load_raises("yolo:\n  roi_width: 0\n")
+
+    def test_negative_roi_origin_raises(self) -> None:
+        self._assert_load_raises("yolo:\n  roi_x: -10\n")
+
+
+class TestSortingWaypointValidation(unittest.TestCase):
+    """SortingController must fail fast on unreachable fixed waypoints."""
+
+    # ── V-05 ────────────────────────────────────────────────────────────────
+    def test_unreachable_place_position_rejected_at_init(self) -> None:
+        from src.config_loader import (
+            KinematicsConfig,
+            PlacePosition,
+            PLCCommands,
+            SortPositionsConfig,
+        )
+        from src.robot.sorting_controller import SortingController
+
+        positions = SortPositionsConfig()
+        positions.place_bad = PlacePosition(x=99999.0, y=0.0, z_down=80.0, z_up=150.0)
+
+        with self.assertRaises(ValueError) as ctx:
+            SortingController(MagicMock(), positions, KinematicsConfig(), PLCCommands())
+        self.assertIn("place_bad", str(ctx.exception))
+
+    def test_default_positions_pass_validation(self) -> None:
+        from src.config_loader import KinematicsConfig, PLCCommands, SortPositionsConfig
+        from src.robot.sorting_controller import SortingController
+
+        sorter = SortingController(
+            MagicMock(), SortPositionsConfig(), KinematicsConfig(), PLCCommands()
+        )
+        self.assertTrue(sorter.is_idle())
+
+
+@unittest.skipUnless(_HAVE_CUSTOMTKINTER, "customtkinter not installed")
+class TestHeaderTabsRegression(unittest.TestCase):
+    """Regression: navigation tabs must actually be packed (were invisible).
+
+    The refactor that introduced VAAHeader created _btn_auto/_btn_manual but
+    lost their .pack() calls, leaving the AUTO/MANUAL switch rendered nowhere.
+    """
+
+    # ── R-05 ────────────────────────────────────────────────────────────────
+    def test_navigation_tabs_are_packed(self) -> None:
+        import customtkinter as ctk
+
+        from src.ui.header import VAAHeader
+
+        root = ctk.CTk()
+        root.withdraw()
+        try:
+            header = VAAHeader(parent=root, controller=MagicMock())
+            root.update_idletasks()
+            root.update()
+            for btn in (header._btn_auto, header._btn_manual):
+                label = str(btn.cget("text"))
+                self.assertEqual(
+                    btn.winfo_manager(),
+                    "pack",
+                    f"Tab '{label}' is not managed by pack – it never renders.",
+                )
+        finally:
+            root.destroy()
+
+
+@unittest.skipUnless(_HAVE_CUSTOMTKINTER, "customtkinter not installed")
+class TestAppIcon(unittest.TestCase):
+    """The brand logo must become the OS window/taskbar icon at start-up."""
+
+    def _make_root(self):
+        import customtkinter as ctk
+
+        root = ctk.CTk()
+        root.withdraw()
+        return root
+
+    # ── R-06 ────────────────────────────────────────────────────────────────
+    def test_apply_app_icon_with_valid_png(self) -> None:
+        import tempfile
+
+        from PIL import Image
+
+        from src.ui.header import apply_app_icon
+
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        Image.new("RGBA", (64, 64), (0, 212, 255, 255)).save(path)
+        try:
+            root = self._make_root()
+            try:
+                self.assertTrue(apply_app_icon(root, path))
+                # Tk keeps the registered iconphoto image
+                self.assertTrue(root._app_icon_ref is not None)
+            finally:
+                root.destroy()
+        finally:
+            os.unlink(path)
+
+    def test_apply_app_icon_missing_file_returns_false(self) -> None:
+        from src.ui.header import apply_app_icon
+
+        root = self._make_root()
+        try:
+            self.assertFalse(apply_app_icon(root, "Z:/definitely/not/here/logo.png"))
+        finally:
+            root.destroy()
+
+    def test_get_logo_path_points_at_asset(self) -> None:
+        import os as _os
+
+        from src.ui.header import get_logo_path
+
+        p = get_logo_path()
+        self.assertTrue(
+            _os.path.normpath(p).endswith(_os.path.join("assets", "vaa_logo.png"))
+        )
 
 
 # ---------------------------------------------------------------------------

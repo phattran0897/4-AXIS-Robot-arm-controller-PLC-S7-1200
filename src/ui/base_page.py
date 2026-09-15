@@ -2,8 +2,9 @@
 src/ui/base_page.py – Abstract base class for all application pages.
 
 Every page (Auto / Manual) inherits :class:`BasePage`, which wires up the
-controller reference and exposes shared helpers: status-bar updates,
-camera selector construction, and the ``update_gui_data`` contract.
+controller reference and exposes shared helpers: card + section-header
+factories, status-bar updates, camera-selector construction, and the
+``update_gui_data`` contract.
 """
 
 from __future__ import annotations
@@ -15,14 +16,16 @@ from typing import TYPE_CHECKING, Any
 import customtkinter as ctk
 
 from src.ui.theme import (
+    CARD_BG,
+    CONTENT_BG,
+    DANGER,
+    HEADER_BG,
     PANEL_BG,
     PANEL_BORDER,
+    ROW_BG,
     SUCCESS,
-    DANGER,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
-    CARD_BG,
-    HEADER_BG,
 )
 
 if TYPE_CHECKING:
@@ -54,7 +57,7 @@ class BasePage(ctk.CTkFrame):
         controller: "RobotApp",
         page_color: str = "#00D4FF",
     ) -> None:
-        super().__init__(parent, fg_color="#0F172A")
+        super().__init__(parent, fg_color=CONTENT_BG)
         self.controller: "RobotApp" = controller
         self.page_color: str = page_color
 
@@ -64,6 +67,10 @@ class BasePage(ctk.CTkFrame):
 
         # Proper reference to prevent PhotoImage garbage collection
         self._current_tk_image: ctk.CTkImage | None = None
+
+        # Dynamic video display size (updated on container resize)
+        self._video_display_width: int = 440
+        self._video_display_height: int = 310
 
     # ------------------------------------------------------------------
     # Contract
@@ -99,6 +106,94 @@ class BasePage(ctk.CTkFrame):
     # Shared UI factory helpers
     # ------------------------------------------------------------------
 
+    def _create_card(self, parent: ctk.CTkFrame) -> ctk.CTkFrame:
+        """Create a modern bordered card (single implementation app-wide)."""
+        return ctk.CTkFrame(
+            parent,
+            fg_color=CARD_BG,
+            border_color=PANEL_BORDER,
+            border_width=1,
+            corner_radius=14,
+        )
+
+    def build_section_header(
+        self,
+        parent: ctk.CTkFrame,
+        icon: str,
+        title: str,
+        color: str,
+    ) -> ctk.CTkFrame:
+        """
+        Build the standard section header row (icon + title + underline)
+        and return the header frame.
+        """
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=15, pady=(14, 8))
+
+        row = ctk.CTkFrame(header, fg_color="transparent")
+        row.pack(fill="x")
+
+        ctk.CTkLabel(
+            row,
+            text=icon,
+            font=ctk.CTkFont(size=18),
+            text_color=color,
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkLabel(
+            row,
+            text=title,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=color,
+        ).pack(side="left")
+
+        # Accent underline for a crisp, professional finish
+        ctk.CTkFrame(header, height=2, fg_color=color, corner_radius=1).pack(
+            fill="x", pady=(6, 0)
+        )
+        return header
+
+    def create_data_row(
+        self,
+        parent: ctk.CTkFrame,
+        name: str,
+        value: str,
+        value_color: str | None = None,
+        mono_font: bool = True,
+    ) -> ctk.CTkLabel:
+        """
+        Create a styled label/value row and return the value label.
+
+        Used for joint readouts, kinematics results, and similar key-value
+        displays so they look identical across pages.
+        """
+        row = ctk.CTkFrame(
+            parent,
+            fg_color=ROW_BG,
+            corner_radius=10,
+            border_color=PANEL_BORDER,
+            border_width=1,
+        )
+        row.pack(fill="x", pady=4, ipady=5)
+
+        ctk.CTkLabel(
+            row,
+            text=name,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=TEXT_SECONDARY,
+            anchor="w",
+        ).pack(side="left", padx=12)
+
+        val_label = ctk.CTkLabel(
+            row,
+            text=value,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=value_color or TEXT_PRIMARY,
+            anchor="e",
+        )
+        val_label.pack(side="right", padx=12)
+        return val_label
+
     def build_camera_column(
         self,
         parent: ctk.CTkFrame,
@@ -108,39 +203,14 @@ class BasePage(ctk.CTkFrame):
         """
         Build the camera column (frame + selector + video label) in one call.
 
-        Eliminates the duplication that existed when each sub-class implemented
+        Eliminates duplication that existed when each sub-class implemented
         this layout manually.
-
-        Parameters
-        ----------
-        parent:
-            The parent grid container.
-        column:
-            Grid column index to place the camera column.
-        title_color:
-            Hex colour string for the selector label.
         """
         frame = self._create_card(parent)
         frame.grid(row=0, column=column, padx=8, pady=8, sticky="nsew")
 
         # Section header
-        header = ctk.CTkFrame(frame, fg_color="transparent")
-        header.pack(fill="x", padx=15, pady=(12, 8))
-
-        icon_label = ctk.CTkLabel(
-            header,
-            text="📷",
-            font=ctk.CTkFont(size=18),
-            text_color=title_color,
-        )
-        icon_label.pack(side="left", padx=(0, 8))
-
-        ctk.CTkLabel(
-            header,
-            text="AI VISION",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=title_color,
-        ).pack(side="left")
+        self.build_section_header(frame, "📷", "AI VISION", title_color)
 
         # Camera selector
         selector_frame = ctk.CTkFrame(frame, fg_color="transparent")
@@ -165,16 +235,19 @@ class BasePage(ctk.CTkFrame):
             values=cam_values,
             command=self.controller.change_camera_source,
             width=140,
+            height=28,
             fg_color=PANEL_BG,
             text_color=TEXT_PRIMARY,
             button_color=title_color,
             button_hover_color=title_color,
             dropdown_fg_color=PANEL_BG,
             dropdown_text_color=TEXT_PRIMARY,
+            border_color=PANEL_BORDER,
+            corner_radius=8,
         )
         cam_selector.pack(side="right")
         if cam_values and cam_values[0] != "No Camera":
-            cam_selector.set(f"{cam_values[0]} (Default)")
+            cam_selector.set(cam_values[0])
         else:
             cam_selector.set("No Camera")
 
@@ -182,7 +255,7 @@ class BasePage(ctk.CTkFrame):
         video_container = ctk.CTkFrame(
             frame,
             fg_color="black",
-            corner_radius=8,
+            corner_radius=10,
             border_color=PANEL_BORDER,
             border_width=1,
         )
@@ -197,23 +270,10 @@ class BasePage(ctk.CTkFrame):
         )
         self.video_label.pack(fill="both", expand=True, padx=5, pady=5)
 
-    def _create_card(self, parent: ctk.CTkFrame) -> ctk.CTkFrame:
-        """Create a modern card with border."""
-        frame = ctk.CTkFrame(
-            parent,
-            fg_color=CARD_BG,
-            border_color=PANEL_BORDER,
-            border_width=1,
-            corner_radius=16,
-        )
-        return frame
+        # Track container size for dynamic camera scaling on fullscreen
+        video_container.bind("<Configure>", self._on_video_container_resize)
 
-    def build_status_bar(
-        self,
-        navigate_text: str,
-        navigate_target: str,
-        navigate_color: str,
-    ) -> ctk.CTkLabel:
+    def build_status_bar(self) -> ctk.CTkLabel:
         """
         Build the bottom status bar common to all pages.
 
@@ -222,7 +282,7 @@ class BasePage(ctk.CTkFrame):
         frame_bottom = ctk.CTkFrame(
             self,
             fg_color=HEADER_BG,
-            height=60,
+            height=56,
             corner_radius=12,
             border_color=PANEL_BORDER,
             border_width=1,
@@ -240,9 +300,9 @@ class BasePage(ctk.CTkFrame):
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=SUCCESS,
         )
-        self.lbl_err_status.pack(side="left", pady=15)
+        self.lbl_err_status.pack(side="left", pady=14)
 
-        # Center: Clear Error button
+        # Clear Error button
         ctk.CTkButton(
             status_frame,
             text="⚠  Clear Error",
@@ -256,29 +316,20 @@ class BasePage(ctk.CTkFrame):
             height=32,
             corner_radius=8,
             command=self.controller.clear_all_errors,
-        ).pack(side="left", padx=20, pady=12)
-
-        # Right: Navigate button
-        # Determine hover color based on target
-        nav_hover = "#4338CA" if "Auto" in navigate_target else "#8B5CF6"
-        ctk.CTkButton(
-            frame_bottom,
-            text=navigate_text,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color=navigate_color,
-            hover_color=nav_hover,
-            text_color="white",
-            width=160,
-            height=36,
-            corner_radius=8,
-            command=lambda: self.controller.show_frame(navigate_target),
-        ).pack(side="right", padx=15, pady=11)
+        ).pack(side="left", padx=20, pady=11)
 
         return self.lbl_err_status
 
     # ------------------------------------------------------------------
     # Shared status update (called by sub-classes)
     # ------------------------------------------------------------------
+
+    def _on_video_container_resize(self, event) -> None:
+        """Track video container size so the camera feed scales on fullscreen."""
+        # Ignore spurious tiny sizes during initial layout
+        if event.width > 50 and event.height > 50:
+            self._video_display_width = event.width - 10  # padding margin
+            self._video_display_height = event.height - 10
 
     def _refresh_error_status(self, data: dict[str, Any]) -> None:
         """Update the error status label shared by every page."""

@@ -3,27 +3,42 @@ src/kinematics/kinematics.py – 4-DOF articulated robot arm kinematics.
 
 DH Table (mm)
 ─────────────────────────────────────────────────────
-  i   θ_i      d_i (mm)    a_i (mm)    α_i
-  1   θ₁       100         0           +90°
-  2   θ₂       0           106         0
-  3   θ₃       0           103         0
-  4   θ₄       0           85          0
+  i   α_i        a_i (mm)    d_i (mm)    θ_i (biến)
+  1   −π/2       40          300         θ₁
+  2   0          190         0           θ₂
+  3   0          110         0           θ₃
+  4   0          65          0           θ₄
 ─────────────────────────────────────────────────────
 
 Forward Kinematics
-    (θ₁°, θ₂°, θ₃°, θ₄°)  →  (X mm, Y mm, Z mm)
-    x = (106·cos θ₂ + 103·cos(θ₂+θ₃) + 85·cos(θ₂+θ₃+θ₄)) · cos θ₁
-    y = (106·cos θ₂ + 103·cos(θ₂+θ₃) + 85·cos(θ₂+θ₃+θ₄)) · sin θ₁
-    z = 100 + 106·sin θ₂ + 103·sin(θ₂+θ₃) + 85·sin(θ₂+θ₃+θ₄)
+    (θ₁°, θ₂°, θ₃°, θ₄°)  →  (Px mm, Py mm, Pz mm)
+    Px = cos(θ₁) · (a₄·cos(θ₂+θ₃+θ₄) + a₃·cos(θ₂+θ₃) + a₂·cos(θ₂) + a₁)
+    Py = sin(θ₁) · (a₄·cos(θ₂+θ₃+θ₄) + a₃·cos(θ₂+θ₃) + a₂·cos(θ₂) + a₁)
+    Pz = d₁ − a₃·sin(θ₂+θ₃) − a₂·sin(θ₂) − a₄·sin(θ₂+θ₃+θ₄)
 
 Inverse Kinematics  (geometric, with end-effector pitch φ)
-    (X mm, Y mm, Z mm, φ°)  →  (θ₁°, θ₂°, θ₃°, θ₄°)
-    θ₁ = atan2(Y, X)
-    Wrist position (removing link-4 contribution):
-        r_w = r_total − 85·cos φ       (horizontal projection)
-        z_w = Z − 100 − 85·sin φ       (vertical from base)
-    Then solve 2-link planar IK (a₂=106, a₃=103) for θ₂, θ₃,
-    and θ₄ = φ − θ₂ − θ₃.
+    (Px mm, Py mm, Pz mm, φ°)  →  (θ₁°, θ₂°, θ₃°, θ₄°)
+    θ₁ = atan2(Py, Px)
+    r  = √(Px² + Py²) − a₁
+    z  = Pz − d₁
+    r₄ = r − a₄·cos(φ)
+    z₄ = z + a₄·sin(φ)
+    C₃ = (r₄² + z₄² − a₂² − a₃²) / (2·a₂·a₃)   clamped to [-1, 1]
+    S₃ = √(1 − C₃²)
+    θ₃ = atan2(S₃, C₃)
+    α  = atan2(z₄, r₄)
+    β  = atan2(a₃·sin(θ₃), a₂ + a₃·cos(θ₃))
+    θ₂ = α − β
+    θ₄ = φ − θ₂ − θ₃
+
+Configuration
+-------------
+The module ships with the default DH parameters above.  At application
+start-up :meth:`configure` is called with the values parsed from
+``config.yaml`` so the YAML file is the single source of truth:
+
+    from src.kinematics import configure
+    configure(a1=cfg.kinematics.a1, d1=cfg.kinematics.d1, ...)
 
 Usage
 -----
@@ -36,13 +51,68 @@ Usage
 from __future__ import annotations
 
 import math
+import threading
 
 
-# ── DH link parameters (mm) ─────────────────────────────────────────────────
-D1 = 100.0   # base height (d₁)
-A2 = 106.0   # link-2 length (a₂)
-A3 = 103.0   # link-3 length (a₃)
-A4 = 85.0    # link-4 / end-effector length (a₄)
+# ── DH link parameters (mm) – defaults; overridden via configure() ──────────
+A1: float = 40.0  # base horizontal offset (a₁)
+D1: float = 300.0  # base height (d₁)
+A2: float = 190.0  # link-2 length (a₂)
+A3: float = 110.0  # link-3 length (a₃)
+A4: float = 65.0  # link-4 / end-effector length (a₄)
+
+# ── Joint limits (degrees) – used by UI validation; set via configure() ─────
+JOINT_LIMITS: dict[str, tuple[float, float]] = {
+    "j1": (-180.0, 180.0),
+    "j2": (0.0, 250.0),
+    "j3": (0.0, 200.0),
+    "j4": (-180.0, 180.0),
+}
+
+_cfg_lock = threading.Lock()
+
+
+def configure(
+    a1: float | None = None,
+    d1: float | None = None,
+    a2: float | None = None,
+    a3: float | None = None,
+    a4: float | None = None,
+    limits: dict[str, tuple[float, float]] | None = None,
+) -> None:
+    """
+    Update the module-level DH parameters and joint limits.
+
+    Called once at start-up with values from ``config.yaml`` so the YAML
+    file drives the kinematics instead of these hardcoded defaults.
+    Thread-safe; not intended to be called while the robot is moving.
+    """
+    global A1, D1, A2, A3, A4
+    with _cfg_lock:
+        # Validate ALL values first, then apply atomically — a failed call
+        # must never leave partially-updated module state behind.
+        new_values: dict[str, float] = {
+            "a1": A1 if a1 is None else float(a1),
+            "d1": D1 if d1 is None else float(d1),
+            "a2": A2 if a2 is None else float(a2),
+            "a3": A3 if a3 is None else float(a3),
+            "a4": A4 if a4 is None else float(a4),
+        }
+        for key in ("d1", "a2", "a3", "a4"):
+            if new_values[key] <= 0.0:
+                raise ValueError(
+                    f"Link parameter {key} must be positive "
+                    f"(got {new_values[key]})."
+                )
+        A1 = new_values["a1"]
+        D1 = new_values["d1"]
+        A2 = new_values["a2"]
+        A3 = new_values["a3"]
+        A4 = new_values["a4"]
+        if limits:
+            for joint, pair in limits.items():
+                if joint in JOINT_LIMITS:
+                    JOINT_LIMITS[joint] = (float(pair[0]), float(pair[1]))
 
 
 class InverseKinematicsError(Exception):
@@ -92,9 +162,8 @@ def forward_kinematics(
     """
     4-DOF articulated-arm forward kinematics.
 
-    Computes the end-effector (X, Y, Z) position from four revolute joint
-    angles using the DH parameters:
-        d₁ = 100 mm,  a₂ = 106 mm,  a₃ = 103 mm,  a₄ = 85 mm
+    Computes the end-effector (Px, Py, Pz) position from four revolute joint
+    angles using the currently-configured DH parameters.
 
     Parameters
     ----------
@@ -110,13 +179,13 @@ def forward_kinematics(
     Returns
     -------
     tuple[float, float, float]
-        End-effector position (X, Y, Z) in millimetres.
+        End-effector position (Px, Py, Pz) in millimetres.
 
     Examples
     --------
     >>> x, y, z = forward_kinematics(0.0, 0.0, 0.0, 0.0)
     >>> round(x, 2), round(y, 2), round(z, 2)
-    (294.0, 0.0, 100.0)
+    (405.0, 0.0, 300.0)
     """
     t1 = math.radians(j1)
     t2 = math.radians(j2)
@@ -124,19 +193,19 @@ def forward_kinematics(
     t234 = math.radians(j2 + j3 + j4)
 
     # Horizontal projection (radial distance from Z-axis)
-    r = A2 * math.cos(t2) + A3 * math.cos(t23) + A4 * math.cos(t234)
+    r = A4 * math.cos(t234) + A3 * math.cos(t23) + A2 * math.cos(t2) + A1
 
-    x = r * math.cos(t1)
-    y = r * math.sin(t1)
-    z = D1 + A2 * math.sin(t2) + A3 * math.sin(t23) + A4 * math.sin(t234)
+    px = r * math.cos(t1)
+    py = r * math.sin(t1)
+    pz = D1 - A3 * math.sin(t23) - A2 * math.sin(t2) - A4 * math.sin(t234)
 
-    return x, y, z
+    return px, py, pz
 
 
 def inverse_kinematics(
     x: float,
     y: float,
-    z: float = 100.0,
+    z: float = 300.0,
     phi: float = 0.0,
     **_kwargs,
 ) -> tuple[float, float, float, float]:
@@ -168,7 +237,7 @@ def inverse_kinematics(
 
     Examples
     --------
-    >>> j1, j2, j3, j4 = inverse_kinematics(294.0, 0.0, 100.0, phi=0.0)
+    >>> j1, j2, j3, j4 = inverse_kinematics(405.0, 0.0, 300.0, phi=0.0)
     >>> round(j1, 1), round(j2, 1), round(j3, 1), round(j4, 1)
     (0.0, 0.0, 0.0, 0.0)
     """
@@ -196,36 +265,49 @@ def _inverse_kinematics_impl(
 
     # ── Wrist position (remove link-4 contribution) ──────────────────────
     phi_rad = math.radians(phi)
-    r_w = r_total - A4 * math.cos(phi_rad)
-    z_w = z - D1 - A4 * math.sin(phi_rad)
+
+    # FK uses: Pz = d1 - height. So downward depth is d1 - Pz
+    z_depth = D1 - z
+
+    # r = sqrt(Px² + Py²) - a1
+    r = r_total - A1
+    # r4 = r - a4·cos(φ)
+    r4 = r - A4 * math.cos(phi_rad)
+    # The downward depth of the wrist:
+    z4 = z_depth - A4 * math.sin(phi_rad)
 
     # ── 2-link planar IK (a₂, a₃) for θ₂, θ₃ ────────────────────────────
-    dist_sq = r_w * r_w + z_w * z_w
+    dist_sq = r4 * r4 + z4 * z4
     dist = math.sqrt(dist_sq)
 
     # Check reachability of the wrist point
-    if dist > (A2 + A3) or dist < abs(A2 - A3):
+    if round(dist, 4) > (A2 + A3) or round(dist, 4) < abs(A2 - A3):
         raise WorkspaceError(
             f"Target ({x:.2f}, {y:.2f}, {z:.2f}) with φ={phi:.1f}° is "
             f"outside the reachable workspace (wrist distance={dist:.2f} mm, "
             f"arm range=[{abs(A2 - A3):.1f}, {A2 + A3:.1f}] mm)."
         )
 
-    # cos θ₃ by the law of cosines
+    # C₃ = (r₄² + z₄² − a₂² − a₃²) / (2·a₂·a₃)
     cos_theta3 = (dist_sq - A2 * A2 - A3 * A3) / (2.0 * A2 * A3)
     cos_theta3 = max(-1.0, min(1.0, cos_theta3))  # clamp for numerical safety
 
-    # Elbow-up solution (negative θ₃)
-    theta3 = -math.acos(cos_theta3)
+    # S₃ = √(1 − C₃²)  (elbow-up solution)
+    sin_theta3 = math.sqrt(1.0 - cos_theta3 * cos_theta3)
 
-    # θ₂ via atan2 formulation
-    s3 = math.sin(theta3)
-    c3 = math.cos(theta3)
-    alpha = math.atan2(z_w, r_w)
-    beta = math.atan2(A3 * s3, A2 + A3 * c3)
+    # θ₃ = atan2(S₃, C₃)
+    theta3 = math.atan2(sin_theta3, cos_theta3)
+
+    # α = atan2(z₄, r₄)
+    alpha = math.atan2(z4, r4)
+
+    # β = atan2(a₃·sin(θ₃), a₂ + a₃·cos(θ₃))
+    beta = math.atan2(A3 * sin_theta3, A2 + A3 * cos_theta3)
+
+    # θ₂ = α − β
     theta2 = alpha - beta
 
-    # θ₄ from pitch constraint
+    # θ₄ = φ − θ₂ − θ₃
     theta4 = phi_rad - theta2 - theta3
 
     return (

@@ -4,7 +4,9 @@ src/kinematics/__init__.py – Kinematics module for Industrial robot.
 
 from src.kinematics.kinematics import (
     InverseKinematicsError,
+    JOINT_LIMITS,
     WorkspaceError,
+    configure,
     forward_kinematics,
     inverse_kinematics,
     reachable,
@@ -16,4 +18,6 @@ __all__ = [
     "InverseKinematicsError",
     "WorkspaceError",
     "reachable",
+    "configure",
+    "JOINT_LIMITS",
 ]

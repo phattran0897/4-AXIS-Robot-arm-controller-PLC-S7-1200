@@ -3,8 +3,10 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+
+# Application logs (rotating files live in ./logs)
+logs/
 robot_app.log
-assets/
 
 # IDE
 .vscode/
@@ -13,9 +15,12 @@ assets/
 # Virtual environments
 venv/
 .env/
+.venv/
 
-# pytest
+# Tooling caches
 .pytest_cache/
+.ruff_cache/
+.coverage
 
 # OS
 Thumbs.db

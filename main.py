@@ -1,5 +1,5 @@
 """
-aamain.py – Application entry point for the 4-Axis Industrial Robot Control System.
+main.py – Application entry point for the 4-Axis Industrial Robot Control System.
 
 Responsibilities
 ----------------
@@ -12,54 +12,68 @@ Responsibilities
 from __future__ import annotations
 
 import logging
+import os
+import re
 import threading
 import time
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
 import customtkinter as ctk
+import tkinter
 
 from src.ai.yolo_detector import YOLODetector
 from src.config_loader import RobotConfig, load_config
-from src.kinematics import inverse_kinematics, InverseKinematicsError
-from src.plc.plc_controller import PLCController
-from src.robot.sorting_controller import SortingController, SortResult
+from src.kinematics import configure as configure_kinematics
+from src.plc.plc_controller import ADDR, PLCController
+from src.robot.sorting_controller import SortResult, SortingController
+from src.ui.header import VAAFooter, VAAHeader, apply_app_icon
 from src.ui.page_auto import PageAuto
 from src.ui.page_manual import PageManual
-from src.ui.header import VAAHeader, VAAFooter
 from src.ui.theme import ACCENT, CARD_BG, PANEL_BORDER
-
 from PIL import Image
 
 # ---------------------------------------------------------------------------
-# Logging (console + rotating file)
+# Logging (console + rotating file under ./logs)
 # ---------------------------------------------------------------------------
-_robot_log = logging.getLogger("RobotApp")
-_robot_log.setLevel(logging.INFO)
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s – %(message)s"
 
-_console = logging.StreamHandler()
-_console.setFormatter(
-    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s – %(message)s")
-)
-_robot_log.addHandler(_console)
 
-_log_file = RotatingFileHandler(
-    "robot_app.log",
-    maxBytes=5_000_000,  # 5 MB per file
-    backupCount=3,
-    encoding="utf-8",
-)
-_log_file.setFormatter(
-    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s – %(message)s")
-)
-_robot_log.addHandler(_log_file)
+def _setup_logging() -> logging.Logger:
+    """Attach console + rotating-file handlers exactly once."""
+    robot_log = logging.getLogger("RobotApp")
+    if robot_log.handlers:  # Already configured (e.g. test_gui_no_plc import)
+        return robot_log
+    robot_log.setLevel(logging.INFO)
 
-log = _robot_log
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter(_LOG_FORMAT))
+    robot_log.addHandler(console)
+
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_file = RotatingFileHandler(
+            os.path.join(LOG_DIR, "robot_app.log"),
+            maxBytes=20_000_000,  # 20 MB per file
+            backupCount=5,
+            encoding="utf-8",
+        )
+        log_file.setFormatter(logging.Formatter(_LOG_FORMAT))
+        robot_log.addHandler(log_file)
+    except OSError as exc:
+        robot_log.warning("File logging disabled (cannot write %s): %s", LOG_DIR, exc)
+
+    return robot_log
+
+
+log = _setup_logging()
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 _THREAD_JOIN_TIMEOUT: float = 5.0
+_SORT_JOIN_TIMEOUT: float = 10.0
 _CAMERA_SWITCH_DEBOUNCE: float = 0.5  # seconds
 
 
@@ -74,11 +88,28 @@ class RobotApp(ctk.CTk):
         super().__init__()
         self.cfg: RobotConfig = cfg
 
+        # ── Kinematics: make config.yaml the single source of truth ────────
+        kin = cfg.kinematics
+        configure_kinematics(
+            a1=kin.a1,
+            d1=kin.d1,
+            a2=kin.a2,
+            a3=kin.a3,
+            a4=kin.a4,
+            limits={
+                "j1": (kin.j1_min, kin.j1_max),
+                "j2": (kin.j2_min, kin.j2_max),
+                "j3": (kin.j3_min, kin.j3_max),
+                "j4": (kin.j4_min, kin.j4_max),
+            },
+        )
+
         # ── Window setup ────────────────────────────────────────────────────
         ctk.set_appearance_mode(cfg.app.appearance_mode)
         ctk.set_default_color_theme(cfg.app.color_theme)
         self.title(cfg.app.title)
         self.geometry(cfg.app.geometry)
+        apply_app_icon(self)  # Brand logo → window / taskbar icon
 
         # ── Hardware controllers ─────────────────────────────────────────────
         self.plc: PLCController = PLCController(cfg.plc)
@@ -92,13 +123,17 @@ class RobotApp(ctk.CTk):
             inference_height=cfg.camera.inference_height,
             camera_read_timeout=cfg.camera.read_timeout,
         )
-        self._sorter: SortingController = SortingController(
+        self.sorter: SortingController = SortingController(
             plc=self.plc,
             positions=cfg.sort_positions,
             kinematics=cfg.kinematics,
             plc_commands=cfg.plc.commands,
         )
         self._sort_thread: threading.Thread | None = None
+        self._sort_start_lock = threading.Lock()
+
+        # Backwards-compatible alias (older code accessed controller._sorter)
+        self._sorter = self.sorter
 
         # ── Thread synchronisation ───────────────────────────────────────────
         self._stop_event: threading.Event = threading.Event()
@@ -106,14 +141,14 @@ class RobotApp(ctk.CTk):
         # ── Camera switch debounce ───────────────────────────────────────────
         self._camera_switch_timer: threading.Timer | None = None
 
-        # ── Object Lock tracking (AI vision loop) ────────────────────────────
-        self._lock_start_time: float | None = None  # monotonic time lock started
-        self._lock_duration: float = 2.5  # seconds to hold lock
-        self._lock_tolerance: float = 15.0  # max position drift (mm)
-        self._lock_target_x: float = 0.0  # locked X position (mm)
-        self._lock_target_y: float = 0.0  # locked Y position (mm)
-        self._lock_class_id: int = 0  # locked class ID
-        self._is_locked: bool = False  # lock confirmed flag
+        # ── Manual Capture Trigger (AI vision loop) ──────────────────────────
+        self._manual_classify_trigger: threading.Event = threading.Event()
+
+        # ── Post-sort cooldown (prevents rapid re-detection) ─────────────────
+        self._sort_cooldown_duration: float = (
+            3.0  # seconds to ignore detections after sort
+        )
+        self._sort_cooldown_end: float = 0.0  # monotonic time when cooldown expires
 
         # ── GUI container + page routing ─────────────────────────────────────
         self._container: ctk.CTkFrame = ctk.CTkFrame(self)
@@ -153,7 +188,7 @@ class RobotApp(ctk.CTk):
 
         ctk.CTkLabel(
             console_header,
-            text="💻  PLC TRANSMISSION TELEMETRY",
+            text="PLC TRANSMISSION TELEMETRY",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=ACCENT,
         ).pack(side="left")
@@ -205,8 +240,27 @@ class RobotApp(ctk.CTk):
         log.info("RobotApp initialised – all threads started.")
 
     # ------------------------------------------------------------------
+    # Thread-safe Tk dispatch
+    # ------------------------------------------------------------------
+
+    def _safe_after(self, milliseconds: int, func, *args) -> None:
+        """
+        Schedule *func* on the Tk main loop, ignoring the benign races that
+        occur when a background thread fires during window teardown.
+        """
+        try:
+            self.after(milliseconds, func, *args)
+        except (tkinter.TclError, RuntimeError) as exc:
+            log.debug("GUI dispatch skipped during shutdown: %s", exc)
+
+    # ------------------------------------------------------------------
     # Page routing
     # ------------------------------------------------------------------
+
+    @property
+    def current_page(self) -> str:
+        """Name of the currently visible page (e.g. ``"PageAuto"``)."""
+        return self._current_page
 
     def show_frame(self, page_name: str) -> None:
         """Raise the named page to the top of the stacking order."""
@@ -218,9 +272,9 @@ class RobotApp(ctk.CTk):
         self.header.update_active_tab(page_name)
         log.debug("Switched to page: %s", page_name)
         if page_name == "PageAuto":
-            self.plc.send_pulse(0, 2)  # AUTO_MODE (offset 0.2)
+            self.plc.send_pulse(*ADDR.AUTO_MODE)  # AUTO_MODE (offset 0.2)
         elif page_name == "PageManual":
-            self.plc.send_pulse(16, 0)  # MANUAL_MODE (offset 16.0)
+            self.plc.send_pulse(*ADDR.MANUAL_MODE)  # MANUAL_MODE (offset 16.0)
 
     # ------------------------------------------------------------------
     # Camera switching (debounced)
@@ -230,8 +284,8 @@ class RobotApp(ctk.CTk):
         """
         Parse the combo-box selection string and debounce-switch the camera.
 
-        Expected format: ``"Camera <index> (<label>)"``
-        e.g. ``"Camera 1 (External)"``
+        Expected format: ``"Camera <index>"``
+        e.g. ``"Camera 1"``
         """
         if self._camera_switch_timer is not None:
             self._camera_switch_timer.cancel()
@@ -245,29 +299,35 @@ class RobotApp(ctk.CTk):
 
     def _do_change_camera(self, choice_str: str) -> None:
         """Actually perform the camera switch (called after debounce)."""
-        try:
-            import re
-
-            match = re.search(r"\d+", choice_str)
-            if not match:
-                raise ValueError("No digits found in string")
-            idx: int = int(match.group())
-        except (ValueError, AttributeError) as exc:
-            log.error("Cannot parse camera index from '%s': %s", choice_str, exc)
+        match = re.search(r"\d+", choice_str)
+        if not match:
+            log.error("Cannot parse camera index from '%s'.", choice_str)
             return
+        idx: int = int(match.group())
 
         success: bool = self.detector.switch_camera(idx)
 
         if success:
             log.info("Camera switched to index %d.", idx)
         else:
-            from tkinter import messagebox
-
-            messagebox.showerror(
-                "Hardware Error",
+            # Tkinter dialogs must run on the main thread – marshal safely.
+            self._safe_after(
+                0,
+                self._show_hardware_error_dialog,
                 f"Cannot open camera at index {idx}.\n"
                 "Check the device connection and try again.",
             )
+
+    def _show_hardware_error_dialog(self, message: str) -> None:
+        """Show a hardware error box (main thread only)."""
+        from tkinter import messagebox
+
+        messagebox.showerror("Hardware Error", message, parent=self)
+
+    def trigger_manual_classification(self) -> None:
+        """Trigger a manual capture and classification cycle."""
+        self._manual_classify_trigger.set()
+        log.info("Manual classification triggered via GUI.")
 
     # ------------------------------------------------------------------
     # Background thread: AI / camera loop
@@ -275,19 +335,23 @@ class RobotApp(ctk.CTk):
 
     def _yolo_processing_loop(self) -> None:
         """
-        Continuously capture frames, run YOLO inference, push detections
-        to the PLC, and refresh the GUI video label.
+        Continuously capture frames and display them on the GUI with an ROI
+        overlay.  When ``_manual_classify_trigger`` is set, extracts the ROI,
+        runs YOLO inference, and dispatches the sorting cycle.
 
-        Object Locking: when a defect is detected, the system enters a
-        locking phase (~2.5 seconds). During this phase the object's
-        position must remain stable (within tolerance). Only after the
-        lock is confirmed is the sorting command sent to the PLC.
-
-        Runs until ``_stop_event`` is set.
+        The GUI preview is throttled to ``camera.preview_fps`` to keep CPU
+        usage low; classification requests are always processed immediately.
         """
-        import math as _math
+        import cv2
 
         cam_cfg = self.cfg.camera
+        roi_x = self.cfg.yolo.roi_x
+        roi_y = self.cfg.yolo.roi_y
+        roi_w = self.cfg.yolo.roi_width
+        roi_h = self.cfg.yolo.roi_height
+
+        preview_interval: float = 1.0 / max(cam_cfg.preview_fps, 1)
+        last_preview_time: float = 0.0
 
         try:
             if not self.detector.start_camera(cam_cfg.default_index):
@@ -296,128 +360,51 @@ class RobotApp(ctk.CTk):
                 )
 
             frame_interval: float = 1.0 / max(cam_cfg.fps, 1)
-            last_detection: tuple[bool, float, float, int] = (False, 0.0, 0.0, 0)
 
             while not self._stop_event.is_set():
-                # ── Step 1: read frame from thread-safe queue ────────────────────
                 frame = self.detector.read_frame()
 
-                # ── Step 2: inference unlocked ───────────────────────────────────
                 if frame is not None:
                     try:
-                        result = self.detector.annotate_frame(frame)
-                        last_detection = (
-                            result.has_defect,
-                            result.robot_x,
-                            result.robot_y,
-                            result.class_id,
-                        )
+                        force_preview = False
 
-                        # ── Step 3: Object Locking logic ────────────────────────────
-                        has_defect, rx, ry, class_id = last_detection
-                        annotated = result.annotated_frame
+                        # Manual Trigger Check (uses the raw frame)
+                        if self._manual_classify_trigger.is_set():
+                            self._manual_classify_trigger.clear()
+                            self._handle_manual_classification(frame)
+                            force_preview = True
 
+                        # Annotate + convert ONLY when the preview will
+                        # actually be redrawn – skipped ticks save the copy,
+                        # the overlay drawing, and the colour conversion.
+                        now = time.monotonic()
                         if (
-                            has_defect
-                            and self.plc.is_connected()
-                            and self._sorter.is_idle()
+                            force_preview
+                            or (now - last_preview_time) >= preview_interval
                         ):
-                            now = time.monotonic()
+                            last_preview_time = now
 
-                            if self._lock_start_time is None:
-                                # ── First detection: start locking ──────────────────
-                                self._lock_start_time = now
-                                self._lock_target_x = rx
-                                self._lock_target_y = ry
-                                self._lock_class_id = class_id
-                                self._is_locked = False
-                                log.info(
-                                    "Object detected – starting lock (X=%.2f Y=%.2f class=%d)",
-                                    rx,
-                                    ry,
-                                    class_id,
-                                )
-                            else:
-                                # ── Ongoing lock: check position stability ──────────
-                                drift = _math.hypot(
-                                    rx - self._lock_target_x,
-                                    ry - self._lock_target_y,
-                                )
+                            # Draw ROI overlay in place (frame is not reused)
+                            cv2.rectangle(
+                                frame,
+                                (roi_x, roi_y),
+                                (roi_x + roi_w, roi_y + roi_h),
+                                (0, 255, 0),
+                                2,
+                            )
+                            cv2.putText(
+                                frame,
+                                "ROI - Dat Hop Vao Day",
+                                (roi_x, roi_y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6,
+                                (0, 255, 0),
+                                2,
+                            )
 
-                                if drift > self._lock_tolerance:
-                                    # Object moved too much – restart lock
-                                    log.info(
-                                        "Lock reset – object drifted %.1fmm (tolerance=%.1fmm)",
-                                        drift,
-                                        self._lock_tolerance,
-                                    )
-                                    self._lock_start_time = now
-                                    self._lock_target_x = rx
-                                    self._lock_target_y = ry
-                                    self._lock_class_id = class_id
-                                    self._is_locked = False
-                                else:
-                                    # Position stable – check if lock duration met
-                                    elapsed = now - self._lock_start_time
-
-                                    if (
-                                        elapsed >= self._lock_duration
-                                        and not self._is_locked
-                                    ):
-                                        # ── Lock confirmed → dispatch to PLC ────────
-                                        self._is_locked = True
-                                        # Model class mapping: 0 = Defect (BAD), 1 = Good (GOOD)
-                                        sort_result = (
-                                            SortResult.BAD
-                                            if self._lock_class_id == 0
-                                            else SortResult.GOOD
-                                        )
-                                        log.info(
-                                            "Object LOCKED (%.1fs) → Spawning sort "
-                                            "(Result=%s) X=%.2f Y=%.2f",
-                                            elapsed,
-                                            sort_result.name,
-                                            self._lock_target_x,
-                                            self._lock_target_y,
-                                        )
-                                        self._sort_thread = threading.Thread(
-                                            target=self._run_sort_and_reset_lock,
-                                            args=(
-                                                self._lock_target_x,
-                                                self._lock_target_y,
-                                                sort_result,
-                                            ),
-                                            daemon=True,
-                                        )
-                                        self._sort_thread.start()
-
-                            # ── Draw lock overlay on the frame ──────────────────────
-                            if (
-                                annotated is not None
-                                and self._lock_start_time is not None
-                            ):
-                                elapsed = now - self._lock_start_time
-                                progress = min(elapsed / self._lock_duration, 1.0)
-                                self.detector.draw_lock_overlay(
-                                    annotated, progress, self._is_locked
-                                )
-
-                        else:
-                            # No defect or sorter busy – reset lock state
-                            if (
-                                self._lock_start_time is not None
-                                and not self._is_locked
-                            ):
-                                log.info("Lock cancelled – object lost or sorter busy.")
-                            if not self._is_locked:
-                                self._lock_start_time = None
-
-                        # ── Step 4: Update GUI video label ──────────────────────────
-                        pil = result.to_pil(
-                            cam_cfg.display_width, cam_cfg.display_height
-                        )
-                        if pil is not None:
-                            self._update_video_label(pil)
+                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            pil_image = Image.fromarray(rgb)
+                            self._update_video_label(pil_image)
 
                     except Exception as frame_exc:
                         log.error(
@@ -434,38 +421,132 @@ class RobotApp(ctk.CTk):
 
         log.info("AI vision thread exited cleanly.")
 
+    def _handle_manual_classification(self, frame: Any) -> None:
+        """
+        Run one classification cycle: crop the configured ROI, sharpen it,
+        run YOLO inference, and dispatch the sorting cycle when an object
+        is actually detected.
+        """
+        import cv2
+
+        roi_x = self.cfg.yolo.roi_x
+        roi_y = self.cfg.yolo.roi_y
+        roi_w = self.cfg.yolo.roi_width
+        roi_h = self.cfg.yolo.roi_height
+
+        # Ensure ROI is within bounds
+        fh, fw = frame.shape[:2]
+        if roi_x >= fw or roi_y >= fh or roi_w <= 0 or roi_h <= 0:
+            log.warning(
+                "ROI (x=%d y=%d w=%d h=%d) lies outside %dx%d frame – "
+                "capture skipped.",
+                roi_x,
+                roi_y,
+                roi_w,
+                roi_h,
+                fw,
+                fh,
+            )
+            self.log_tx("Capture skipped: ROI outside camera frame.")
+            return
+        cx = max(0, min(roi_x, fw))
+        cy = max(0, min(roi_y, fh))
+        cw = max(1, min(roi_w, fw - cx))
+        ch = max(1, min(roi_h, fh - cy))
+
+        roi_crop = frame[cy : cy + ch, cx : cx + cw]
+
+        # Apply Unsharp Masking to sharpen ROI before inference
+        blurred = cv2.GaussianBlur(roi_crop, (0, 0), 2.0)
+        roi_crop = cv2.addWeighted(roi_crop, 1.5, blurred, -0.5, 0)
+
+        # Run inference on crop
+        result = self.detector.annotate_frame(roi_crop)
+
+        if not result.has_defect:
+            log.info("Manual Capture: no object detected above threshold – skipped.")
+            self.log_tx("Capture: no object detected – sort skipped.")
+            return
+
+        sort_result = SortResult.BAD if result.class_id == 0 else SortResult.GOOD
+
+        log.info(
+            "Manual Capture: Object Classified as %s (class=%d, X=%.1fmm, Y=%.1fmm)",
+            sort_result.name,
+            result.class_id,
+            result.robot_x,
+            result.robot_y,
+        )
+        self.log_tx(f"Classified: {sort_result.name} ({result.class_name or 'obj'})")
+
+        # Visual feedback handled by caller overlay; dispatch the cycle with
+        # the detected coordinates so picking is vision-guided.
+        self._start_sort_cycle(result.robot_x, result.robot_y, sort_result)
+
+    def _start_sort_cycle(self, rx: float, ry: float, result: SortResult) -> bool:
+        """
+        Launch the sorting cycle on a worker thread unless one is already
+        running or the post-sort cooldown is active.
+
+        Returns ``True`` if a cycle was started.
+        """
+        # Post-sort cooldown prevents immediate re-triggering on the same part
+        remaining = self._sort_cooldown_end - time.monotonic()
+        if remaining > 0:
+            log.info("Sort suppressed – cooldown active for another %.1fs.", remaining)
+            self.log_tx(f"Sort suppressed (cooldown {remaining:.1f}s).")
+            return False
+
+        with self._sort_start_lock:
+            if self._sort_thread is not None and self._sort_thread.is_alive():
+                log.warning("Sort thread still running – skipping new sort.")
+                return False
+            self._sort_thread = threading.Thread(
+                target=self._run_sort_and_reset_lock,
+                args=(rx, ry, result),
+                name="SortCycleThread",
+                daemon=True,
+            )
+            self._sort_thread.start()
+            return True
+
     def _run_sort_and_reset_lock(
         self, rx: float, ry: float, sort_result: SortResult
     ) -> None:
-        """Execute sorting cycle and reset lock state when finished."""
+        """Execute sorting cycle, guarding against PLC faults."""
+        # E-stop gate: never start motion while the PLC reports an error
+        status = self.plc.read_status()
+        if status and status.get("error_flag", False):
+            log.error("Sort aborted – PLC error flag is active.")
+            self.log_tx("Sort ABORTED: PLC error flag active.")
+            return
+        if status and not status.get("auto_mode", True):
+            # Manual mode – pulsing START_AUTO here could combine with an
+            # operator's jog inputs into unintended motion.
+            log.warning("Sort aborted – AUTO mode bit is off.")
+            self.log_tx("Sort ABORTED: AUTO mode is off (manual mode).")
+            return
+
         try:
-            self._sorter.execute_sort(rx, ry, sort_result)
+            self.sorter.execute_sort(rx, ry, sort_result)
         except Exception as exc:
             log.error("Sorting cycle failed: %s", exc)
         finally:
-            # Reset lock state so next detection can start fresh
-            self._lock_start_time = None
-            self._is_locked = False
+            # Activate post-sort cooldown to prevent immediate re-detection
+            self._sort_cooldown_end = time.monotonic() + self._sort_cooldown_duration
+            log.info(
+                "Post-sort cooldown activated (%.1fs).",
+                self._sort_cooldown_duration,
+            )
 
     def clear_all_errors(self) -> None:
         """Clear errors on PLC and reset sorting controller state."""
         self.plc.send_command(self.cfg.plc.commands.idle)
-        self._sorter.clear_error()
-
-    def _dispatch_target_to_plc(self, rx: float, ry: float) -> None:
-        """Compute IK and send joint targets + move command to the PLC."""
-        try:
-            j1, j2, j3, j4 = inverse_kinematics(rx, ry)
-            self.plc.send_joint_targets(j1, j2, j3, j4)
-            self.plc.send_command(self.cfg.plc.commands.move)
-        except InverseKinematicsError:
-            log.error("IK failed: unreachable target X=%.2f Y=%.2f", rx, ry)
-        except Exception as exc:
-            log.error("Unexpected error during defect response: %s", exc)
+        self.sorter.clear_error()
 
     def _update_video_label(self, img: Image.Image) -> None:
         """Push a new frame to whichever page is currently visible (thread-safe)."""
-        self.after(0, self._do_update_video, img)
+        self._safe_after(0, self._do_update_video, img)
 
     def _do_update_video(self, img: Image.Image) -> None:
         """Internal method to update video label on main thread."""
@@ -473,11 +554,35 @@ class RobotApp(ctk.CTk):
         if page is None:
             return
         try:
-            cam_cfg = self.cfg.camera
+            # Use dynamic size from video container (scales on fullscreen)
+            disp_w = getattr(
+                page, "_video_display_width", self.cfg.camera.display_width
+            )
+            disp_h = getattr(
+                page, "_video_display_height", self.cfg.camera.display_height
+            )
+
+            # Preserve aspect ratio while fitting into the container
+            orig_w, orig_h = img.size
+            if orig_w > 0 and orig_h > 0:
+                aspect = orig_w / orig_h
+                container_aspect = disp_w / disp_h
+
+                if aspect > container_aspect:
+                    # Image is wider than container, constrain by width
+                    target_w = disp_w
+                    target_h = int(disp_w / aspect)
+                else:
+                    # Image is taller than container, constrain by height
+                    target_h = disp_h
+                    target_w = int(disp_h * aspect)
+            else:
+                target_w, target_h = disp_w, disp_h
+
             ctk_img = ctk.CTkImage(
                 light_image=img,
                 dark_image=img,
-                size=(cam_cfg.display_width, cam_cfg.display_height),
+                size=(target_w, target_h),
             )
             page.update_video(ctk_img)
         except Exception as exc:
@@ -497,7 +602,7 @@ class RobotApp(ctk.CTk):
                 self.tx_textbox.delete("1.0", f"{len(lines) - 100}.0")
             self.tx_textbox.configure(state="disabled")
 
-        self.after(0, _append)
+        self._safe_after(0, _append)
 
     # ------------------------------------------------------------------
     # Background thread: PLC cyclic poll with exponential backoff
@@ -508,8 +613,8 @@ class RobotApp(ctk.CTk):
         Poll the PLC at the configured interval and push fresh data to
         all page ``update_gui_data()`` callbacks via ``self.after()``.
 
-        Falls back to reconnection with exponential backoff when the PLC is offline.
-        Runs until ``_stop_event`` is set.
+        Falls back to reconnection with exponential backoff when the PLC
+        is offline.  Runs until ``_stop_event`` is set.
         """
         interval: float = self.cfg.app.plc_poll_interval
         retry_delay: float = interval
@@ -520,14 +625,15 @@ class RobotApp(ctk.CTk):
             if self.plc.is_connected():
                 data: dict[str, Any] = self.plc.read_status()
                 if data:
-                    self.after(0, self._dispatch_plc_data, data)
+                    self._safe_after(0, self._dispatch_plc_data, data)
                 retry_delay = interval
                 consecutive_failures = 0
             else:
                 consecutive_failures += 1
                 if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
                     log.warning(
-                        "PLC offline – attempting reconnection (attempt %d, backoff %.1fs)…",
+                        "PLC offline – attempting reconnection "
+                        "(attempt %d, backoff %.1fs)…",
                         consecutive_failures,
                         retry_delay,
                     )
@@ -568,9 +674,12 @@ class RobotApp(ctk.CTk):
         Graceful shutdown sequence:
 
         1. Signal all background threads to stop via ``_stop_event``.
-        2. Release hardware resources (camera, PLC socket).
-        3. Join threads with a timeout to prevent hangs.
-        4. Destroy the Tk window.
+        2. Let an in-flight sort cycle finish (bounded wait) BEFORE cutting
+           PLC comms — disconnecting first would abort the robot mid-motion
+           with an undefined gripper state.
+        3. Release hardware resources (camera, PLC socket).
+        4. Join remaining threads with a timeout to prevent hangs.
+        5. Destroy the Tk window.
         """
         log.info("Shutdown initiated…")
         self._stop_event.set()
@@ -578,13 +687,14 @@ class RobotApp(ctk.CTk):
         if self._camera_switch_timer is not None:
             self._camera_switch_timer.cancel()
 
-        self.detector.stop()
-        self.plc.disconnect()
-
-        # Wait for active sorting thread to complete gracefully
+        # Wait for active sorting thread to complete gracefully while the
+        # PLC connection is still alive.
         if self._sort_thread is not None and self._sort_thread.is_alive():
             log.info("Waiting for active sorting thread to complete...")
-            self._sort_thread.join(timeout=5.0)
+            self._sort_thread.join(timeout=_SORT_JOIN_TIMEOUT)
+
+        self.detector.stop()
+        self.plc.disconnect()
 
         for thread in (self._plc_thread, self._ai_thread):
             if thread.is_alive():
