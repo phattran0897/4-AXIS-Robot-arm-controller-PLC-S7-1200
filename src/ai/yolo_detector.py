@@ -117,9 +117,21 @@ class YOLODetector:
         inference_width: int = _DEFAULT_INFERENCE_WIDTH,
         inference_height: int = _DEFAULT_INFERENCE_HEIGHT,
         camera_read_timeout: float = 2.0,
+        calibration_path: str = "",
     ) -> None:
         resolved = self._resolve_model_path(model_path)
         self.model: YOLO = YOLO(resolved, task="detect")
+
+        # Fail fast if the loaded model's task doesn't match 'detect'.
+        # Note: in test/mock contexts, model.task may be a MagicMock
+        # (non-string) — skip validation in that case.
+        model_task = getattr(self.model, "task", "detect")
+        if isinstance(model_task, str) and model_task != "detect":
+            raise ValueError(
+                f"YOLO model at '{resolved}' has task='{model_task}' but "
+                f"'detect' is required. Check model_path or retrain for detection."
+            )
+
         self.thresh: float = float(thresh)
         self.px2mm: float = float(px2mm)
         self.home_x: float = float(home_x)
@@ -129,6 +141,15 @@ class YOLODetector:
         self.camera_read_timeout: float = camera_read_timeout
         self._cap: cv2.VideoCapture | None = None
         self._current_idx: int = 0
+
+        # Camera intrinsics calibration (optional)
+        self._camera_matrix: np.ndarray | None = None
+        self._dist_coeffs: np.ndarray | None = None
+        self._undistort_map1: np.ndarray | None = None
+        self._undistort_map2: np.ndarray | None = None
+        self._calibration_loaded: bool = False
+        if calibration_path:
+            self._load_calibration(calibration_path)
 
         # Camera read timeout infrastructure
         self._read_queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=1)
@@ -142,14 +163,48 @@ class YOLODetector:
 
         log.info(
             "YOLODetector initialised – model=%s thresh=%.2f px2mm=%.3f "
-            "inference=%dx%d timeout=%.1fs",
+            "inference=%dx%d timeout=%.1fs calibration=%s",
             resolved,
             thresh,
             px2mm,
             inference_width,
             inference_height,
             camera_read_timeout,
+            "loaded" if self._calibration_loaded else "none (px2mm fallback)",
         )
+
+    def _load_calibration(self, path: str) -> None:
+        """
+        Load camera intrinsics from an OpenCV-format YAML/JSON calibration file.
+
+        Expected keys: ``camera_matrix`` and ``distortion_coefficients``
+        (as produced by ``cv2.calibrateCamera`` and ``cv2.FileStorage``).
+        Falls back silently to px2mm when the file is missing or malformed.
+        """
+        resolved = os.path.abspath(path)
+        if not os.path.isfile(resolved):
+            log.warning(
+                "Calibration file not found: %s – falling back to px2mm.", resolved
+            )
+            return
+        try:
+            fs = cv2.FileStorage(resolved, cv2.FILE_STORAGE_READ)
+            cam_node = fs.getNode("camera_matrix")
+            dist_node = fs.getNode("distortion_coefficients")
+            if cam_node.empty() or dist_node.empty():
+                log.warning(
+                    "Calibration file missing camera_matrix or "
+                    "distortion_coefficients – falling back to px2mm."
+                )
+                fs.release()
+                return
+            self._camera_matrix = cam_node.mat()
+            self._dist_coeffs = dist_node.mat()
+            self._calibration_loaded = True
+            fs.release()
+            log.info("Camera calibration loaded from %s", resolved)
+        except Exception as exc:
+            log.warning("Failed to load calibration from %s: %s", resolved, exc)
 
     def _probe_cameras_background(self) -> None:
         """Probe available cameras in a background thread to prevent UI freezing."""
@@ -471,6 +526,30 @@ class YOLODetector:
             if not ret or frame is None:
                 time.sleep(0.01)  # Throttle CPU on transient read failures
                 continue
+
+            # Apply undistortion when camera calibration is loaded
+            if self._calibration_loaded and self._camera_matrix is not None:
+                if self._undistort_map1 is None:
+                    h, w = frame.shape[:2]
+                    new_mtx, _roi = cv2.getOptimalNewCameraMatrix(
+                        self._camera_matrix, self._dist_coeffs, (w, h), 1, (w, h)
+                    )
+                    self._undistort_map1, self._undistort_map2 = (
+                        cv2.initUndistortRectifyMap(
+                            self._camera_matrix,
+                            self._dist_coeffs,
+                            None,
+                            new_mtx,
+                            (w, h),
+                            cv2.CV_16SC2,
+                        )
+                    )
+                frame = cv2.remap(
+                    frame,
+                    self._undistort_map1,
+                    self._undistort_map2,
+                    cv2.INTER_LINEAR,
+                )
 
             # Keep-Newest frame queue: evict stale frame if queue is full
             try:

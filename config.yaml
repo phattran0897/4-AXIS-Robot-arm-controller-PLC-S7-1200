@@ -55,6 +55,11 @@ yolo:
   roi_y: 100
   roi_width: 200
   roi_height: 190
+  
+  # Optional: path to OpenCV camera calibration YAML (from cv2.calibrateCamera).
+  # When set, frames are undistorted before inference for improved accuracy.
+  # Leave empty to use the flat px2mm scalar fallback.
+  calibration_path: ""
 
 # ── Camera ───────────────────────────────────────────────────────────────────
 camera:
@@ -77,19 +82,22 @@ camera:
   # Camera read timeout in seconds (watchdog prevents indefinite blocking)
   read_timeout: 2.0
 
+  # Apply unsharp mask sharpening to ROI crops before inference (set false to reduce latency)
+  enable_unsharp_mask: true
+
 # ── Kinematics (4-DOF Articulated Arm – DH Parameters) ───────────────────────
 kinematics:
   # DH link parameters (mm)
-  a1: 40.0     # Base horizontal offset
-  d1: 300.0    # Base height
+  a1: 0.0      # Base horizontal offset
+  d1: 189.6    # Base height
   a2: 190.0    # Link 2 length
-  a3: 110.0    # Link 3 length
-  a4: 65.0     # Link 4 / end-effector length
+  a3: 190.0    # Link 3 length
+  a4: 74.0     # Link 4 / end-effector length
 
   # Joint angle limits (degrees)
   j1_min: -180.0
   j1_max: 180.0
-  j2_min: 0.0
+  j2_min: -180.0
   j2_max: 250.0
   j3_min: 0.0
   j3_max: 200.0

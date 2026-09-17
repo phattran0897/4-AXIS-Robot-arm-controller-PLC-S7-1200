@@ -75,6 +75,8 @@ class YOLOConfig:
     roi_y: int = 80
     roi_width: int = 240
     roi_height: int = 240
+    # Optional camera calibration file path (OpenCV YAML/JSON)
+    calibration_path: str = ""
 
 
 @dataclass(slots=True)
@@ -90,20 +92,22 @@ class CameraConfig:
     inference_height: int = 480
     # Camera read timeout in seconds
     read_timeout: float = 2.0
+    # Enable unsharp mask image sharpening before inference
+    enable_unsharp_mask: bool = True
 
 
 @dataclass(slots=True)
 class KinematicsConfig:
     # DH link parameters (mm)
-    a1: float = 40.0  # Base horizontal offset
-    d1: float = 300.0  # Base height
+    a1: float = 0.0  # Base horizontal offset
+    d1: float = 189.6  # Base height
     a2: float = 190.0  # Link 2 length
-    a3: float = 110.0  # Link 3 length
-    a4: float = 65.0  # Link 4 / end-effector length
+    a3: float = 190.0  # Link 3 length
+    a4: float = 74.0  # Link 4 / end-effector length
     # Joint angle limits (degrees)
     j1_min: float = -180.0
     j1_max: float = 180.0
-    j2_min: float = 0.0
+    j2_min: float = -180.0
     j2_max: float = 250.0
     j3_min: float = 0.0
     j3_max: float = 200.0
@@ -133,10 +137,18 @@ class PlacePosition:
     z_up: float = 150.0
 
 
+def _default_place_good() -> PlacePosition:
+    return PlacePosition(x=150.0, y=100.0, z_down=80.0, z_up=150.0)
+
+
+def _default_place_bad() -> PlacePosition:
+    return PlacePosition(x=-150.0, y=100.0, z_down=80.0, z_up=150.0)
+
+
 @dataclass(slots=True)
 class SortPositionsConfig:
-    place_good: PlacePosition = field(default_factory=PlacePosition)
-    place_bad: PlacePosition = field(default_factory=PlacePosition)
+    place_good: PlacePosition = field(default_factory=_default_place_good)
+    place_bad: PlacePosition = field(default_factory=_default_place_bad)
     pick_z_down: float = 80.0
     pick_z_up: float = 150.0
     gripper_delay: float = 0.5
@@ -272,6 +284,7 @@ def load_config(path: str | None = None) -> RobotConfig:
         roi_y=int(yolo_raw.get("roi_y", 80)),
         roi_width=int(yolo_raw.get("roi_width", 240)),
         roi_height=int(yolo_raw.get("roi_height", 240)),
+        calibration_path=str(yolo_raw.get("calibration_path", "")),
     )
 
     # ── Camera ──────────────────────────────────────────────────────────────
@@ -285,6 +298,7 @@ def load_config(path: str | None = None) -> RobotConfig:
         inference_width=int(cam_raw.get("inference_width", 640)),
         inference_height=int(cam_raw.get("inference_height", 480)),
         read_timeout=float(cam_raw.get("read_timeout", 2.0)),
+        enable_unsharp_mask=bool(cam_raw.get("enable_unsharp_mask", True)),
     )
 
     # ── Kinematics ──────────────────────────────────────────────────────────
@@ -354,9 +368,9 @@ def load_config(path: str | None = None) -> RobotConfig:
             f"app.plc_poll_interval must be positive (got {app_cfg.plc_poll_interval})."
         )
     for link_name in ("a1", "a2", "a3", "a4"):
-        if getattr(kin_cfg, link_name) <= 0.0:
+        if getattr(kin_cfg, link_name) < 0.0:
             raise ValueError(
-                f"kinematics.{link_name} must be positive "
+                f"kinematics.{link_name} must be non-negative "
                 f"(got {getattr(kin_cfg, link_name)})."
             )
     if kin_cfg.d1 <= 0.0:

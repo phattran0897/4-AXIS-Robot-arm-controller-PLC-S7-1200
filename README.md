@@ -2,7 +2,7 @@
 
 A production-grade Python application for automated defect detection and
 robotic pick-and-sort using **YOLOv11**, a **Siemens S7-1200 PLC**, and a
-**CustomTkinter** GUI.
+**PySide6** GUI.
 
 ```
 Camera → YOLODetector (YOLO inference on ROI crop)
@@ -40,9 +40,10 @@ Camera → YOLODetector (YOLO inference on ROI crop)
 │   ├── config_loader.py         # Typed YAML loader (dataclasses, __slots__)
 │   ├── kinematics/
 │   │   ├── __init__.py
-│   │   └── kinematics.py        # 4-DOF FK / geometric IK, workspace validation
+│   │   └── kinematics.py        # 4-DOF FK / geometric IK, elbow config, workspace validation
 │   ├── ai/
-│   │   └── yolo_detector.py     # Camera + YOLO; read/annotate split, watchdog
+│   │   ├── yolo_detector.py     # Camera + YOLO; read/annotate split, watchdog, calibration
+│   │   └── stability_tracker.py # Vision-target stability state machine
 │   ├── plc/
 │   │   └── plc_controller.py    # snap7 S7-1200 wrapper; ADDR map; atomic writes
 │   ├── robot/
@@ -151,6 +152,7 @@ yolo:
   home_x: 200.0         # Robot home X in mm
   home_y: 0.0           # Robot home Y in mm
   roi_x: 190            # Manual-capture ROI crop (x, y, w, h)
+  calibration_path: ""  # Path to OpenCV calibration YAML (optional)
 
 camera:
   default_index: 0
@@ -171,6 +173,8 @@ kinematics:             # ← drives the IK/FK engine at start-up
   j2_min: 0.0           # Joint limits used for UI validation
   j2_max: 250.0
   default_phi: 0.0      # Default end-effector pitch for IK
+  # Elbow config: IK supports elbow="up" (positive sin θ₃) or
+  # elbow="down" (negative sin θ₃) via the UI toggle.
 
 app:
   plc_poll_interval: 0.10
@@ -316,7 +320,9 @@ model) so they execute in any headless environment without physical devices.
 | `TestPLCDbReadSize` | DB size rounding |
 | `TestSortingController` | IK fallbacks, PLC call sequence, counters |
 | `test_page_manual.py` | JOG toggling, button feedback, TX logging, joint limits |
-
+| `TestKinematicsElbowConfig` | Elbow up/down selection, FK pitch return, round-trip tolerance |
+| `TestStabilityTracker` | Lock after N frames, reset on jump, progress property |
+| `TestPLCBufferContents` | IEEE-754 byte-level verification of joint target writes |
 ---
 
 ## CI Pipeline
@@ -344,6 +350,8 @@ replaced by `unittest.mock` stubs at test time.
 | `threading.Event` for shutdown | Threads wake immediately on stop, eliminating zombie processes |
 | Constructor-injected `RobotConfig` | No global state; fully testable without filesystem access |
 | `configure()` for kinematics | config.yaml DH parameters drive IK/FK – no hardcoded duplicates |
+| Elbow up/down selection | IK returns both configurations via `elbow` parameter |
+| Optional camera intrinsics | Undistortion via calibration file; flat `px2mm` as fallback |
 | `self.after(0, callback)` for GUI updates | Ensures PLC data is dispatched on the Tk main thread (thread-safety) |
 | Single `ADDR` address map | Eliminates magic bit numbers scattered across UI code |
 | Atomic `write_bits` grouping | Concurrent writers can no longer clobber shared bytes |

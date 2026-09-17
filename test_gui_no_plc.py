@@ -303,6 +303,9 @@ class MockPLCController:
 
 def main() -> None:
     """Patch PLCController with MockPLCController, then launch the app."""
+    import sys
+    from PySide6.QtWidgets import QApplication
+    from src.ui.theme import GLOBAL_QSS
 
     # 1. Monkey-patch PLCController BEFORE importing main
     import src.plc.plc_controller as plc_module
@@ -314,15 +317,18 @@ def main() -> None:
 
     main_module.PLCController = MockPLCController  # type: ignore[misc,assignment]
 
-    # 3. Load config normally
+    # 3. Create Qt Application
+    qapp = QApplication.instance() or QApplication(sys.argv)
+    qapp.setStyleSheet(GLOBAL_QSS)
+
+    # 4. Load config normally
     config: RobotConfig = load_config()
 
-    # 4. Create and run the app (it will use MockPLCController)
+    # 5. Create and run the app (it will use MockPLCController)
     from main import RobotApp
 
     app = RobotApp(cfg=config)
-    app.title(config.app.title + "  [🧪 TEST MODE – No PLC]")
-    app.protocol("WM_DELETE_WINDOW", app.on_closing)
+    app.setWindowTitle(config.app.title + "  [🧪 TEST MODE – No PLC]")
 
     log.info("=" * 60)
     log.info("  🧪  TEST MODE ACTIVE – Mock PLC (no real PLC needed)")
@@ -335,8 +341,10 @@ def main() -> None:
     log.info("  ⏳  Post-sort cooldown: %.1fs", app._sort_cooldown_duration)
     log.info("=" * 60)
 
-    app.mainloop()
+    app.show()
+    sys.exit(qapp.exec())
 
 
 if __name__ == "__main__":
     main()
+

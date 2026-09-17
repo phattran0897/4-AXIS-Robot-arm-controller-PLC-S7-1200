@@ -1,5 +1,5 @@
 """
-src/ui/page_auto.py – Automatic (AI-driven) operation page.
+src/ui/page_auto.py – Automatic (AI-driven) operation page (PySide6).
 
 Displays live YOLO camera feed, real-time joint-angle readouts, and
 system-control buttons for the automated pick-and-sort workflow.
@@ -11,13 +11,25 @@ import logging
 import math
 from typing import TYPE_CHECKING, Any
 
-import customtkinter as ctk
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from src.plc.plc_controller import ADDR
 from src.robot.sorting_controller import RobotState, SortResult
 from src.ui.base_page import BasePage
 from src.ui.theme import (
     ACCENT,
+    ACCENT_DIM,
+    CARD_BG,
     DANGER,
     INFO,
     PANEL_BG,
@@ -25,9 +37,12 @@ from src.ui.theme import (
     ROW_BG,
     SUCCESS,
     SUCCESS_HOVER,
+    TEXT_DIM,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
     WARNING,
+    btn_style,
+    card_style,
 )
 
 if TYPE_CHECKING:
@@ -49,7 +64,9 @@ class PageAuto(BasePage):
     └─────────────────────────────────────────────────────────────────┘
     """
 
-    def __init__(self, parent: ctk.CTkFrame, controller: "RobotApp") -> None:
+    def __init__(
+        self, parent: QWidget | None = None, controller: "RobotApp" | None = None
+    ) -> None:
         super().__init__(parent, controller, page_color=ACCENT)
         # UI Interpolation states for smooth running numbers ("chạy số")
         self._disp = [0.0, 0.0, 0.0, 0.0]
@@ -58,232 +75,274 @@ class PageAuto(BasePage):
 
         self._build_ui()
 
-        # Start the smooth interpolation loop
-        self._interpolate_gui_numbers()
+        # Start the smooth interpolation loop via QTimer
+        self._interp_timer = QTimer(self)
+        self._interp_timer.timeout.connect(self._interpolate_gui_numbers)
+        self._interp_timer.start(33)  # ~30 FPS
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        # Status bar first (packed side="bottom", fill="x")
-        self.lbl_err_status = self.build_status_bar()
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(16, 12, 16, 12)
+        main_layout.setSpacing(12)
 
-        # Main content area
-        main_layout = ctk.CTkFrame(self, fg_color="transparent")
-        main_layout.pack(fill="both", expand=True, padx=20, pady=15)
-        main_layout.grid_columnconfigure(0, weight=1, minsize=290)
-        main_layout.grid_columnconfigure(1, weight=1, minsize=290)
-        main_layout.grid_columnconfigure(2, weight=2, minsize=460)
-        main_layout.grid_rowconfigure(0, weight=1)
+        # 3-column container
+        columns_widget = QWidget(self)
+        col_layout = QHBoxLayout(columns_widget)
+        col_layout.setContentsMargins(0, 0, 0, 0)
+        col_layout.setSpacing(12)
 
         # Column 0: Control Panel
-        self._build_control_panel(main_layout)
+        self._build_control_panel(columns_widget)
 
         # Column 1: Status Panel
-        self._build_status_panel(main_layout)
+        self._build_status_panel(columns_widget)
 
         # Column 2: Camera Panel
-        self.build_camera_column(main_layout, column=2, title_color=ACCENT)
+        self.build_camera_column(columns_widget, column=2, title_color=ACCENT)
 
-    def _build_control_panel(self, parent: ctk.CTkFrame) -> None:
+        # Set stretch factors: Col 0: 2, Col 1: 2, Col 2: 3
+        col_layout.setStretch(0, 2)
+        col_layout.setStretch(1, 2)
+        col_layout.setStretch(2, 3)
+
+        main_layout.addWidget(columns_widget, 1)
+
+        # Bottom status bar
+        self.lbl_err_status = self.build_status_bar()
+
+    def _build_control_panel(self, parent: QWidget) -> None:
         """Build the control panel with START/PAUSE buttons."""
         frame = self._create_card(parent)
-        frame.grid(row=0, column=0, padx=8, pady=8, sticky="nsew")
+        frame.setMinimumWidth(260)
+        frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(8, 8, 8, 12)
+        layout.setSpacing(8)
 
         self.build_section_header(frame, "⚡", "CONTROL PANEL", ACCENT)
 
-        # Buttons container
-        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_frame.pack(fill="both", expand=True, padx=15, pady=(6, 12))
+        btn_frame = QWidget(frame)
+        btn_frame.setStyleSheet("background: transparent; border: none;")
+        btn_layout = QVBoxLayout(btn_frame)
+        btn_layout.setContentsMargins(12, 6, 12, 12)
+        btn_layout.setSpacing(8)
 
         # START button
-        self.btn_start = ctk.CTkButton(
-            btn_frame,
-            text="▶   START AUTO",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color=SUCCESS,
-            hover_color=SUCCESS_HOVER,
-            text_color="white",
-            height=52,
-            corner_radius=12,
-            command=lambda: self.controller.plc.send_pulse(*ADDR.START_AUTO),
+        self.btn_start = QPushButton("▶   START AUTO", btn_frame)
+        self.btn_start.setFixedHeight(48)
+        self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_start.setStyleSheet(
+            btn_style(SUCCESS, SUCCESS_HOVER, radius=12, font_size=14)
         )
-        self.btn_start.pack(fill="x", pady=(4, 10))
+        self.btn_start.clicked.connect(
+            lambda: self.controller.plc.send_pulse(*ADDR.START_AUTO)
+            if self.controller
+            else None
+        )
+        btn_layout.addWidget(self.btn_start)
 
         # PAUSE button
-        self.btn_pause = ctk.CTkButton(
-            btn_frame,
-            text="⏸   PAUSE",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color=WARNING,
-            hover_color="#D97706",
-            text_color="white",
-            height=52,
-            corner_radius=12,
-            command=lambda: self.controller.plc.send_pulse(*ADDR.PAUSE),
+        self.btn_pause = QPushButton("⏸   PAUSE", btn_frame)
+        self.btn_pause.setFixedHeight(48)
+        self.btn_pause.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pause.setStyleSheet(
+            btn_style(WARNING, "#D97706", radius=12, font_size=14)
         )
-        self.btn_pause.pack(fill="x", pady=5)
+        self.btn_pause.clicked.connect(
+            lambda: self.controller.plc.send_pulse(*ADDR.PAUSE)
+            if self.controller
+            else None
+        )
+        btn_layout.addWidget(self.btn_pause)
 
-        # Status indicator
-        status_card = ctk.CTkFrame(
-            btn_frame,
-            fg_color=ROW_BG,
-            corner_radius=10,
-            border_color=PANEL_BORDER,
-            border_width=1,
+        # Status indicator card
+        status_card = QFrame(btn_frame)
+        status_card.setStyleSheet(card_style(ROW_BG, PANEL_BORDER, 10))
+        sc_layout = QVBoxLayout(status_card)
+        sc_layout.setContentsMargins(12, 10, 12, 10)
+
+        self.lbl_operation = QLabel("● IDLE", status_card)
+        self.lbl_operation.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; "
+            f"border: none; background: transparent;"
         )
-        status_card.pack(fill="x", pady=(14, 8), ipady=8)
-        self.lbl_operation = ctk.CTkLabel(
-            status_card,
-            text="● IDLE",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color=TEXT_SECONDARY,
-        )
-        self.lbl_operation.pack()
+        sc_layout.addWidget(self.lbl_operation)
+        btn_layout.addWidget(status_card)
 
         # Capture & Classify button
-        self.btn_capture = ctk.CTkButton(
-            btn_frame,
-            text="📸   CHỤP & PHÂN LOẠI",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color=INFO,
-            hover_color="#2563EB",
-            text_color="white",
-            height=52,
-            corner_radius=12,
-            command=self.controller.trigger_manual_classification,
+        self.btn_capture = QPushButton("📸   CHỤP & PHÂN LOẠI", btn_frame)
+        self.btn_capture.setFixedHeight(48)
+        self.btn_capture.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_capture.setStyleSheet(
+            btn_style(INFO, "#2563EB", radius=12, font_size=13)
         )
-        self.btn_capture.pack(fill="x", pady=(10, 15))
+        self.btn_capture.clicked.connect(
+            lambda: self.controller.trigger_manual_classification()
+            if self.controller
+            else None
+        )
+        btn_layout.addWidget(self.btn_capture)
 
-        # Reset button
-        ctk.CTkButton(
-            btn_frame,
-            text="🔄   RESET COUNTERS",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color="transparent",
-            border_color="#475569",
-            border_width=1,
-            hover_color="#475569",
-            text_color=TEXT_PRIMARY,
-            height=38,
-            corner_radius=8,
-            command=self._on_reset_counters,
-        ).pack(fill="x", pady=5)
+        # Reset counters button
+        btn_reset = QPushButton("🔄   RESET COUNTERS", btn_frame)
+        btn_reset.setFixedHeight(36)
+        btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_reset.setStyleSheet(
+            btn_style(
+                bg="transparent",
+                hover="#475569",
+                text=TEXT_PRIMARY,
+                radius=8,
+                font_size=11,
+                border="1px solid #475569",
+            )
+        )
+        btn_reset.clicked.connect(self._on_reset_counters)
+        btn_layout.addWidget(btn_reset)
+        btn_layout.addStretch()
 
-    def _build_status_panel(self, parent: ctk.CTkFrame) -> None:
+        layout.addWidget(btn_frame)
+
+        if parent.layout() is not None:
+            parent.layout().addWidget(frame)
+
+    def _build_status_panel(self, parent: QWidget) -> None:
         """Build the joint status panel."""
         frame = self._create_card(parent)
-        frame.grid(row=0, column=1, padx=8, pady=8, sticky="nsew")
+        frame.setMinimumWidth(260)
+        frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(8, 8, 8, 12)
+        layout.setSpacing(6)
 
         self.build_section_header(frame, "📊", "JOINT STATUS", ACCENT)
 
-        # Joint data container
-        data_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        data_frame.pack(fill="both", expand=True, padx=15, pady=(6, 12))
+        data_frame = QWidget(frame)
+        data_frame.setStyleSheet("background: transparent; border: none;")
+        data_layout = QVBoxLayout(data_frame)
+        data_layout.setContentsMargins(12, 6, 12, 12)
+        data_layout.setSpacing(4)
 
-        # Joint values (styled as clean modern cells)
+        # Joint values
         self.lbl_j1 = self.create_data_row(data_frame, "J1 (Xoay)", "0.00 °", ACCENT)
         self.lbl_j2 = self.create_data_row(data_frame, "J2 (Vai)", "0.00 °", ACCENT)
         self.lbl_j3 = self.create_data_row(data_frame, "J3 (Khuỷu)", "0.00 °", ACCENT)
         self.lbl_j4 = self.create_data_row(data_frame, "J4 (Cổ tay)", "0.00 °", ACCENT)
 
-        # Gripper status container
-        grip_row = ctk.CTkFrame(
-            data_frame,
-            fg_color=PANEL_BG,
-            corner_radius=10,
-            border_color=PANEL_BORDER,
-            border_width=1,
+        # Pick height readout
+        pick_z = (
+            self.controller.cfg.sort_positions.pick_z_down
+            if self.controller and hasattr(self.controller, "cfg")
+            else 80.0
         )
-        grip_row.pack(fill="x", pady=(10, 4), ipady=7)
+        self.lbl_pick_z = self.create_data_row(
+            data_frame, "Pick Z", f"{pick_z:.1f} mm", INFO
+        )
 
-        self.lbl_gripper = ctk.CTkLabel(
-            grip_row,
-            text="GRIPPER: OPEN",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=TEXT_SECONDARY,
+        # Gripper status container
+        grip_frame = QFrame(data_frame)
+        grip_frame.setStyleSheet(card_style(PANEL_BG, PANEL_BORDER, 10))
+        gf_layout = QVBoxLayout(grip_frame)
+        gf_layout.setContentsMargins(12, 8, 12, 8)
+
+        self.lbl_gripper = QLabel("GRIPPER: OPEN", grip_frame)
+        self.lbl_gripper.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 12px; font-weight: bold; "
+            f"border: none; background: transparent;"
         )
-        self.lbl_gripper.pack(padx=12, anchor="w")
+        gf_layout.addWidget(self.lbl_gripper)
+        data_layout.addWidget(grip_frame)
 
         # Classification status indicator
-        classify_row = ctk.CTkFrame(
-            data_frame,
-            fg_color=PANEL_BG,
-            corner_radius=10,
-            border_color=PANEL_BORDER,
-            border_width=1,
-        )
-        classify_row.pack(fill="x", pady=4, ipady=9)
+        classify_frame = QFrame(data_frame)
+        classify_frame.setStyleSheet(card_style(PANEL_BG, PANEL_BORDER, 10))
+        cf_layout = QVBoxLayout(classify_frame)
+        cf_layout.setContentsMargins(12, 10, 12, 10)
 
-        self.lbl_classification = ctk.CTkLabel(
-            classify_row,
-            text="⏳ CHỜ PHÂN LOẠI",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=TEXT_SECONDARY,
+        self.lbl_classification = QLabel("⏳ CHỜ PHÂN LOẠI", classify_frame)
+        self.lbl_classification.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; "
+            f"border: none; background: transparent;"
         )
-        self.lbl_classification.pack(padx=12)
+        cf_layout.addWidget(self.lbl_classification)
+        data_layout.addWidget(classify_frame)
 
-        # Sorting statistics container
-        sort_stats_frame = ctk.CTkFrame(data_frame, fg_color="transparent")
-        sort_stats_frame.pack(fill="x", pady=(12, 4))
-        sort_stats_frame.grid_columnconfigure(0, weight=1, uniform="stats")
-        sort_stats_frame.grid_columnconfigure(1, weight=1, uniform="stats")
+        # Sorting statistics container (GOOD / BAD cards)
+        stats_widget = QWidget(data_frame)
+        stats_widget.setStyleSheet("background: transparent; border: none;")
+        stats_layout = QHBoxLayout(stats_widget)
+        stats_layout.setContentsMargins(0, 6, 0, 0)
+        stats_layout.setSpacing(8)
 
-        # GOOD counter card
-        good_card = ctk.CTkFrame(
-            sort_stats_frame,
-            fg_color=ROW_BG,
-            corner_radius=10,
-            border_color=PANEL_BORDER,
-            border_width=1,
-        )
-        good_card.grid(row=0, column=0, padx=(0, 4), sticky="nsew", ipady=6)
-        ctk.CTkLabel(
-            good_card,
-            text="TỐT",
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=TEXT_SECONDARY,
-        ).pack()
-        self.lbl_good = ctk.CTkLabel(
-            good_card,
-            text="0",
-            font=ctk.CTkFont(size=20, weight="bold"),
-            text_color=SUCCESS,
-        )
-        self.lbl_good.pack()
+        # GOOD card
+        good_card = QFrame(stats_widget)
+        good_card.setStyleSheet(card_style(ROW_BG, PANEL_BORDER, 10))
+        good_layout = QVBoxLayout(good_card)
+        good_layout.setContentsMargins(10, 8, 10, 8)
+        good_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # BAD counter card
-        bad_card = ctk.CTkFrame(
-            sort_stats_frame,
-            fg_color=ROW_BG,
-            corner_radius=10,
-            border_color=PANEL_BORDER,
-            border_width=1,
+        lbl_g_title = QLabel("✅ TỐT", good_card)
+        lbl_g_title.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 10px; font-weight: bold; "
+            f"border: none; background: transparent;"
         )
-        bad_card.grid(row=0, column=1, padx=(4, 0), sticky="nsew", ipady=6)
-        ctk.CTkLabel(
-            bad_card,
-            text="XẤU",
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=TEXT_SECONDARY,
-        ).pack()
-        self.lbl_bad = ctk.CTkLabel(
-            bad_card,
-            text="0",
-            font=ctk.CTkFont(size=20, weight="bold"),
-            text_color=DANGER,
+        lbl_g_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        good_layout.addWidget(lbl_g_title)
+
+        self.lbl_good = QLabel("0", good_card)
+        self.lbl_good.setStyleSheet(
+            f"color: {SUCCESS}; font-size: 22px; font-weight: bold; "
+            f"border: none; background: transparent;"
         )
-        self.lbl_bad.pack()
+        self.lbl_good.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        good_layout.addWidget(self.lbl_good)
+        stats_layout.addWidget(good_card)
+
+        # BAD card
+        bad_card = QFrame(stats_widget)
+        bad_card.setStyleSheet(card_style(ROW_BG, PANEL_BORDER, 10))
+        bad_layout = QVBoxLayout(bad_card)
+        bad_layout.setContentsMargins(10, 8, 10, 8)
+        bad_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        lbl_b_title = QLabel("❌ XẤU", bad_card)
+        lbl_b_title.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 10px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        lbl_b_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bad_layout.addWidget(lbl_b_title)
+
+        self.lbl_bad = QLabel("0", bad_card)
+        self.lbl_bad.setStyleSheet(
+            f"color: {DANGER}; font-size: 22px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        self.lbl_bad.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bad_layout.addWidget(self.lbl_bad)
+        stats_layout.addWidget(bad_card)
+
+        data_layout.addWidget(stats_widget)
+        data_layout.addStretch()
+
+        layout.addWidget(data_frame)
+
+        if parent.layout() is not None:
+            parent.layout().addWidget(frame)
 
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
 
     def _on_reset_counters(self) -> None:
-        self.controller.sorter.reset_counters()
-        self.lbl_good.configure(text="0")
-        self.lbl_bad.configure(text="0")
+        if self.controller and hasattr(self.controller, "sorter"):
+            self.controller.sorter.reset_counters()
+        self.lbl_good.setText("0")
+        self.lbl_bad.setText("0")
 
     # ------------------------------------------------------------------
     # BasePage contract
@@ -291,9 +350,6 @@ class PageAuto(BasePage):
 
     def update_gui_data(self, data: dict[str, Any]) -> None:
         """Refresh joint-angle targets and error status from *data*."""
-        if not self.winfo_exists():
-            return
-        # Update targets from live PLC telemetry (GUI loop interpolates towards these)
         self._target = [
             float(data.get("j1_target", 0.0)),
             float(data.get("j2_target", 0.0)),
@@ -301,52 +357,73 @@ class PageAuto(BasePage):
             float(data.get("j4_target", 0.0)),
         ]
 
+        if not self.controller or not hasattr(self.controller, "sorter"):
+            return
+
         sorter = self.controller.sorter
         # Update sorting counters
-        self.lbl_good.configure(text=str(sorter.counter_good))
-        self.lbl_bad.configure(text=str(sorter.counter_bad))
+        self.lbl_good.setText(str(sorter.counter_good))
+        self.lbl_bad.setText(str(sorter.counter_bad))
 
         # Update state displays
         state_str = sorter.state.name
         if sorter.state == RobotState.IDLE:
-            self.lbl_operation.configure(text="● IDLE", text_color=TEXT_SECONDARY)
-            self.lbl_gripper.configure(text="GRIPPER: OPEN", text_color=TEXT_SECONDARY)
+            self.lbl_operation.setText("● IDLE")
+            self.lbl_operation.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
+            )
+            self.lbl_gripper.setText("GRIPPER: OPEN")
+            self.lbl_gripper.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 12px; font-weight: bold; border: none; background: transparent;"
+            )
         elif sorter.state == RobotState.ERROR:
-            self.lbl_operation.configure(text="● SYSTEM ERROR", text_color=DANGER)
-            self.lbl_gripper.configure(text="GRIPPER: FAULT", text_color=DANGER)
+            self.lbl_operation.setText("● SYSTEM ERROR")
+            self.lbl_operation.setStyleSheet(
+                f"color: {DANGER}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
+            )
+            self.lbl_gripper.setText("GRIPPER: FAULT")
+            self.lbl_gripper.setStyleSheet(
+                f"color: {DANGER}; font-size: 12px; font-weight: bold; border: none; background: transparent;"
+            )
         else:
-            self.lbl_operation.configure(text=f"● {state_str}", text_color=WARNING)
+            self.lbl_operation.setText(f"● {state_str}")
+            self.lbl_operation.setStyleSheet(
+                f"color: {WARNING}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
+            )
             if sorter.state == RobotState.GRIPPING:
-                self.lbl_gripper.configure(text="GRIPPER: CLOSED", text_color=SUCCESS)
+                self.lbl_gripper.setText("GRIPPER: CLOSED")
+                self.lbl_gripper.setStyleSheet(
+                    f"color: {SUCCESS}; font-size: 12px; font-weight: bold; border: none; background: transparent;"
+                )
             elif sorter.state == RobotState.RELEASING:
-                self.lbl_gripper.configure(
-                    text="GRIPPER: OPENING", text_color=TEXT_SECONDARY
+                self.lbl_gripper.setText("GRIPPER: OPENING")
+                self.lbl_gripper.setStyleSheet(
+                    f"color: {TEXT_SECONDARY}; font-size: 12px; font-weight: bold; border: none; background: transparent;"
                 )
 
-        # Update classification status from sorting controller state
+        # Update classification status
         if not sorter.is_idle() and sorter.last_sort_result is not None:
-            # Sorting cycle in progress – show the active classification
             if sorter.last_sort_result == SortResult.GOOD:
-                self.lbl_classification.configure(
-                    text="✅ HÀNG TỐT", text_color=SUCCESS
+                self.lbl_classification.setText("✅ HÀNG TỐT")
+                self.lbl_classification.setStyleSheet(
+                    f"color: {SUCCESS}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
                 )
             else:
-                self.lbl_classification.configure(text="❌ HÀNG XẤU", text_color=DANGER)
+                self.lbl_classification.setText("❌ HÀNG XẤU")
+                self.lbl_classification.setStyleSheet(
+                    f"color: {DANGER}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
+                )
         else:
-            self.lbl_classification.configure(
-                text="⏳ CHỜ PHÂN LOẠI", text_color=TEXT_SECONDARY
+            self.lbl_classification.setText("⏳ CHỜ PHÂN LOẠI")
+            self.lbl_classification.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
             )
 
         self._refresh_error_status(data)
 
     def _interpolate_gui_numbers(self) -> None:
-        """
-        Smoothly step displayed joint values towards their targets.
-
-        The loop keeps scheduling at ~30 FPS but only touches Tk widgets
-        while this page is visible and when a value actually changed.
-        """
-        step_max = 5.0  # Max degrees to move per frame (creates a smooth roll)
+        """Smoothly step displayed joint values towards their targets."""
+        step_max = 5.0  # Max degrees per frame
 
         def move_towards(current: float, target: float, max_step: float) -> float:
             diff = target - current
@@ -354,15 +431,16 @@ class PageAuto(BasePage):
                 return target
             return current + math.copysign(max_step, diff)
 
-        visible = getattr(self.controller, "current_page", "PageAuto") == "PageAuto"
+        visible = (
+            getattr(self.controller, "current_page", "PageAuto") == "PageAuto"
+            if self.controller
+            else True
+        )
 
         labels = (self.lbl_j1, self.lbl_j2, self.lbl_j3, self.lbl_j4)
         for i, label in enumerate(labels):
             self._disp[i] = move_towards(self._disp[i], self._target[i], step_max)
             text = f"{self._disp[i]:.2f} °"
             if visible and text != self._last_rendered[i]:
-                label.configure(text=text)
+                label.setText(text)
                 self._last_rendered[i] = text
-
-        # Run at ~30 FPS (33ms)
-        self.after(33, self._interpolate_gui_numbers)

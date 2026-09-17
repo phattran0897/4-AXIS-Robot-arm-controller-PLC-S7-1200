@@ -2,7 +2,7 @@
 tests/test_page_manual.py – Unit tests for PageManual UI logic.
 
 Tests JOG toggle state management, button visual feedback, joint validation,
-and TX telemetry logging. All tests use mock objects — no Tk window required.
+and TX telemetry logging. All tests use mock objects — no Qt window required.
 """
 
 from __future__ import annotations
@@ -26,15 +26,19 @@ if PROJECT_ROOT not in sys.path:
 def _make_page_manual():
     """
     Construct a PageManual-like object with only the logic attributes
-    initialised (no Tk widgets). We bypass __init__ and set up mocks.
+    initialised (no Qt widgets). We use MagicMock with spec to avoid
+    instantiating the full QWidget hierarchy.
     """
-    # We need customtkinter importable for the module-level imports in
-    # page_manual.py, but we don't need a real Tk root.
-    import customtkinter as ctk  # noqa: F401
+    import PySide6  # noqa: F401
 
     from src.ui.page_manual import PageManual
 
-    page = object.__new__(PageManual)
+    # Use a simple namespace object to avoid QWidget __init__
+    page = MagicMock(spec=PageManual)
+
+    # Restore the real methods we want to test
+    page._toggle_jog = PageManual._toggle_jog.__get__(page)
+    page._validate_joints = PageManual._validate_joints.__get__(page)
 
     # ── Mock controller with PLC ─────────────────────────────────────────
     page.controller = MagicMock()
@@ -54,7 +58,7 @@ def _make_page_manual():
     }
     page._jog_buttons = {}
     for addr in page._jog_states:
-        page._jog_buttons[addr] = MagicMock()  # mock CTkButton
+        page._jog_buttons[addr] = MagicMock()  # mock QPushButton
 
     # ── Kinematics mode ─────────────────────────────────────────────────
     page._kine_mode = "Forward"
@@ -118,30 +122,27 @@ class TestJogToggle(unittest.TestCase):
             self.assertTrue(self.page._jog_states[addr])
 
     # ── TC-04 ─────────────────────────────────────────────────────────────
-    def test_jog_button_color_on(self):
-        """Button must be reconfigured with SUCCESS color when toggled ON."""
-        from src.ui.theme import SUCCESS
-
+    def test_jog_button_text_on(self):
+        """Button must have setText called with '[ON]' suffix when toggled ON."""
         addr = (80, 2)
         self.page._toggle_jog(addr, "▲ LÊN")
 
         btn = self.page._jog_buttons[addr]
-        btn.configure.assert_called_once()
-        kwargs = btn.configure.call_args
-        # Check fg_color is SUCCESS (green)
-        self.assertEqual(kwargs[1]["fg_color"], SUCCESS)
+        btn.setText.assert_called()
+        text_arg = btn.setText.call_args[0][0]
+        self.assertIn("[ON]", text_arg)
 
     # ── TC-05 ─────────────────────────────────────────────────────────────
-    def test_jog_button_color_off(self):
-        """Button must be reconfigured with gray color when toggled OFF."""
+    def test_jog_button_text_off(self):
+        """Button must have setText called with '[OFF]' suffix when toggled OFF."""
         addr = (80, 3)
         self.page._toggle_jog(addr, "XUỐNG ▼")  # ON
-        self.page._jog_buttons[addr].configure.reset_mock()
+        self.page._jog_buttons[addr].setText.reset_mock()
         self.page._toggle_jog(addr, "XUỐNG ▼")  # OFF
 
         btn = self.page._jog_buttons[addr]
-        kwargs = btn.configure.call_args
-        self.assertEqual(kwargs[1]["fg_color"], "#475569")
+        text_arg = btn.setText.call_args[0][0]
+        self.assertIn("[OFF]", text_arg)
 
     # ── TC-06 ─────────────────────────────────────────────────────────────
     def test_toggle_logs_to_tx(self):

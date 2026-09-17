@@ -10,6 +10,7 @@ from src.kinematics.kinematics import (
     forward_kinematics,
     inverse_kinematics,
     reachable,
+    validate_joint_angles,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "reachable",
     "configure",
     "JOINT_LIMITS",
+    "validate_joint_angles",
 ]

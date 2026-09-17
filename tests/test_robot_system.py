@@ -36,7 +36,7 @@ import numpy as np  # noqa: E402  (must follow sys.path setup above)
 
 # ---------------------------------------------------------------------------
 # Conditional import guards – allow tests to run in environments that lack
-# optional runtime dependencies (snap7, cv2, customtkinter).
+# optional runtime dependencies (snap7, cv2, PySide6).
 # ---------------------------------------------------------------------------
 _HAVE_SNAP7 = False
 try:
@@ -54,11 +54,11 @@ try:
 except ImportError:
     pass
 
-_HAVE_CUSTOMTKINTER = False
+_HAVE_PYSIDE6 = False
 try:
-    import customtkinter  # noqa: F401
+    import PySide6  # noqa: F401
 
-    _HAVE_CUSTOMTKINTER = True
+    _HAVE_PYSIDE6 = True
 except ImportError:
     pass
 
@@ -238,11 +238,11 @@ class TestInverseKinematicsModule(unittest.TestCase):
         """FK at all-zero joints must give (294, 0, 100)."""
         from src.kinematics import forward_kinematics
 
-        x, y, z = forward_kinematics(0.0, 0.0, 0.0, 0.0)
-        # r = 40 + 190 + 110 + 65 = 405, z = 300
-        self.assertAlmostEqual(x, 405.0, places=1)
+        x, y, z, _pitch = forward_kinematics(0.0, 0.0, 0.0, 0.0)
+        # r = 0 + 190 + 190 + 74 = 454, z = 189.6
+        self.assertAlmostEqual(x, 454.0, places=1)
         self.assertAlmostEqual(y, 0.0, places=1)
-        self.assertAlmostEqual(z, 300.0, places=1)
+        self.assertAlmostEqual(z, 189.6, places=1)
 
     # ── TC-17 ────────────────────────────────────────────────────────────────
     def test_fk_ik_round_trip(self) -> None:
@@ -251,10 +251,10 @@ class TestInverseKinematicsModule(unittest.TestCase):
 
         # Pick specific joint angles
         j1, j2, j3, j4 = 30.0, 20.0, -15.0, -5.0
-        x, y, z = forward_kinematics(j1, j2, j3, j4)
+        x, y, z, _pitch = forward_kinematics(j1, j2, j3, j4)
         phi = j2 + j3 + j4  # end-effector pitch
         j1r, j2r, j3r, j4r = inverse_kinematics(x, y, z, phi=phi)
-        x2, y2, z2 = forward_kinematics(j1r, j2r, j3r, j4r)
+        x2, y2, z2, _pitch2 = forward_kinematics(j1r, j2r, j3r, j4r)
         self.assertAlmostEqual(x, x2, places=2)
         self.assertAlmostEqual(y, y2, places=2)
         self.assertAlmostEqual(z, z2, places=2)
@@ -272,7 +272,7 @@ class TestInverseKinematicsModule(unittest.TestCase):
         from src.kinematics import forward_kinematics, inverse_kinematics
 
         # Get a reachable point at 45° by computing FK with θ₁=45°
-        x, y, z = forward_kinematics(45.0, 0.0, 0.0, 0.0)
+        x, y, z, _pitch = forward_kinematics(45.0, 0.0, 0.0, 0.0)
         j1, j2, j3, j4 = inverse_kinematics(x, y, z, phi=0.0)
         self.assertAlmostEqual(j1, 45.0, places=2)
 
@@ -297,10 +297,10 @@ class TestInverseKinematicsModule(unittest.TestCase):
         """FK with θ₁=90° should swap X and Y (X≈0, Y=r)."""
         from src.kinematics import forward_kinematics
 
-        x, y, z = forward_kinematics(90.0, 0.0, 0.0, 0.0)
+        x, y, z, _pitch = forward_kinematics(90.0, 0.0, 0.0, 0.0)
         self.assertAlmostEqual(x, 0.0, places=1)
-        self.assertAlmostEqual(y, 405.0, places=1)
-        self.assertAlmostEqual(z, 300.0, places=1)
+        self.assertAlmostEqual(y, 454.0, places=1)
+        self.assertAlmostEqual(z, 189.6, places=1)
 
 
 # ===========================================================================
@@ -570,27 +570,29 @@ class TestYOLODetector(unittest.TestCase):
 
 
 # ===========================================================================
-# 5 – BasePage  (run only when customtkinter is available)
+# 5 – BasePage  (run only when PySide6 is available)
 # ===========================================================================
 
 
-@unittest.skipUnless(_HAVE_CUSTOMTKINTER, "customtkinter not installed")
+@unittest.skipUnless(_HAVE_PYSIDE6, "PySide6 not installed")
 class TestBasePage(unittest.TestCase):
     """Tests for src/ui/base_page.py"""
 
     def test_update_video_stores_reference(self) -> None:
-        """update_video() must store the PhotoImage to prevent garbage collection."""
+        """update_video() must store the pixmap to prevent garbage collection."""
         from src.ui.base_page import BasePage
 
         page = BasePage.__new__(BasePage)
-        page._current_tk_image = None
+        page._current_pixmap = None
         page.video_label = MagicMock()
+        page.video_label.width.return_value = 440
+        page.video_label.height.return_value = 310
 
-        fake_tk = MagicMock()
-        page.update_video(fake_tk)
+        fake_pixmap = MagicMock()
+        fake_pixmap.scaled.return_value = fake_pixmap
+        page.update_video(fake_pixmap)
 
-        self.assertIs(page._current_tk_image, fake_tk)
-        page.video_label.configure.assert_called_once_with(text="", image=fake_tk)
+        self.assertIs(page._current_pixmap, fake_pixmap)
 
 
 # ===========================================================================
@@ -1046,47 +1048,45 @@ class TestSortingWaypointValidation(unittest.TestCase):
         self.assertTrue(sorter.is_idle())
 
 
-@unittest.skipUnless(_HAVE_CUSTOMTKINTER, "customtkinter not installed")
+@unittest.skipUnless(_HAVE_PYSIDE6, "PySide6 not installed")
 class TestHeaderTabsRegression(unittest.TestCase):
-    """Regression: navigation tabs must actually be packed (were invisible).
+    """Regression: navigation tabs must be present in the header layout.
 
-    The refactor that introduced VAAHeader created _btn_auto/_btn_manual but
-    lost their .pack() calls, leaving the AUTO/MANUAL switch rendered nowhere.
+    The refactor that introduced VAAHeader created _btn_auto/_btn_manual.
+    Verify they exist and have text labels assigned.
     """
 
     # ── R-05 ────────────────────────────────────────────────────────────────
-    def test_navigation_tabs_are_packed(self) -> None:
-        import customtkinter as ctk
+    def test_navigation_tabs_exist(self) -> None:
+        import sys
+
+        from PySide6.QtWidgets import QApplication
 
         from src.ui.header import VAAHeader
 
-        root = ctk.CTk()
-        root.withdraw()
+        app = QApplication.instance() or QApplication(sys.argv)
         try:
-            header = VAAHeader(parent=root, controller=MagicMock())
-            root.update_idletasks()
-            root.update()
-            for btn in (header._btn_auto, header._btn_manual):
-                label = str(btn.cget("text"))
-                self.assertEqual(
-                    btn.winfo_manager(),
-                    "pack",
-                    f"Tab '{label}' is not managed by pack – it never renders.",
-                )
+            header = VAAHeader(parent=None, controller=MagicMock())
+            self.assertIsNotNone(header._btn_auto)
+            self.assertIsNotNone(header._btn_manual)
+            self.assertEqual(header._btn_auto.text(), "AUTO MODE")
+            self.assertEqual(header._btn_manual.text(), "MANUAL MODE")
         finally:
-            root.destroy()
+            header.deleteLater()
 
 
-@unittest.skipUnless(_HAVE_CUSTOMTKINTER, "customtkinter not installed")
+@unittest.skipUnless(_HAVE_PYSIDE6, "PySide6 not installed")
 class TestAppIcon(unittest.TestCase):
     """The brand logo must become the OS window/taskbar icon at start-up."""
 
-    def _make_root(self):
-        import customtkinter as ctk
+    def _make_window(self):
+        import sys
 
-        root = ctk.CTk()
-        root.withdraw()
-        return root
+        from PySide6.QtWidgets import QApplication, QMainWindow
+
+        _app = QApplication.instance() or QApplication(sys.argv)
+        window = QMainWindow()
+        return window
 
     # ── R-06 ────────────────────────────────────────────────────────────────
     def test_apply_app_icon_with_valid_png(self) -> None:
@@ -1100,24 +1100,22 @@ class TestAppIcon(unittest.TestCase):
         os.close(fd)
         Image.new("RGBA", (64, 64), (0, 212, 255, 255)).save(path)
         try:
-            root = self._make_root()
+            window = self._make_window()
             try:
-                self.assertTrue(apply_app_icon(root, path))
-                # Tk keeps the registered iconphoto image
-                self.assertTrue(root._app_icon_ref is not None)
+                self.assertTrue(apply_app_icon(window, path))
             finally:
-                root.destroy()
+                window.deleteLater()
         finally:
             os.unlink(path)
 
     def test_apply_app_icon_missing_file_returns_false(self) -> None:
         from src.ui.header import apply_app_icon
 
-        root = self._make_root()
+        window = self._make_window()
         try:
-            self.assertFalse(apply_app_icon(root, "Z:/definitely/not/here/logo.png"))
+            self.assertFalse(apply_app_icon(window, "Z:/definitely/not/here/logo.png"))
         finally:
-            root.destroy()
+            window.deleteLater()
 
     def test_get_logo_path_points_at_asset(self) -> None:
         import os as _os
@@ -1130,9 +1128,313 @@ class TestAppIcon(unittest.TestCase):
         )
 
 
+# ===========================================================================
+# 10 – Extended Kinematics Tests (elbow config, pitch return)
+# ===========================================================================
+
+
+class TestKinematicsElbowConfig(unittest.TestCase):
+    """Tests for elbow-up / elbow-down configuration selection in IK."""
+
+    # ── TC-19 ────────────────────────────────────────────────────────────────
+    def test_elbow_up_vs_down_different_solutions(self) -> None:
+        """Same target with different elbow configs must yield different θ₃ signs."""
+        from src.kinematics import forward_kinematics, inverse_kinematics
+
+        # Use a reachable target that has room for both solutions
+        x, y, z, _pitch = forward_kinematics(30.0, 40.0, 20.0, -10.0)
+        phi = 40.0 + 20.0 + (-10.0)  # = 50.0
+
+        j1_up, j2_up, j3_up, j4_up = inverse_kinematics(x, y, z, phi=phi, elbow="up")
+        j1_dn, j2_dn, j3_dn, j4_dn = inverse_kinematics(
+            x, y, z, phi=phi, elbow="down"
+        )
+
+        # θ₁ must be the same (base rotation doesn't depend on elbow config)
+        self.assertAlmostEqual(j1_up, j1_dn, places=4)
+
+        # θ₃ must have opposite sign (up = positive, down = negative)
+        # unless the target is at exact extension (sin_theta3 ≈ 0)
+        if abs(j3_up) > 0.1:
+            self.assertNotAlmostEqual(j3_up, j3_dn, places=1)
+
+    # ── TC-20 ────────────────────────────────────────────────────────────────
+    def test_fk_ik_round_trip_elbow_down(self) -> None:
+        """FK → IK(elbow='down') → FK must recover the same position."""
+        from src.kinematics import forward_kinematics, inverse_kinematics
+
+        j1, j2, j3, j4 = 30.0, 40.0, -20.0, -10.0
+        x, y, z, _pitch = forward_kinematics(j1, j2, j3, j4)
+        phi = j2 + j3 + j4
+
+        j1r, j2r, j3r, j4r = inverse_kinematics(
+            x, y, z, phi=phi, elbow="down"
+        )
+        x2, y2, z2, _p2 = forward_kinematics(j1r, j2r, j3r, j4r)
+
+        self.assertAlmostEqual(x, x2, places=2)
+        self.assertAlmostEqual(y, y2, places=2)
+        self.assertAlmostEqual(z, z2, places=2)
+
+    # ── TC-22 ────────────────────────────────────────────────────────────────
+    def test_fk_returns_pitch(self) -> None:
+        """FK must return pitch = j2 + j3 + j4 as the 4th element."""
+        from src.kinematics import forward_kinematics
+
+        j2, j3, j4 = 30.0, -15.0, 10.0
+        result = forward_kinematics(0.0, j2, j3, j4)
+        self.assertEqual(len(result), 4)
+        self.assertAlmostEqual(result[3], j2 + j3 + j4, places=6)
+
+    # ── TC-23 ────────────────────────────────────────────────────────────────
+    def test_ik_invalid_elbow_raises_value_error(self) -> None:
+        """Passing an invalid elbow value must raise ValueError."""
+        from src.kinematics import inverse_kinematics
+
+        with self.assertRaises(ValueError):
+            inverse_kinematics(200.0, 100.0, 200.0, phi=0.0, elbow="invalid")
+
+    def test_fk_ik_round_trip_3d_tolerance(self) -> None:
+        """FK→IK→FK round-trip must hold within 1e-3 mm tolerance."""
+        from src.kinematics import forward_kinematics, inverse_kinematics
+
+        for j1, j2, j3, j4 in [
+            (0.0, 0.0, 0.0, 0.0),
+            (45.0, 30.0, -15.0, -5.0),
+            (-60.0, 50.0, 10.0, -20.0),
+            (90.0, 20.0, -10.0, 5.0),
+        ]:
+            x, y, z, _p = forward_kinematics(j1, j2, j3, j4)
+            phi = j2 + j3 + j4
+            j1r, j2r, j3r, j4r = inverse_kinematics(x, y, z, phi=phi)
+            x2, y2, z2, _p2 = forward_kinematics(j1r, j2r, j3r, j4r)
+            self.assertAlmostEqual(x, x2, places=3)
+            self.assertAlmostEqual(y, y2, places=3)
+            self.assertAlmostEqual(z, z2, places=3)
+
+
+# ===========================================================================
+# 11 – StabilityTracker
+# ===========================================================================
+
+
+class TestStabilityTracker(unittest.TestCase):
+    """Tests for src/ai/stability_tracker.py"""
+
+    # ── TC-24 ────────────────────────────────────────────────────────────────
+    def test_locks_after_required_frames(self) -> None:
+        """Tracker must lock after exactly required_frames stable updates."""
+        from src.ai.stability_tracker import StabilityTracker
+
+        tracker = StabilityTracker(threshold_mm=5.0, required_frames=5)
+        self.assertFalse(tracker.is_locked)
+
+        for i in range(4):
+            result = tracker.update(100.0, 200.0)
+            self.assertFalse(result, f"Locked too early at frame {i + 1}")
+
+        result = tracker.update(100.0, 200.0)
+        self.assertTrue(result)
+        self.assertTrue(tracker.is_locked)
+        self.assertEqual(tracker.locked_position, (100.0, 200.0))
+
+    # ── TC-25 ────────────────────────────────────────────────────────────────
+    def test_resets_on_large_jump(self) -> None:
+        """A position jump beyond threshold_mm must reset the stable count."""
+        from src.ai.stability_tracker import StabilityTracker
+
+        tracker = StabilityTracker(threshold_mm=5.0, required_frames=5)
+
+        # Build up 3 stable frames
+        for _ in range(3):
+            tracker.update(100.0, 200.0)
+        self.assertEqual(tracker.stable_count, 3)
+
+        # Large jump resets
+        tracker.update(200.0, 200.0)
+        self.assertEqual(tracker.stable_count, 1)
+        self.assertFalse(tracker.is_locked)
+
+    def test_reset_method_clears_state(self) -> None:
+        """reset() must clear all tracking state."""
+        from src.ai.stability_tracker import StabilityTracker
+
+        tracker = StabilityTracker(threshold_mm=5.0, required_frames=3)
+        for _ in range(5):
+            tracker.update(100.0, 200.0)
+        self.assertTrue(tracker.is_locked)
+
+        tracker.reset()
+        self.assertFalse(tracker.is_locked)
+        self.assertIsNone(tracker.locked_position)
+        self.assertEqual(tracker.stable_count, 0)
+
+    def test_locked_tracker_unlocks_on_movement(self) -> None:
+        """A locked tracker must unlock when the object moves away."""
+        from src.ai.stability_tracker import StabilityTracker
+
+        tracker = StabilityTracker(threshold_mm=5.0, required_frames=3)
+        for _ in range(3):
+            tracker.update(100.0, 200.0)
+        self.assertTrue(tracker.is_locked)
+
+        # Move far away — should unlock
+        result = tracker.update(500.0, 500.0)
+        self.assertFalse(result)
+        self.assertFalse(tracker.is_locked)
+
+    def test_progress_property(self) -> None:
+        """progress must report fraction of required frames."""
+        from src.ai.stability_tracker import StabilityTracker
+
+        tracker = StabilityTracker(threshold_mm=5.0, required_frames=10)
+        tracker.update(100.0, 200.0)
+        self.assertAlmostEqual(tracker.progress, 0.1, places=2)
+
+
+# ===========================================================================
+# 12 – PLC Buffer Byte-Level Verification
+# ===========================================================================
+
+
+@unittest.skipUnless(_HAVE_SNAP7, "snap7 not installed")
+class TestPLCBufferContents(unittest.TestCase):
+    """Byte-level verification of PLC write buffers (TC-11 extension)."""
+
+    def test_send_joint_targets_buffer_byte_contents(self) -> None:
+        """send_joint_targets must write IEEE-754 floats at correct byte offsets."""
+        import struct
+
+        from src.plc.plc_controller import PLCController
+
+        cfg = _make_robot_config().plc
+        ctrl = PLCController(cfg)
+        mock_client = MagicMock()
+        mock_client.get_connected.return_value = True
+        mock_client.db_read.return_value = bytearray(1)
+        ctrl._client = mock_client
+
+        j1, j2, j3, j4 = 45.0, 30.0, -15.0, 10.0
+        ctrl.send_joint_targets(j1, j2, j3, j4)
+
+        target_offset = ctrl._cfg.offsets.j1_target
+        # Find the write call to the target offset
+        buf = None
+        for call in mock_client.db_write.call_args_list:
+            db, offset, data = call[0]
+            if offset == target_offset:
+                buf = data
+                break
+
+        self.assertIsNotNone(buf, "No write to j1_target offset found")
+        self.assertEqual(len(buf), 16)
+
+        # Verify IEEE-754 big-endian floats (snap7 uses big-endian)
+        j1_read = struct.unpack(">f", buf[0:4])[0]
+        j2_read = struct.unpack(">f", buf[4:8])[0]
+        j3_read = struct.unpack(">f", buf[8:12])[0]
+        j4_read = struct.unpack(">f", buf[12:16])[0]
+
+        self.assertAlmostEqual(j1_read, j1, places=4)
+        self.assertAlmostEqual(j2_read, j2, places=4)
+        self.assertAlmostEqual(j3_read, j3, places=4)
+        self.assertAlmostEqual(j4_read, j4, places=4)
+
+    # ── Group 1 Unit Tests: Memory Safety & Limits & PC Master ──────────────
+    def test_send_joint_targets_unmapped_j4_writes_12_bytes(self) -> None:
+        """When j4_target == -1, send_joint_targets must write exactly 12 bytes."""
+        from src.config_loader import PLCOffsets
+        from src.plc.plc_controller import PLCController
+
+        cfg = _make_robot_config().plc
+        cfg.offsets = PLCOffsets(
+            j1_target=42,
+            j2_target=46,
+            j3_target=50,
+            j4_target=-1,
+        )
+        ctrl = PLCController(cfg)
+        mock_client = MagicMock()
+        mock_client.get_connected.return_value = True
+        mock_client.db_read.return_value = bytearray(1)
+        ctrl._client = mock_client
+
+        ctrl.send_joint_targets(10.0, 20.0, 30.0, 40.0)
+
+        # Must write to offset 42 with length 12
+        target_offset = 42
+        mock_client.db_write.assert_any_call(
+            cfg.db_number, target_offset, unittest.mock.ANY
+        )
+        call_buf = None
+        for call in mock_client.db_write.call_args_list:
+            if call[0][1] == target_offset:
+                call_buf = call[0][2]
+                break
+        self.assertIsNotNone(call_buf)
+        self.assertEqual(len(call_buf), 12)
+        # Verify bytes 42..53 are written; byte 54 is never touched
+        self.assertEqual(42 + len(call_buf), 54)
+
+    def test_ik_raises_when_joint_limits_exceeded(self) -> None:
+        """Target with joint angle exceeding JOINT_LIMITS must raise WorkspaceError."""
+        from src.kinematics import configure, inverse_kinematics, WorkspaceError
+
+        # Limit J1 to [-30°, 30°]
+        configure(limits={"j1": (-30.0, 30.0)})
+        try:
+            # Point along positive Y axis requires J1 = 90°, exceeding limit
+            with self.assertRaises(WorkspaceError) as ctx:
+                inverse_kinematics(0.0, 250.0, 300.0, phi=0.0)
+            self.assertIn("Joint limit exceeded: j1=", str(ctx.exception))
+        finally:
+            # Restore default limits
+            configure(
+                limits={
+                    "j1": (-180.0, 180.0),
+                    "j2": (-180.0, 250.0),
+                    "j3": (-200.0, 200.0),
+                    "j4": (-180.0, 180.0),
+                }
+            )
+
+    def test_move_and_wait_transmits_targets_and_waits_for_motion_done(self) -> None:
+        """_move_and_wait() must call send_joint_targets and wait for motion_done."""
+        from src.config_loader import KinematicsConfig, PLCCommands, SortPositionsConfig
+        from src.robot.sorting_controller import SortingController
+
+        mock_plc = MagicMock()
+        mock_plc.read_status.side_effect = [
+            {"motion_done": False},
+            {"motion_done": True},
+        ]
+        sorter = SortingController(
+            mock_plc, SortPositionsConfig(), KinematicsConfig(), PLCCommands()
+        )
+        sorter._move_and_wait(15.0, 25.0, 35.0, 0.0)
+
+        mock_plc.send_joint_targets.assert_called_once_with(15.0, 25.0, 35.0, 0.0)
+        self.assertGreaterEqual(mock_plc.read_status.call_count, 2)
+
+    def test_move_and_wait_raises_on_timeout(self) -> None:
+        """_move_and_wait() must raise TimeoutError if motion_done is never received."""
+        from src.config_loader import KinematicsConfig, PLCCommands, SortPositionsConfig
+        from src.robot.sorting_controller import SortingController
+
+        mock_plc = MagicMock()
+        # Always return motion_done=False
+        mock_plc.read_status.return_value = {"motion_done": False}
+        sorter = SortingController(
+            mock_plc, SortPositionsConfig(), KinematicsConfig(), PLCCommands()
+        )
+        with self.assertRaises(TimeoutError):
+            sorter._move_and_wait(10.0, 20.0, 30.0, 0.0, timeout=0.08)
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

@@ -1,5 +1,5 @@
 """
-src/ui/base_page.py – Abstract base class for all application pages.
+src/ui/base_page.py – Abstract base class for all application pages (PySide6).
 
 Every page (Auto / Manual) inherits :class:`BasePage`, which wires up the
 controller reference and exposes shared helpers: card + section-header
@@ -13,19 +13,38 @@ import logging
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Any
 
-import customtkinter as ctk
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from src.ui.theme import (
+    ACCENT,
+    ACCENT_DIM,
+    ACCENT_GLOW,
     CARD_BG,
     CONTENT_BG,
     DANGER,
+    FONT_MONO,
     HEADER_BG,
-    PANEL_BG,
     PANEL_BORDER,
+    PANEL_BORDER_LIGHT,
     ROW_BG,
     SUCCESS,
+    TEXT_DIM,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
+    btn_style,
+    card_style,
+    video_container_style,
 )
 
 if TYPE_CHECKING:
@@ -34,43 +53,44 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-class BasePage(ctk.CTkFrame):
+class BasePage(QWidget):
     """
-    Shared base frame for every page in the application.
+    Shared base widget for every page in the application.
 
     Sub-classes must implement :meth:`update_gui_data`.
 
     Parameters
     ----------
     parent:
-        The container frame managed by :class:`RobotApp`.
+        The container widget managed by :class:`RobotApp`.
     controller:
-        The main application instance, used to access ``plc``, ``detector``,
-        ``show_frame()``, and ``change_camera_source()``.
+        The main application instance.
     page_color:
         Accent colour for page-specific title labels (hex string).
     """
 
     def __init__(
         self,
-        parent: ctk.CTkFrame,
-        controller: "RobotApp",
+        parent: QWidget | None = None,
+        controller: "RobotApp" | None = None,
         page_color: str = "#00D4FF",
     ) -> None:
-        super().__init__(parent, fg_color=CONTENT_BG)
-        self.controller: "RobotApp" = controller
+        super().__init__(parent)
+        self.controller: "RobotApp" = controller  # type: ignore[assignment]
         self.page_color: str = page_color
 
         # Shared widgets populated by sub-class build helpers
-        self.video_label: ctk.CTkLabel | None = None
-        self.lbl_err_status: ctk.CTkLabel | None = None
+        self.video_label: QLabel | None = None
+        self.lbl_err_status: QLabel | None = None
 
-        # Proper reference to prevent PhotoImage garbage collection
-        self._current_tk_image: ctk.CTkImage | None = None
+        # Proper reference to prevent pixmap garbage collection
+        self._current_pixmap: QPixmap | None = None
 
         # Dynamic video display size (updated on container resize)
-        self._video_display_width: int = 440
-        self._video_display_height: int = 310
+        self._video_display_width: int = 480
+        self._video_display_height: int = 360
+
+        self.setStyleSheet(f"background-color: {CONTENT_BG};")
 
     # ------------------------------------------------------------------
     # Contract
@@ -79,244 +99,303 @@ class BasePage(ctk.CTkFrame):
     @abstractmethod
     def update_gui_data(self, data: dict[str, Any]) -> None:
         """
-        Refresh all dynamic widgets with *data* from the PLC cyclic read.
+        Refresh dynamic widgets with *data* from the PLC cyclic read.
 
-        Called from the background ``cyclic_update`` thread via
-        ``self.after()`` – implementations must be thread-safe
-        (CustomTkinter is *not* thread-safe; use ``self.after()`` if
-        needed).
+        Called on the main Qt event thread via signal/slot.
         """
 
     # ------------------------------------------------------------------
-    # Video label (thread-safe update)
+    # Video label (thread-safe update via main thread slot)
     # ------------------------------------------------------------------
 
-    def update_video(self, img: ctk.CTkImage) -> None:
+    def update_video(self, img: QImage | QPixmap | Any) -> None:
         """
-        Replace the current video frame with *img*.
+        Replace current video frame with *img*.
+        """
+        if isinstance(img, QImage):
+            pixmap = QPixmap.fromImage(img)
+        elif isinstance(img, QPixmap):
+            pixmap = img
+        else:
+            pixmap = img
 
-        Stores the reference in ``_current_tk_image`` to prevent garbage
-        collection. Thread-safe to call from any thread.
-        """
-        self._current_tk_image = img
+        self._current_pixmap = pixmap
+
         if self.video_label is not None:
-            self.video_label.configure(text="", image=img)
+            if hasattr(pixmap, "scaled"):
+                # Scale keeping aspect ratio to fill the current label size
+                target_w = max(self.video_label.width() - 4, 10)
+                target_h = max(self.video_label.height() - 4, 10)
+                scaled = pixmap.scaled(
+                    target_w,
+                    target_h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            else:
+                scaled = pixmap
+
+            if hasattr(self.video_label, "setPixmap"):
+                self.video_label.setPixmap(scaled)
 
     # ------------------------------------------------------------------
     # Shared UI factory helpers
     # ------------------------------------------------------------------
 
-    def _create_card(self, parent: ctk.CTkFrame) -> ctk.CTkFrame:
-        """Create a modern bordered card (single implementation app-wide)."""
-        return ctk.CTkFrame(
-            parent,
-            fg_color=CARD_BG,
-            border_color=PANEL_BORDER,
-            border_width=1,
-            corner_radius=14,
-        )
+    def _create_card(self, parent: QWidget | None = None) -> QFrame:
+        """Create a modern bordered card frame."""
+        frame = QFrame(parent or self)
+        frame.setStyleSheet(card_style(CARD_BG, PANEL_BORDER, 14))
+        return frame
 
     def build_section_header(
         self,
-        parent: ctk.CTkFrame,
+        parent: QWidget,
         icon: str,
         title: str,
         color: str,
-    ) -> ctk.CTkFrame:
+    ) -> QWidget:
         """
         Build the standard section header row (icon + title + underline)
-        and return the header frame.
+        and return the container widget.
         """
-        header = ctk.CTkFrame(parent, fg_color="transparent")
-        header.pack(fill="x", padx=15, pady=(14, 8))
+        header_widget = QWidget(parent)
+        header_widget.setStyleSheet("background: transparent; border: none;")
+        layout = QVBoxLayout(header_widget)
+        layout.setContentsMargins(15, 12, 15, 6)
+        layout.setSpacing(6)
 
-        row = ctk.CTkFrame(header, fg_color="transparent")
-        row.pack(fill="x")
+        row = QWidget(header_widget)
+        row.setStyleSheet("background: transparent; border: none;")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(10)
 
-        ctk.CTkLabel(
-            row,
-            text=icon,
-            font=ctk.CTkFont(size=18),
-            text_color=color,
-        ).pack(side="left", padx=(0, 8))
-
-        ctk.CTkLabel(
-            row,
-            text=title,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color=color,
-        ).pack(side="left")
-
-        # Accent underline for a crisp, professional finish
-        ctk.CTkFrame(header, height=2, fg_color=color, corner_radius=1).pack(
-            fill="x", pady=(6, 0)
+        lbl_icon = QLabel(icon, row)
+        lbl_icon.setStyleSheet(
+            f"color: {color}; font-size: 18px; border: none; background: transparent;"
         )
-        return header
+        row_layout.addWidget(lbl_icon)
+
+        lbl_title = QLabel(title, row)
+        lbl_title.setStyleSheet(
+            f"color: {color}; font-size: 13px; font-weight: bold; "
+            f"letter-spacing: 1px; border: none; background: transparent;"
+        )
+        row_layout.addWidget(lbl_title)
+        row_layout.addStretch()
+
+        layout.addWidget(row)
+
+        # Gradient underline
+        underline = QFrame(header_widget)
+        underline.setFixedHeight(2)
+        underline.setStyleSheet(
+            f"background-color: {color}; border-radius: 1px; border: none;"
+        )
+        layout.addWidget(underline)
+
+        if parent.layout() is not None:
+            parent.layout().addWidget(header_widget)
+
+        return header_widget
 
     def create_data_row(
         self,
-        parent: ctk.CTkFrame,
+        parent: QWidget,
         name: str,
         value: str,
         value_color: str | None = None,
         mono_font: bool = True,
-    ) -> ctk.CTkLabel:
+    ) -> QLabel:
         """
         Create a styled label/value row and return the value label.
-
-        Used for joint readouts, kinematics results, and similar key-value
-        displays so they look identical across pages.
         """
-        row = ctk.CTkFrame(
-            parent,
-            fg_color=ROW_BG,
-            corner_radius=10,
-            border_color=PANEL_BORDER,
-            border_width=1,
-        )
-        row.pack(fill="x", pady=4, ipady=5)
+        row_frame = QFrame(parent)
+        row_frame.setStyleSheet(card_style(ROW_BG, PANEL_BORDER, 10))
+        row_layout = QHBoxLayout(row_frame)
+        row_layout.setContentsMargins(12, 7, 12, 7)
 
-        ctk.CTkLabel(
-            row,
-            text=name,
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=TEXT_SECONDARY,
-            anchor="w",
-        ).pack(side="left", padx=12)
-
-        val_label = ctk.CTkLabel(
-            row,
-            text=value,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color=value_color or TEXT_PRIMARY,
-            anchor="e",
+        name_label = QLabel(name, row_frame)
+        name_label.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; "
+            f"border: none; background: transparent;"
         )
-        val_label.pack(side="right", padx=12)
+        row_layout.addWidget(name_label)
+
+        row_layout.addStretch()
+
+        font_family = FONT_MONO if mono_font else "Segoe UI"
+        color = value_color or TEXT_PRIMARY
+        val_label = QLabel(value, row_frame)
+        val_label.setStyleSheet(
+            f"color: {color}; font-family: '{font_family}', monospace; "
+            f"font-size: 13px; font-weight: bold; border: none; background: transparent;"
+        )
+        row_layout.addWidget(val_label)
+
+        if parent.layout() is not None:
+            parent.layout().addWidget(row_frame)
+
         return val_label
 
     def build_camera_column(
         self,
-        parent: ctk.CTkFrame,
-        column: int,
-        title_color: str,
-    ) -> None:
+        parent: QWidget,
+        column: int = 2,
+        title_color: str = "#00E5FF",
+    ) -> QFrame:
         """
-        Build the camera column (frame + selector + video label) in one call.
+        Build the camera column (card frame + selector + video label).
 
-        Eliminates duplication that existed when each sub-class implemented
-        this layout manually.
+        The video container fills all available vertical space so the
+        camera feed is always maximised within the column.
         """
         frame = self._create_card(parent)
-        frame.grid(row=0, column=column, padx=8, pady=8, sticky="nsew")
+        frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(8, 8, 8, 12)
+        layout.setSpacing(6)
 
         # Section header
         self.build_section_header(frame, "📷", "AI VISION", title_color)
 
-        # Camera selector
-        selector_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        selector_frame.pack(fill="x", padx=15, pady=(0, 8))
+        # Camera selector row
+        selector_widget = QWidget(frame)
+        selector_widget.setStyleSheet("background: transparent; border: none;")
+        sel_layout = QHBoxLayout(selector_widget)
+        sel_layout.setContentsMargins(15, 0, 15, 0)
+        sel_layout.setSpacing(8)
 
-        ctk.CTkLabel(
-            selector_frame,
-            text="Source:",
-            font=ctk.CTkFont(size=11),
-            text_color=TEXT_SECONDARY,
-        ).pack(side="left")
-
-        # Populate camera options dynamically
-        available_cameras = self.controller.detector.available_cameras(max_index=2)
-        if available_cameras:
-            cam_values = [f"Camera {i}" for i in available_cameras]
-        else:
-            cam_values = ["No Camera"]
-
-        cam_selector = ctk.CTkComboBox(
-            selector_frame,
-            values=cam_values,
-            command=self.controller.change_camera_source,
-            width=140,
-            height=28,
-            fg_color=PANEL_BG,
-            text_color=TEXT_PRIMARY,
-            button_color=title_color,
-            button_hover_color=title_color,
-            dropdown_fg_color=PANEL_BG,
-            dropdown_text_color=TEXT_PRIMARY,
-            border_color=PANEL_BORDER,
-            corner_radius=8,
+        # Live indicator dot
+        lbl_live = QLabel("●", selector_widget)
+        lbl_live.setStyleSheet(
+            f"color: {SUCCESS}; font-size: 14px; border: none; background: transparent;"
         )
-        cam_selector.pack(side="right")
-        if cam_values and cam_values[0] != "No Camera":
-            cam_selector.set(cam_values[0])
-        else:
-            cam_selector.set("No Camera")
+        sel_layout.addWidget(lbl_live)
 
-        # Video label with modern styling
-        video_container = ctk.CTkFrame(
-            frame,
-            fg_color="black",
-            corner_radius=10,
-            border_color=PANEL_BORDER,
-            border_width=1,
+        lbl_src = QLabel("LIVE", selector_widget)
+        lbl_src.setStyleSheet(
+            f"color: {SUCCESS}; font-size: 11px; font-weight: bold; "
+            f"letter-spacing: 1px; border: none; background: transparent;"
         )
-        video_container.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        sel_layout.addWidget(lbl_src)
+        sel_layout.addStretch()
 
-        self.video_label = ctk.CTkLabel(
-            video_container,
-            text="🎥  Initializing AI Vision...",
-            fg_color="black",
-            text_color=TEXT_SECONDARY,
-            font=ctk.CTkFont(size=12),
+        lbl_source = QLabel("Source:", selector_widget)
+        lbl_source.setStyleSheet(
+            f"color: {TEXT_DIM}; font-size: 10px; border: none; background: transparent;"
         )
-        self.video_label.pack(fill="both", expand=True, padx=5, pady=5)
+        sel_layout.addWidget(lbl_source)
 
-        # Track container size for dynamic camera scaling on fullscreen
-        video_container.bind("<Configure>", self._on_video_container_resize)
+        # Available cameras
+        available = (
+            self.controller.detector.available_cameras(max_index=2)
+            if self.controller and hasattr(self.controller, "detector")
+            else [0]
+        )
+        cam_values = [f"Camera {i}" for i in available] if available else ["No Camera"]
 
-    def build_status_bar(self) -> ctk.CTkLabel:
+        cam_selector = QComboBox(selector_widget)
+        cam_selector.addItems(cam_values)
+        cam_selector.setFixedSize(130, 28)
+        if self.controller and hasattr(self.controller, "change_camera_source"):
+            cam_selector.currentTextChanged.connect(self.controller.change_camera_source)
+        sel_layout.addWidget(cam_selector)
+        layout.addWidget(selector_widget)
+
+        # ── Video container (expands to fill) ────────────────────────────
+        video_container = QFrame(frame)
+        video_container.setStyleSheet(video_container_style(ACCENT_DIM))
+        video_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        v_layout = QVBoxLayout(video_container)
+        v_layout.setContentsMargins(3, 3, 3, 3)
+
+        self.video_label = QLabel(video_container)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setText("🎥  Initializing AI Vision...")
+        self.video_label.setMinimumSize(320, 200)
+        self.video_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+        )
+        self.video_label.setStyleSheet(
+            f"color: {TEXT_DIM}; font-size: 13px; "
+            f"background-color: #000000; border: none; border-radius: 10px;"
+        )
+        v_layout.addWidget(self.video_label)
+
+        # Video container takes all remaining vertical space
+        layout.addWidget(video_container, 1)
+
+        # ── Bottom info row ──────────────────────────────────────────────
+        info_row = QWidget(frame)
+        info_row.setStyleSheet("background: transparent; border: none;")
+        info_layout = QHBoxLayout(info_row)
+        info_layout.setContentsMargins(15, 2, 15, 0)
+        info_layout.setSpacing(4)
+
+        lbl_model = QLabel("● YOLO", info_row)
+        lbl_model.setStyleSheet(
+            f"color: {ACCENT_DIM}; font-size: 10px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        info_layout.addWidget(lbl_model)
+        info_layout.addStretch()
+
+        lbl_res = QLabel("ROI Detection", info_row)
+        lbl_res.setStyleSheet(
+            f"color: {TEXT_DIM}; font-size: 10px; border: none; background: transparent;"
+        )
+        info_layout.addWidget(lbl_res)
+        layout.addWidget(info_row)
+
+        if parent.layout() is not None:
+            parent.layout().addWidget(frame)
+
+        return frame
+
+    def build_status_bar(self) -> QLabel:
         """
         Build the bottom status bar common to all pages.
-
-        Returns the error-status :class:`ctk.CTkLabel`.
         """
-        frame_bottom = ctk.CTkFrame(
-            self,
-            fg_color=HEADER_BG,
-            height=56,
-            corner_radius=12,
-            border_color=PANEL_BORDER,
-            border_width=1,
+        frame_bottom = QFrame(self)
+        frame_bottom.setFixedHeight(50)
+        frame_bottom.setStyleSheet(
+            f"background-color: {HEADER_BG}; "
+            f"border: 1px solid {PANEL_BORDER}; border-radius: 12px;"
         )
-        frame_bottom.pack(fill="x", side="bottom", padx=20, pady=(0, 15))
-        frame_bottom.pack_propagate(False)
+        layout = QHBoxLayout(frame_bottom)
+        layout.setContentsMargins(20, 8, 20, 8)
+        layout.setSpacing(15)
 
-        # Left: Status
-        status_frame = ctk.CTkFrame(frame_bottom, fg_color="transparent")
-        status_frame.pack(side="left", padx=15, fill="both", expand=True)
-
-        self.lbl_err_status = ctk.CTkLabel(
-            status_frame,
-            text="● SYSTEM STABLE",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=SUCCESS,
+        self.lbl_err_status = QLabel("● SYSTEM STABLE", frame_bottom)
+        self.lbl_err_status.setStyleSheet(
+            f"color: {SUCCESS}; font-size: 12px; font-weight: bold; "
+            f"letter-spacing: 0.5px; border: none; background: transparent;"
         )
-        self.lbl_err_status.pack(side="left", pady=14)
+        layout.addWidget(self.lbl_err_status)
 
         # Clear Error button
-        ctk.CTkButton(
-            status_frame,
-            text="⚠  Clear Error",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color="transparent",
-            border_color=DANGER,
-            border_width=1,
-            hover_color=DANGER,
-            text_color=DANGER,
-            width=110,
-            height=32,
-            corner_radius=8,
-            command=self.controller.clear_all_errors,
-        ).pack(side="left", padx=20, pady=11)
+        btn_clear = QPushButton("⚠  Clear Error", frame_bottom)
+        btn_clear.setStyleSheet(
+            btn_style(
+                bg="transparent",
+                hover=DANGER,
+                text=DANGER,
+                radius=8,
+                border=f"1px solid {DANGER}",
+                padding="4px 12px",
+            )
+        )
+        if self.controller and hasattr(self.controller, "clear_all_errors"):
+            btn_clear.clicked.connect(self.controller.clear_all_errors)
+        layout.addWidget(btn_clear)
+        layout.addStretch()
+
+        if self.layout() is not None:
+            self.layout().addWidget(frame_bottom)
 
         return self.lbl_err_status
 
@@ -324,24 +403,26 @@ class BasePage(ctk.CTkFrame):
     # Shared status update (called by sub-classes)
     # ------------------------------------------------------------------
 
-    def _on_video_container_resize(self, event) -> None:
-        """Track video container size so the camera feed scales on fullscreen."""
-        # Ignore spurious tiny sizes during initial layout
-        if event.width > 50 and event.height > 50:
-            self._video_display_width = event.width - 10  # padding margin
-            self._video_display_height = event.height - 10
+    def resizeEvent(self, event) -> None:
+        """Update display sizes when window resizes."""
+        super().resizeEvent(event)
+        # Redraw the current frame immediately upon resize
+        if self._current_pixmap is not None:
+            self.update_video(self._current_pixmap)
 
     def _refresh_error_status(self, data: dict[str, Any]) -> None:
         """Update the error status label shared by every page."""
         if self.lbl_err_status is None:
             return
         if data.get("error_flag", False):
-            self.lbl_err_status.configure(
-                text="⚠  WARNING: SYSTEM ERROR!",
-                text_color=DANGER,
+            self.lbl_err_status.setText("⚠  WARNING: SYSTEM ERROR!")
+            self.lbl_err_status.setStyleSheet(
+                f"color: {DANGER}; font-size: 12px; font-weight: bold; "
+                f"border: none; background: transparent;"
             )
         else:
-            self.lbl_err_status.configure(
-                text="● SYSTEM STABLE",
-                text_color=SUCCESS,
+            self.lbl_err_status.setText("● SYSTEM STABLE")
+            self.lbl_err_status.setStyleSheet(
+                f"color: {SUCCESS}; font-size: 12px; font-weight: bold; "
+                f"border: none; background: transparent;"
             )

@@ -77,6 +77,16 @@ def _compute_db_read_size(offsets: PLCOffsets) -> int:
     return compute_db_read_size(offsets)
 
 
+class _PulseHandle:
+    """Handle to a scheduled pulse that allows cancellation without thread creation."""
+
+    def __init__(self, cancel_fn: Callable[[], None]) -> None:
+        self._cancel_fn = cancel_fn
+
+    def cancel(self) -> None:
+        self._cancel_fn()
+
+
 class PLCController:
     """
     Thread-safe interface to the Siemens S7-1200 PLC.
@@ -102,12 +112,20 @@ class PLCController:
         self._is_connected_cached: bool = False
         self.tx_callback: Callable[[str], None] | None = None
 
-        # Active push-button pulses keyed by (byte, bit) so a repeated
-        # pulse restarts instead of stacking threads.  Each entry is a
-        # (timer, generation) pair; the generation counter lets a stale
-        # timer detect it has been superseded and skip its reset write.
-        self._pulse_timers: dict[tuple[int, int], tuple[threading.Timer, int]] = {}
+        # Active push-button pulses keyed by (byte, bit).
+        # Uses a single dedicated background worker thread instead of spawning
+        # a new threading.Timer on every pulse, eliminating thread churn.
+        self._pulse_timers: dict[tuple[int, int], tuple[Any, int]] = {}
         self._pulse_generations: dict[tuple[int, int], int] = {}
+        self._pulse_expiries: dict[tuple[int, int], float] = {}
+        self._pulse_worker_event = threading.Event()
+        self._pulse_worker_stop = threading.Event()
+        self._pulse_thread = threading.Thread(
+            target=self._pulse_worker_loop,
+            name="PLCPulseWorker",
+            daemon=True,
+        )
+        self._pulse_thread.start()
 
         log.info(
             "PLCController created – target %s rack=%d slot=%d db=%d read_size=%d",
@@ -158,10 +176,13 @@ class PLCController:
     def disconnect(self) -> None:
         """Gracefully disconnect from the PLC and cancel pending pulses."""
         with self._lock:
-            for timer, _generation in list(self._pulse_timers.values()):
-                timer.cancel()
+            for handle, _generation in list(self._pulse_timers.values()):
+                if hasattr(handle, "cancel"):
+                    handle.cancel()
             self._pulse_timers.clear()
             self._pulse_generations.clear()
+            self._pulse_expiries.clear()
+            self._pulse_worker_event.set()
             try:
                 self._client.disconnect()
                 self._is_connected_cached = False
@@ -337,42 +358,74 @@ class PLCController:
 
         log.info("Classification bits cleared on PLC.")
 
+    def _pulse_worker_loop(self) -> None:
+        """Background daemon: sequentially handles pulse falling edges without thread creation."""
+        import time as _time
+
+        while not self._pulse_worker_stop.is_set():
+            now = _time.monotonic()
+            due: list[tuple[int, int, int]] = []
+
+            with self._lock:
+                # Find all expired pulses
+                for key, expiry in list(self._pulse_expiries.items()):
+                    if now >= expiry:
+                        gen = self._pulse_generations.get(key, 0)
+                        due.append((key[0], key[1], gen))
+                        self._pulse_expiries.pop(key, None)
+
+            for byte_off, bit_off, gen in due:
+                self._finish_pulse(byte_off, bit_off, gen)
+
+            # Determine next sleep duration
+            timeout = 0.5
+            with self._lock:
+                if self._pulse_expiries:
+                    earliest = min(self._pulse_expiries.values())
+                    timeout = max(0.01, earliest - _time.monotonic())
+
+            self._pulse_worker_event.wait(timeout)
+            self._pulse_worker_event.clear()
+
     def send_pulse(self, byte_offset: int, bit_offset: int) -> None:
         """
         Simulate a push-button press: write True immediately, then reset to
-        False after :data:`PULSE_WIDTH_S` seconds.
+        False after :data:`PULSE_WIDTH_S` seconds via a single worker thread.
 
         A repeated pulse on the same bit cancels the pending reset first,
         so pulses never stack up threads or leave a bit stuck at True.
         Generation counters guarantee a stale reset callback can never
         truncate the rising edge of a newer pulse.
         """
+        import time as _time
+
         key = (byte_offset, bit_offset)
 
         with self._lock:
             previous = self._pulse_timers.pop(key, None)
             generation = self._pulse_generations.get(key, 0) + 1
             self._pulse_generations[key] = generation
-        if previous is not None:
-            previous[0].cancel()
+            if previous is not None and hasattr(previous[0], "cancel"):
+                previous[0].cancel()
+
+            self._pulse_expiries[key] = _time.monotonic() + self.PULSE_WIDTH_S
+            handle = _PulseHandle(lambda b=byte_offset, o=bit_offset: self.cancel_pulse(b, o))
+            self._pulse_timers[key] = (handle, generation)
 
         self.write_bit(byte_offset, bit_offset, True)
+        self._pulse_worker_event.set()
 
-        timer = threading.Timer(
-            self.PULSE_WIDTH_S,
-            self._finish_pulse,
-            args=(byte_offset, bit_offset, generation),
-        )
-        timer.daemon = True
+    def cancel_pulse(self, byte_offset: int, bit_offset: int) -> None:
+        """Immediately cancel a pending pulse and reset the bit to False."""
+        key = (byte_offset, bit_offset)
         with self._lock:
-            # Register only if no newer pulse superseded us meanwhile.
-            if self._pulse_generations.get(key) == generation:
-                self._pulse_timers[key] = (timer, generation)
-        timer.start()
+            self._pulse_timers.pop(key, None)
+            self._pulse_expiries.pop(key, None)
+        self.write_bit(byte_offset, bit_offset, False)
 
     def _finish_pulse(self, byte_offset: int, bit_offset: int, generation: int) -> None:
         """
-        Complete a pulse by resetting the bit (runs on its own thread).
+        Complete a pulse by resetting the bit (runs sequentially or on demand).
 
         Skips the reset when superseded by a newer pulse on the same bit —
         otherwise the stale ``False`` write would erase the new pulse's
@@ -384,6 +437,7 @@ class PLCController:
             if entry is None or entry[1] != generation:
                 return  # Superseded by a newer pulse – do not reset.
             self._pulse_timers.pop(key, None)
+            self._pulse_expiries.pop(key, None)
         self.write_bit(byte_offset, bit_offset, False)
 
     def send_command(self, cmd: int) -> None:
@@ -415,8 +469,10 @@ class PLCController:
         j4: float = 0.0,
     ) -> None:
         """
-        Write four joint-angle targets (degrees) to the PLC Data Block in a
-        single 16-byte transaction and pulse START_AUTO to trigger motion.
+        Write joint-angle targets (degrees) to the PLC Data Block in a
+        single dynamic transaction and pulse START_AUTO to trigger motion.
+        When j4_target < 0 (unmapped), only J1..J3 are written (12 bytes),
+        preventing memory overwrite of subsequent data.
         """
         with self._lock:
             if not self.is_connected():
@@ -424,31 +480,59 @@ class PLCController:
                 return
 
             try:
-                buf = bytearray(16)
-                set_real(buf, 0, j1)
-                set_real(buf, 4, j2)
-                set_real(buf, 8, j3)
-                set_real(buf, 12, j4)
-                self._client.db_write(
-                    self._cfg.db_number, self._cfg.offsets.j1_target, buf
-                )
+                off = self._cfg.offsets
+                # Collect mapped joint targets (offset, value)
+                targets: list[tuple[int, float]] = []
+                if off.j1_target >= 0:
+                    targets.append((off.j1_target, j1))
+                if off.j2_target >= 0:
+                    targets.append((off.j2_target, j2))
+                if off.j3_target >= 0:
+                    targets.append((off.j3_target, j3))
+                if off.j4_target >= 0:
+                    targets.append((off.j4_target, j4))
+
+                if not targets:
+                    log.warning(
+                        "send_joint_targets skipped – no valid target offsets configured."
+                    )
+                    return
+
+                min_offset = min(o for o, _ in targets)
+                max_offset = max(o for o, _ in targets)
+                buf_len = (max_offset - min_offset) + 4
+                buf = bytearray(buf_len)
+
+                for offset, val in targets:
+                    set_real(buf, offset - min_offset, val)
+
+                self._client.db_write(self._cfg.db_number, min_offset, buf)
 
                 # Pulse the START_AUTO bit to command motion execution
                 self.send_pulse(*ADDR.START_AUTO)
 
                 log.debug(
-                    "Joint targets written – J1=%.2f J2=%.2f J3=%.2f J4=%.2f. "
-                    "Triggered START_AUTO.",
+                    "Joint targets written to DB%d offset %d (len=%d bytes) – "
+                    "J1=%.2f J2=%.2f J3=%.2f J4=%.2f. Triggered START_AUTO.",
+                    self._cfg.db_number,
+                    min_offset,
+                    buf_len,
                     j1,
                     j2,
                     j3,
                     j4,
                 )
                 if self.tx_callback:
-                    self.tx_callback(
-                        f"Write Targets: J1={j1:.2f}°, J2={j2:.2f}°, "
-                        f"J3={j3:.2f}°, J4={j4:.2f}°"
-                    )
+                    if off.j4_target >= 0:
+                        self.tx_callback(
+                            f"Write Targets: J1={j1:.2f}°, J2={j2:.2f}°, "
+                            f"J3={j3:.2f}°, J4={j4:.2f}°"
+                        )
+                    else:
+                        self.tx_callback(
+                            f"Write Targets (3-DOF): J1={j1:.2f}°, J2={j2:.2f}°, "
+                            f"J3={j3:.2f}°"
+                        )
             except Exception as exc:
                 log.error("send_joint_targets failed: %s", exc)
                 self._mark_disconnected()

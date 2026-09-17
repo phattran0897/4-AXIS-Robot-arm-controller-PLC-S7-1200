@@ -3,18 +3,16 @@ src/robot/sorting_controller.py – Automated pick-and-place sorting controller.
 
 Contract
 --------
-The S7-1200 PLC executes its internal pick-and-place motion sequence
-autonomously once START_AUTO is pulsed and the classification bits are set.
-This controller orchestrates the *cycle* from the PC side:
+Implements the PC Master motion model:
+1. Writes classification result (GOOD/BAD) to the PLC Data Block.
+2. Computes IK targets for each waypoint (approach, pick, retreat, bin, place).
+3. Transmits joint targets to the PLC (via plc.send_joint_targets).
+4. Supervise motion by polling motion_done bit with timeout.
+5. Actuates gripper (GRIP) strictly after target arrival is confirmed.
+6. Returns robot to home pose and clears classification.
 
-1. Writes the classification result (GOOD/BAD) to the PLC.
-2. Pulses START_AUTO so the PLC begins its sequence.
-3. Mirrors the commanded joint targets (computed locally via IK) into the
-   DB for the GUI, while continuously monitoring PLC health (offline /
-   error flag / motion_done) between every step.
-
-If the PLC drops offline or raises its error flag mid-cycle, an exception
-is raised immediately so the caller can stop and surface the fault.
+Alternatively, execute_sort_plc_sequence() is available if the PLC is
+configured with an autonomous internal sequencer.
 """
 
 from __future__ import annotations
@@ -178,9 +176,14 @@ class SortingController:
             raise
 
     def execute_sort(self, pick_x: float, pick_y: float, result: SortResult) -> None:
-        """Execute a complete pick-and-place sorting cycle."""
+        """
+        Execute a complete pick-and-place sorting cycle under PC Master control.
+
+        Transmits joint targets for each waypoint sequentially, verifies motion_done
+        before each gripper action, and never triggers an uncoordinated PLC sequence.
+        """
         log.info(
-            "Starting sort cycle: Pick=(%.2f, %.2f), Result=%s",
+            "Starting PC Master sort cycle: Pick=(%.2f, %.2f), Result=%s",
             pick_x,
             pick_y,
             result.name,
@@ -193,14 +196,11 @@ class SortingController:
             # 0. Write classification to PLC (atomic bit-group write)
             self.plc.write_classification(result == SortResult.GOOD)
 
-            # TRIGGER PLC TO START ITS INTERNAL MOTION SEQUENCE
-            self.plc.send_pulse(*ADDR.START_AUTO)
-
-            # 1. Pick
+            # 1. Pick (approach -> lower -> close gripper -> retreat)
             self._state = RobotState.MOVING_PICK
             self._pick(pick_x, pick_y)
 
-            # 2. Place
+            # 2. Place (approach bin -> lower -> open gripper -> retreat)
             self._state = RobotState.MOVING_PLACE
             self._place(result)
 
@@ -217,12 +217,55 @@ class SortingController:
             # 4. Clear classification bits after cycle complete
             self.plc.clear_classification()
 
-            log.info("Sort cycle completed successfully.")
+            log.info("PC Master sort cycle completed successfully.")
 
         except Exception as exc:
             self._state = RobotState.ERROR
             self.plc.clear_classification()
             log.error("Error during sorting cycle: %s", exc)
+            raise
+
+    def execute_sort_plc_sequence(
+        self, pick_x: float, pick_y: float, result: SortResult
+    ) -> None:
+        """
+        Alternative sort execution for PLC autonomous sequence mode.
+        Isolated from PC Master mode to prevent race conditions.
+        """
+        log.info(
+            "Starting PLC sequence sort cycle: Pick=(%.2f, %.2f), Result=%s",
+            pick_x,
+            pick_y,
+            result.name,
+        )
+        try:
+            self._last_sort_result = result
+            self.plc.write_classification(result == SortResult.GOOD)
+            self.plc.send_pulse(*ADDR.START_AUTO)
+            self._state = RobotState.MOVING_PICK
+
+            # Wait for PLC sequence to complete
+            deadline = time.monotonic() + 60.0
+            while True:
+                status = self.plc.read_status()
+                if not status or status.get("error_flag", False):
+                    raise RuntimeError("PLC error during autonomous sequence.")
+                if status.get("motion_done", False):
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("PLC autonomous sequence timed out.")
+                self._wait_event.wait(0.1)
+
+            if result == SortResult.GOOD:
+                self._counter_good += 1
+            else:
+                self._counter_bad += 1
+            self.plc.clear_classification()
+            self._state = RobotState.IDLE
+        except Exception as exc:
+            self._state = RobotState.ERROR
+            self.plc.clear_classification()
+            log.error("PLC sequence cycle failed: %s", exc)
             raise
 
     def _pick(self, x: float, y: float) -> None:
@@ -306,20 +349,19 @@ class SortingController:
         timeout: float = 30.0,
     ) -> None:
         """
-        Mirror one commanded waypoint and supervise the PLC while it moves.
+        Command one waypoint to the PLC and wait for motion completion.
 
-        The PLC runs its own internal motion logic, so this method does NOT
-        stream trajectories.  It polls the status DB every 50 ms until the
-        earlier of ``motion_done`` being observed or the estimated travel
-        time (plus grace) elapsing, aborting immediately if the PLC goes
-        offline or raises its error flag.
+        Transmits (j1, j2, j3, j4) to the PLC via send_joint_targets(), then
+        polls the status DB every 50 ms until motion_done is observed or the
+        timeout expires. Aborts immediately if the PLC goes offline, raises
+        its error flag, or times out.
 
         Parameters
         ----------
         j1..j4:
-            Commanded joint angles in degrees (mirrored for the GUI).
+            Commanded joint angles in degrees.
         cmd:
-            Optional legacy command word to pulse (e.g. CMD_HOME).
+            Optional command word to pulse (e.g. CMD_HOME).
         timeout:
             Absolute upper bound on the wait in seconds.
         """
@@ -333,12 +375,20 @@ class SortingController:
             j4,
         )
 
+        # 1. Transmit joint targets to PLC
+        self.plc.send_joint_targets(j1, j2, j3, j4)
+
+        # 2. Issue optional specific command (e.g. HOME)
         if cmd is not None:
             self.plc.send_command(cmd)
 
         estimated = self._estimate_motion_seconds(target)
         deadline = time.monotonic() + min(timeout, estimated + _MOTION_GRACE_S)
 
+        # Allow brief settling time for PLC to register motion start
+        self._wait_event.wait(0.05)
+
+        motion_confirmed = False
         while True:
             status = self.plc.read_status()
             if not status:
@@ -346,13 +396,13 @@ class SortingController:
             if status.get("error_flag", False):
                 raise RuntimeError("PLC error flag activated during active motion.")
             if status.get("motion_done", False):
+                motion_confirmed = True
                 break
             if time.monotonic() >= deadline:
-                log.debug(
-                    "Motion window elapsed (%.2fs est.) – continuing cycle.",
-                    estimated,
+                raise TimeoutError(
+                    f"Motion to targets (J1={j1:.1f}°, J2={j2:.1f}°, J3={j3:.1f}°, J4={j4:.1f}°) "
+                    f"timed out after {estimated + _MOTION_GRACE_S:.1f}s without motion_done signal."
                 )
-                break
             self._wait_event.wait(0.05)
 
         self._previous_joints = target

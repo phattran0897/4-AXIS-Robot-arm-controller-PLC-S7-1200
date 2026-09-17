@@ -1,12 +1,13 @@
 """
-main.py – Application entry point for the 4-Axis Industrial Robot Control System.
+main.py – Application entry point for the 4-Axis Industrial Robot Control System (PySide6).
 
 Responsibilities
 ----------------
 * Bootstrap configuration, logging, PLC controller, and YOLO detector.
-* Manage the CustomTkinter page-routing container.
+* Manage the PySide6 QStackedWidget page-routing container.
 * Own the two background threads (PLC cyclic poll + AI/camera loop).
-* Provide a clean, deadlock-free shutdown via :class:`threading.Event`.
+* Provide thread-safe GUI updates via Qt Signals and Slots.
+* Provide a clean, deadlock-free shutdown via :class:`threading.Event` and closeEvent().
 """
 
 from __future__ import annotations
@@ -14,13 +15,27 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
-import customtkinter as ctk
-import tkinter
+import cv2
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QFont, QImage, QTextCursor
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QStackedWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 from src.ai.yolo_detector import YOLODetector
 from src.config_loader import RobotConfig, load_config
@@ -30,8 +45,15 @@ from src.robot.sorting_controller import SortResult, SortingController
 from src.ui.header import VAAFooter, VAAHeader, apply_app_icon
 from src.ui.page_auto import PageAuto
 from src.ui.page_manual import PageManual
-from src.ui.theme import ACCENT, CARD_BG, PANEL_BORDER
-from PIL import Image
+from src.ui.theme import (
+    ACCENT,
+    ACCENT_DIM,
+    CARD_BG,
+    GLOBAL_QSS,
+    PANEL_BORDER,
+    TEXT_DIM,
+    card_style,
+)
 
 # ---------------------------------------------------------------------------
 # Logging (console + rotating file under ./logs)
@@ -43,7 +65,7 @@ _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s – %(message)s"
 def _setup_logging() -> logging.Logger:
     """Attach console + rotating-file handlers exactly once."""
     robot_log = logging.getLogger("RobotApp")
-    if robot_log.handlers:  # Already configured (e.g. test_gui_no_plc import)
+    if robot_log.handlers:  # Already configured
         return robot_log
     robot_log.setLevel(logging.INFO)
 
@@ -77,12 +99,18 @@ _SORT_JOIN_TIMEOUT: float = 10.0
 _CAMERA_SWITCH_DEBOUNCE: float = 0.5  # seconds
 
 
-class RobotApp(ctk.CTk):
+class RobotApp(QMainWindow):
     """
-    Main application window.
+    Main application window (PySide6 QMainWindow).
 
     Owns all hardware controllers, background threads, and GUI page routing.
     """
+
+    # Qt Signals for thread-safe worker-to-UI dispatch
+    frame_ready = Signal(QImage)
+    plc_data_ready = Signal(dict)
+    tx_logged = Signal(str)
+    show_error_dialog = Signal(str)
 
     def __init__(self, cfg: RobotConfig) -> None:
         super().__init__()
@@ -105,11 +133,17 @@ class RobotApp(ctk.CTk):
         )
 
         # ── Window setup ────────────────────────────────────────────────────
-        ctk.set_appearance_mode(cfg.app.appearance_mode)
-        ctk.set_default_color_theme(cfg.app.color_theme)
-        self.title(cfg.app.title)
-        self.geometry(cfg.app.geometry)
-        apply_app_icon(self)  # Brand logo → window / taskbar icon
+        self.setWindowTitle(cfg.app.title)
+        if "x" in cfg.app.geometry:
+            try:
+                gw, gh = map(int, cfg.app.geometry.split("x"))
+                self.resize(gw, gh)
+            except Exception:
+                self.resize(1280, 820)
+        else:
+            self.resize(1280, 820)
+
+        apply_app_icon(self)
 
         # ── Hardware controllers ─────────────────────────────────────────────
         self.plc: PLCController = PLCController(cfg.plc)
@@ -122,6 +156,7 @@ class RobotApp(ctk.CTk):
             inference_width=cfg.camera.inference_width,
             inference_height=cfg.camera.inference_height,
             camera_read_timeout=cfg.camera.read_timeout,
+            calibration_path=cfg.yolo.calibration_path,
         )
         self.sorter: SortingController = SortingController(
             plc=self.plc,
@@ -138,90 +173,36 @@ class RobotApp(ctk.CTk):
         # ── Thread synchronisation ───────────────────────────────────────────
         self._stop_event: threading.Event = threading.Event()
 
-        # ── Camera switch debounce ───────────────────────────────────────────
-        self._camera_switch_timer: threading.Timer | None = None
+        # ── Camera switch debounce (QTimer on Qt loop) ────────────────────────
+        self._camera_timer: QTimer = QTimer(self)
+        self._camera_timer.setSingleShot(True)
+        self._pending_camera_choice: str = ""
+        self._camera_timer.timeout.connect(self._execute_pending_camera_switch)
 
         # ── Manual Capture Trigger (AI vision loop) ──────────────────────────
         self._manual_classify_trigger: threading.Event = threading.Event()
 
         # ── Post-sort cooldown (prevents rapid re-detection) ─────────────────
-        self._sort_cooldown_duration: float = (
-            3.0  # seconds to ignore detections after sort
+        self._sort_cooldown_duration: float = 3.0  # seconds
+        self._sort_cooldown_end: float = 0.0
+
+        # ── Signal / Slot connections ────────────────────────────────────────
+        self.frame_ready.connect(
+            self._on_frame_ready, Qt.ConnectionType.QueuedConnection
         )
-        self._sort_cooldown_end: float = 0.0  # monotonic time when cooldown expires
-
-        # ── GUI container + page routing ─────────────────────────────────────
-        self._container: ctk.CTkFrame = ctk.CTkFrame(self)
-        self._container.pack(side="top", fill="both", expand=True, padx=0, pady=0)
-        self._container.grid_rowconfigure(0, weight=0)  # Header
-        self._container.grid_rowconfigure(1, weight=1)  # Content
-        self._container.grid_columnconfigure(0, weight=1)
-
-        # Header
-        self.header: VAAHeader = VAAHeader(
-            parent=self._container,
-            controller=self,
+        self.plc_data_ready.connect(
+            self._dispatch_plc_data, Qt.ConnectionType.QueuedConnection
         )
-        self.header.pack(fill="x")
-
-        # Content area (pages)
-        self._content_area: ctk.CTkFrame = ctk.CTkFrame(
-            self._container, fg_color="#0F172A"
+        self.tx_logged.connect(self._on_tx_logged, Qt.ConnectionType.QueuedConnection)
+        self.show_error_dialog.connect(
+            self._show_hardware_error_dialog, Qt.ConnectionType.QueuedConnection
         )
-        self._content_area.pack(fill="both", expand=True)
-        self._content_area.grid_rowconfigure(0, weight=1)
-        self._content_area.grid_columnconfigure(0, weight=1)
 
-        # ── PLC Tx Console ──────────────────────────────────────────────────
-        self.tx_console_frame = ctk.CTkFrame(
-            self._container,
-            fg_color=CARD_BG,
-            border_color=PANEL_BORDER,
-            border_width=1,
-            corner_radius=12,
-        )
-        self.tx_console_frame.pack(fill="x", padx=20, pady=(0, 10))
-
-        # Title / header line
-        console_header = ctk.CTkFrame(self.tx_console_frame, fg_color="transparent")
-        console_header.pack(fill="x", padx=12, pady=(8, 4))
-
-        ctk.CTkLabel(
-            console_header,
-            text="PLC TRANSMISSION TELEMETRY",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=ACCENT,
-        ).pack(side="left")
-
-        # Textbox for scrolling log
-        self.tx_textbox = ctk.CTkTextbox(
-            self.tx_console_frame,
-            height=85,
-            font=ctk.CTkFont(family="Consolas", size=11),
-            fg_color="#020617",
-            text_color="#38BDF8",
-            border_width=0,
-            corner_radius=6,
-        )
-        self.tx_textbox.pack(fill="x", padx=12, pady=(0, 10))
-        self.tx_textbox.configure(state="disabled")
+        # ── GUI layout ───────────────────────────────────────────────────────
+        self._build_central_ui()
 
         # Wire up callback to PLCController
         self.plc.tx_callback = self.log_tx
-
-        # Footer
-        self.footer: VAAFooter = VAAFooter(parent=self._container)
-        self.footer.pack(fill="x", side="bottom")
-
-        self._current_page: str = "PageAuto"
-        self.frames: dict[str, PageAuto | PageManual] = {}
-        for PageClass in (PageAuto, PageManual):
-            name = PageClass.__name__
-            frame = PageClass(parent=self._content_area, controller=self)
-            self.frames[name] = frame
-            frame.grid(row=0, column=0, sticky="nsew")
-
-        self.show_frame("PageAuto")
 
         # ── Background threads ───────────────────────────────────────────────
         self._plc_thread: threading.Thread = threading.Thread(
@@ -240,18 +221,104 @@ class RobotApp(ctk.CTk):
         log.info("RobotApp initialised – all threads started.")
 
     # ------------------------------------------------------------------
-    # Thread-safe Tk dispatch
+    # GUI construction
     # ------------------------------------------------------------------
 
-    def _safe_after(self, milliseconds: int, func, *args) -> None:
-        """
-        Schedule *func* on the Tk main loop, ignoring the benign races that
-        occur when a background thread fires during window teardown.
-        """
-        try:
-            self.after(milliseconds, func, *args)
-        except (tkinter.TclError, RuntimeError) as exc:
-            log.debug("GUI dispatch skipped during shutdown: %s", exc)
+    def _build_central_ui(self) -> None:
+        central_widget = QWidget(self)
+        central_widget.setObjectName("CentralWidget")
+        self.setCentralWidget(central_widget)
+
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # Header
+        self.header: VAAHeader = VAAHeader(
+            parent=central_widget,
+            controller=self,
+            current_page="PageAuto",
+        )
+        main_layout.addWidget(self.header)
+
+        # Stacked pages
+        self.stacked_widget = QStackedWidget(central_widget)
+        self.frames: dict[str, PageAuto | PageManual] = {}
+
+        self.frames["PageAuto"] = PageAuto(parent=self.stacked_widget, controller=self)
+        self.frames["PageManual"] = PageManual(
+            parent=self.stacked_widget, controller=self
+        )
+
+        self.stacked_widget.addWidget(self.frames["PageAuto"])
+        self.stacked_widget.addWidget(self.frames["PageManual"])
+
+        main_layout.addWidget(self.stacked_widget, 1)
+
+        # ── PLC Tx Console ──────────────────────────────────────────────────
+        self.tx_console_frame = QFrame(central_widget)
+        self.tx_console_frame.setStyleSheet(card_style(CARD_BG, PANEL_BORDER, 12))
+        tx_layout = QVBoxLayout(self.tx_console_frame)
+        tx_layout.setContentsMargins(14, 8, 14, 10)
+        tx_layout.setSpacing(6)
+
+        # Title row with accent bar
+        title_row = QWidget(self.tx_console_frame)
+        title_row.setStyleSheet("background: transparent; border: none;")
+        tr_layout = QHBoxLayout(title_row)
+        tr_layout.setContentsMargins(0, 0, 0, 0)
+        tr_layout.setSpacing(8)
+
+        accent_bar = QFrame(title_row)
+        accent_bar.setFixedSize(3, 14)
+        accent_bar.setStyleSheet(
+            f"background-color: {ACCENT}; border-radius: 1px; border: none;"
+        )
+        tr_layout.addWidget(accent_bar)
+
+        lbl_console_title = QLabel(
+            "PLC TRANSMISSION TELEMETRY", title_row
+        )
+        lbl_console_title.setStyleSheet(
+            f"color: {ACCENT}; font-size: 11px; font-weight: bold; "
+            f"letter-spacing: 1px; border: none; background: transparent;"
+        )
+        tr_layout.addWidget(lbl_console_title)
+        tr_layout.addStretch()
+
+        lbl_tx_badge = QLabel("● LIVE", title_row)
+        lbl_tx_badge.setStyleSheet(
+            f"color: {ACCENT_DIM}; font-size: 10px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        tr_layout.addWidget(lbl_tx_badge)
+        tx_layout.addWidget(title_row)
+
+        # Scrolling text log
+        self.tx_textbox = QTextEdit(self.tx_console_frame)
+        self.tx_textbox.setFixedHeight(80)
+        self.tx_textbox.setReadOnly(True)
+        self.tx_textbox.setFont(QFont("Consolas", 10))
+        self.tx_textbox.setStyleSheet(
+            f"background-color: #020617; color: #38BDF8; "
+            f"border: 1px solid {PANEL_BORDER}; border-radius: 8px; padding: 6px;"
+        )
+        tx_layout.addWidget(self.tx_textbox)
+
+        # Outer wrapper with padding
+        tx_wrapper = QWidget(central_widget)
+        tx_wrapper.setStyleSheet("background: transparent; border: none;")
+        tx_w_layout = QVBoxLayout(tx_wrapper)
+        tx_w_layout.setContentsMargins(16, 4, 16, 8)
+        tx_w_layout.addWidget(self.tx_console_frame)
+        main_layout.addWidget(tx_wrapper)
+
+        # Footer
+        self.footer: VAAFooter = VAAFooter(parent=central_widget)
+        main_layout.addWidget(self.footer)
+
+        self._current_page: str = "PageAuto"
+        self.show_frame("PageAuto")
 
     # ------------------------------------------------------------------
     # Page routing
@@ -268,61 +335,46 @@ class RobotApp(ctk.CTk):
             log.warning("Unknown page requested: %s", page_name)
             return
         self._current_page = page_name
-        self.frames[page_name].tkraise()
+        self.stacked_widget.setCurrentWidget(self.frames[page_name])
         self.header.update_active_tab(page_name)
         log.debug("Switched to page: %s", page_name)
         if page_name == "PageAuto":
-            self.plc.send_pulse(*ADDR.AUTO_MODE)  # AUTO_MODE (offset 0.2)
+            self.plc.send_pulse(*ADDR.AUTO_MODE)
         elif page_name == "PageManual":
-            self.plc.send_pulse(*ADDR.MANUAL_MODE)  # MANUAL_MODE (offset 16.0)
+            self.plc.send_pulse(*ADDR.MANUAL_MODE)
 
     # ------------------------------------------------------------------
-    # Camera switching (debounced)
+    # Camera switching (debounced via QTimer)
     # ------------------------------------------------------------------
 
     def change_camera_source(self, choice_str: str) -> None:
-        """
-        Parse the combo-box selection string and debounce-switch the camera.
+        """Debounce camera switch request on the Qt event loop."""
+        self._pending_camera_choice = choice_str
+        self._camera_timer.start(int(_CAMERA_SWITCH_DEBOUNCE * 1000))
 
-        Expected format: ``"Camera <index>"``
-        e.g. ``"Camera 1"``
-        """
-        if self._camera_switch_timer is not None:
-            self._camera_switch_timer.cancel()
-
-        self._camera_switch_timer = threading.Timer(
-            _CAMERA_SWITCH_DEBOUNCE,
-            self._do_change_camera,
-            args=(choice_str,),
-        )
-        self._camera_switch_timer.start()
+    def _execute_pending_camera_switch(self) -> None:
+        if self._pending_camera_choice:
+            self._do_change_camera(self._pending_camera_choice)
 
     def _do_change_camera(self, choice_str: str) -> None:
-        """Actually perform the camera switch (called after debounce)."""
+        """Actually perform the camera switch."""
         match = re.search(r"\d+", choice_str)
         if not match:
             log.error("Cannot parse camera index from '%s'.", choice_str)
             return
         idx: int = int(match.group())
-
         success: bool = self.detector.switch_camera(idx)
-
         if success:
             log.info("Camera switched to index %d.", idx)
         else:
-            # Tkinter dialogs must run on the main thread – marshal safely.
-            self._safe_after(
-                0,
-                self._show_hardware_error_dialog,
+            self.show_error_dialog.emit(
                 f"Cannot open camera at index {idx}.\n"
-                "Check the device connection and try again.",
+                "Check the device connection and try again."
             )
 
     def _show_hardware_error_dialog(self, message: str) -> None:
-        """Show a hardware error box (main thread only)."""
-        from tkinter import messagebox
-
-        messagebox.showerror("Hardware Error", message, parent=self)
+        """Show hardware error box on main thread."""
+        QMessageBox.critical(self, "Hardware Error", message)
 
     def trigger_manual_classification(self) -> None:
         """Trigger a manual capture and classification cycle."""
@@ -336,14 +388,8 @@ class RobotApp(ctk.CTk):
     def _yolo_processing_loop(self) -> None:
         """
         Continuously capture frames and display them on the GUI with an ROI
-        overlay.  When ``_manual_classify_trigger`` is set, extracts the ROI,
-        runs YOLO inference, and dispatches the sorting cycle.
-
-        The GUI preview is throttled to ``camera.preview_fps`` to keep CPU
-        usage low; classification requests are always processed immediately.
+        overlay. Direct QImage conversion without PIL.
         """
-        import cv2
-
         cam_cfg = self.cfg.camera
         roi_x = self.cfg.yolo.roi_x
         roi_y = self.cfg.yolo.roi_y
@@ -374,9 +420,6 @@ class RobotApp(ctk.CTk):
                             self._handle_manual_classification(frame)
                             force_preview = True
 
-                        # Annotate + convert ONLY when the preview will
-                        # actually be redrawn – skipped ticks save the copy,
-                        # the overlay drawing, and the colour conversion.
                         now = time.monotonic()
                         if (
                             force_preview
@@ -384,16 +427,17 @@ class RobotApp(ctk.CTk):
                         ):
                             last_preview_time = now
 
-                            # Draw ROI overlay in place (frame is not reused)
+                            # Draw ROI overlay on a copy for display
+                            display_frame = frame.copy()
                             cv2.rectangle(
-                                frame,
+                                display_frame,
                                 (roi_x, roi_y),
                                 (roi_x + roi_w, roi_y + roi_h),
                                 (0, 255, 0),
                                 2,
                             )
                             cv2.putText(
-                                frame,
+                                display_frame,
                                 "ROI - Dat Hop Vao Day",
                                 (roi_x, roi_y - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -402,9 +446,17 @@ class RobotApp(ctk.CTk):
                                 2,
                             )
 
-                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            pil_image = Image.fromarray(rgb)
-                            self._update_video_label(pil_image)
+                            h, w, ch = display_frame.shape
+                            bytes_per_line = ch * w
+                            # Create thread-safe detached QImage
+                            qimg = QImage(
+                                display_frame.data,
+                                w,
+                                h,
+                                bytes_per_line,
+                                QImage.Format.Format_BGR888,
+                            ).copy()
+                            self.frame_ready.emit(qimg)
 
                     except Exception as frame_exc:
                         log.error(
@@ -422,33 +474,18 @@ class RobotApp(ctk.CTk):
         log.info("AI vision thread exited cleanly.")
 
     def _handle_manual_classification(self, frame: Any) -> None:
-        """
-        Run one classification cycle: crop the configured ROI, sharpen it,
-        run YOLO inference, and dispatch the sorting cycle when an object
-        is actually detected.
-        """
-        import cv2
-
+        """Run one classification cycle on cropped ROI."""
         roi_x = self.cfg.yolo.roi_x
         roi_y = self.cfg.yolo.roi_y
         roi_w = self.cfg.yolo.roi_width
         roi_h = self.cfg.yolo.roi_height
 
-        # Ensure ROI is within bounds
         fh, fw = frame.shape[:2]
         if roi_x >= fw or roi_y >= fh or roi_w <= 0 or roi_h <= 0:
-            log.warning(
-                "ROI (x=%d y=%d w=%d h=%d) lies outside %dx%d frame – "
-                "capture skipped.",
-                roi_x,
-                roi_y,
-                roi_w,
-                roi_h,
-                fw,
-                fh,
-            )
+            log.warning("ROI lies outside frame – capture skipped.")
             self.log_tx("Capture skipped: ROI outside camera frame.")
             return
+
         cx = max(0, min(roi_x, fw))
         cy = max(0, min(roi_y, fh))
         cw = max(1, min(roi_w, fw - cx))
@@ -456,11 +493,10 @@ class RobotApp(ctk.CTk):
 
         roi_crop = frame[cy : cy + ch, cx : cx + cw]
 
-        # Apply Unsharp Masking to sharpen ROI before inference
-        blurred = cv2.GaussianBlur(roi_crop, (0, 0), 2.0)
-        roi_crop = cv2.addWeighted(roi_crop, 1.5, blurred, -0.5, 0)
+        if getattr(self.cfg.camera, "enable_unsharp_mask", True):
+            blurred = cv2.GaussianBlur(roi_crop, (0, 0), 2.0)
+            roi_crop = cv2.addWeighted(roi_crop, 1.5, blurred, -0.5, 0)
 
-        # Run inference on crop
         result = self.detector.annotate_frame(roi_crop)
 
         if not result.has_defect:
@@ -469,7 +505,6 @@ class RobotApp(ctk.CTk):
             return
 
         sort_result = SortResult.BAD if result.class_id == 0 else SortResult.GOOD
-
         log.info(
             "Manual Capture: Object Classified as %s (class=%d, X=%.1fmm, Y=%.1fmm)",
             sort_result.name,
@@ -478,19 +513,10 @@ class RobotApp(ctk.CTk):
             result.robot_y,
         )
         self.log_tx(f"Classified: {sort_result.name} ({result.class_name or 'obj'})")
-
-        # Visual feedback handled by caller overlay; dispatch the cycle with
-        # the detected coordinates so picking is vision-guided.
         self._start_sort_cycle(result.robot_x, result.robot_y, sort_result)
 
     def _start_sort_cycle(self, rx: float, ry: float, result: SortResult) -> bool:
-        """
-        Launch the sorting cycle on a worker thread unless one is already
-        running or the post-sort cooldown is active.
-
-        Returns ``True`` if a cycle was started.
-        """
-        # Post-sort cooldown prevents immediate re-triggering on the same part
+        """Launch the sorting cycle on a worker thread."""
         remaining = self._sort_cooldown_end - time.monotonic()
         if remaining > 0:
             log.info("Sort suppressed – cooldown active for another %.1fs.", remaining)
@@ -514,15 +540,12 @@ class RobotApp(ctk.CTk):
         self, rx: float, ry: float, sort_result: SortResult
     ) -> None:
         """Execute sorting cycle, guarding against PLC faults."""
-        # E-stop gate: never start motion while the PLC reports an error
         status = self.plc.read_status()
         if status and status.get("error_flag", False):
             log.error("Sort aborted – PLC error flag is active.")
             self.log_tx("Sort ABORTED: PLC error flag active.")
             return
         if status and not status.get("auto_mode", True):
-            # Manual mode – pulsing START_AUTO here could combine with an
-            # operator's jog inputs into unintended motion.
             log.warning("Sort aborted – AUTO mode bit is off.")
             self.log_tx("Sort ABORTED: AUTO mode is off (manual mode).")
             return
@@ -532,90 +555,46 @@ class RobotApp(ctk.CTk):
         except Exception as exc:
             log.error("Sorting cycle failed: %s", exc)
         finally:
-            # Activate post-sort cooldown to prevent immediate re-detection
             self._sort_cooldown_end = time.monotonic() + self._sort_cooldown_duration
-            log.info(
-                "Post-sort cooldown activated (%.1fs).",
-                self._sort_cooldown_duration,
-            )
+            log.info("Post-sort cooldown activated (%.1fs).", self._sort_cooldown_duration)
 
     def clear_all_errors(self) -> None:
         """Clear errors on PLC and reset sorting controller state."""
         self.plc.send_command(self.cfg.plc.commands.idle)
         self.sorter.clear_error()
 
-    def _update_video_label(self, img: Image.Image) -> None:
-        """Push a new frame to whichever page is currently visible (thread-safe)."""
-        self._safe_after(0, self._do_update_video, img)
+    # ------------------------------------------------------------------
+    # Main thread slots
+    # ------------------------------------------------------------------
 
-    def _do_update_video(self, img: Image.Image) -> None:
-        """Internal method to update video label on main thread."""
-        page = self.frames.get(self._current_page)
-        if page is None:
-            return
-        try:
-            # Use dynamic size from video container (scales on fullscreen)
-            disp_w = getattr(
-                page, "_video_display_width", self.cfg.camera.display_width
-            )
-            disp_h = getattr(
-                page, "_video_display_height", self.cfg.camera.display_height
-            )
-
-            # Preserve aspect ratio while fitting into the container
-            orig_w, orig_h = img.size
-            if orig_w > 0 and orig_h > 0:
-                aspect = orig_w / orig_h
-                container_aspect = disp_w / disp_h
-
-                if aspect > container_aspect:
-                    # Image is wider than container, constrain by width
-                    target_w = disp_w
-                    target_h = int(disp_w / aspect)
-                else:
-                    # Image is taller than container, constrain by height
-                    target_h = disp_h
-                    target_w = int(disp_h * aspect)
-            else:
-                target_w, target_h = disp_w, disp_h
-
-            ctk_img = ctk.CTkImage(
-                light_image=img,
-                dark_image=img,
-                size=(target_w, target_h),
-            )
-            page.update_video(ctk_img)
-        except Exception as exc:
-            log.debug("Video label update skipped: %s", exc)
+    def _on_frame_ready(self, qimg: QImage) -> None:
+        """Deliver new frame to the currently active page."""
+        current_page = self.stacked_widget.currentWidget()
+        if hasattr(current_page, "update_video"):
+            current_page.update_video(qimg)
 
     def log_tx(self, message: str) -> None:
-        """Append a timestamped message to the transmission telemetry log (thread-safe)."""
+        """Emit telemetry message to be appended on the main thread."""
+        self.tx_logged.emit(message)
 
-        def _append():
-            timestamp = time.strftime("%H:%M:%S")
-            self.tx_textbox.configure(state="normal")
-            self.tx_textbox.insert("end", f"[{timestamp}] {message}\n")
-            self.tx_textbox.see("end")
-            content = self.tx_textbox.get("1.0", "end")
-            lines = content.splitlines()
-            if len(lines) > 100:
-                self.tx_textbox.delete("1.0", f"{len(lines) - 100}.0")
-            self.tx_textbox.configure(state="disabled")
-
-        self._safe_after(0, _append)
+    def _on_tx_logged(self, message: str) -> None:
+        """Append a timestamped message to the transmission telemetry log."""
+        timestamp = time.strftime("%H:%M:%S")
+        self.tx_textbox.append(f"[{timestamp}] {message}")
+        doc = self.tx_textbox.document()
+        if doc.blockCount() > 100:
+            cursor = self.tx_textbox.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
 
     # ------------------------------------------------------------------
     # Background thread: PLC cyclic poll with exponential backoff
     # ------------------------------------------------------------------
 
     def _cyclic_update(self) -> None:
-        """
-        Poll the PLC at the configured interval and push fresh data to
-        all page ``update_gui_data()`` callbacks via ``self.after()``.
-
-        Falls back to reconnection with exponential backoff when the PLC
-        is offline.  Runs until ``_stop_event`` is set.
-        """
+        """Poll PLC and emit status data via Qt Signal."""
         interval: float = self.cfg.app.plc_poll_interval
         retry_delay: float = interval
         max_retry_delay: float = 30.0
@@ -625,7 +604,7 @@ class RobotApp(ctk.CTk):
             if self.plc.is_connected():
                 data: dict[str, Any] = self.plc.read_status()
                 if data:
-                    self._safe_after(0, self._dispatch_plc_data, data)
+                    self.plc_data_ready.emit(data)
                 retry_delay = interval
                 consecutive_failures = 0
             else:
@@ -655,7 +634,6 @@ class RobotApp(ctk.CTk):
             except Exception as exc:
                 log.debug("update_gui_data error on %s: %s", type(frame).__name__, exc)
 
-        # Update footer status
         plc_connected = self.plc.is_connected()
         camera_active = (
             self.detector.is_camera_active()
@@ -666,29 +644,35 @@ class RobotApp(ctk.CTk):
         self.footer.update_status(plc_connected, camera_active, system_ok)
 
     # ------------------------------------------------------------------
+    # Compatibility methods
+    # ------------------------------------------------------------------
+
+    def title(self, title_str: str) -> None:
+        self.setWindowTitle(title_str)
+
+    def protocol(self, name: str, func: Any) -> None:
+        pass
+
+    def mainloop(self) -> int:
+        self.show()
+        qapp = QApplication.instance()
+        return qapp.exec() if qapp else 0
+
+    def on_closing(self) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
 
-    def on_closing(self) -> None:
-        """
-        Graceful shutdown sequence:
-
-        1. Signal all background threads to stop via ``_stop_event``.
-        2. Let an in-flight sort cycle finish (bounded wait) BEFORE cutting
-           PLC comms — disconnecting first would abort the robot mid-motion
-           with an undefined gripper state.
-        3. Release hardware resources (camera, PLC socket).
-        4. Join remaining threads with a timeout to prevent hangs.
-        5. Destroy the Tk window.
-        """
-        log.info("Shutdown initiated…")
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Graceful shutdown on window close."""
+        log.info("Shutdown initiated via closeEvent...")
         self._stop_event.set()
 
-        if self._camera_switch_timer is not None:
-            self._camera_switch_timer.cancel()
+        if hasattr(self, "_camera_timer") and self._camera_timer.isActive():
+            self._camera_timer.stop()
 
-        # Wait for active sorting thread to complete gracefully while the
-        # PLC connection is still alive.
         if self._sort_thread is not None and self._sort_thread.is_alive():
             log.info("Waiting for active sorting thread to complete...")
             self._sort_thread.join(timeout=_SORT_JOIN_TIMEOUT)
@@ -702,8 +686,8 @@ class RobotApp(ctk.CTk):
                 if thread.is_alive():
                     log.warning("Thread '%s' did not exit within timeout.", thread.name)
 
-        log.info("All threads stopped. Destroying window.")
-        self.destroy()
+        log.info("All threads stopped. Window closing.")
+        event.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -711,7 +695,10 @@ class RobotApp(ctk.CTk):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyleSheet(GLOBAL_QSS)
+
     config: RobotConfig = load_config()
-    app = RobotApp(cfg=config)
-    app.protocol("WM_DELETE_WINDOW", app.on_closing)
-    app.mainloop()
+    main_window = RobotApp(cfg=config)
+    main_window.show()
+    sys.exit(app.exec())

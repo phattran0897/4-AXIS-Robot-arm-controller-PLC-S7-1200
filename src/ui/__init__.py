@@ -1,1 +1,1 @@
-"""src.ui – CustomTkinter GUI pages sub-package."""
+"""src.ui – PySide6 GUI pages sub-package."""
