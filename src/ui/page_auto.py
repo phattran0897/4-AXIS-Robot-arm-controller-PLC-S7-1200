@@ -125,15 +125,17 @@ class PageAuto(BasePage):
 
         self.build_section_header(frame, "⚡", "CONTROL PANEL", ACCENT)
 
+        layout.addStretch(1)
+
         btn_frame = QWidget(frame)
         btn_frame.setStyleSheet("background: transparent; border: none;")
         btn_layout = QVBoxLayout(btn_frame)
-        btn_layout.setContentsMargins(12, 6, 12, 12)
-        btn_layout.setSpacing(8)
+        btn_layout.setContentsMargins(15, 12, 15, 20)
+        btn_layout.setSpacing(20)
 
         # START button
         self.btn_start = QPushButton("▶   START AUTO", btn_frame)
-        self.btn_start.setFixedHeight(48)
+        self.btn_start.setFixedHeight(54)
         self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_start.setStyleSheet(
             btn_style(SUCCESS, SUCCESS_HOVER, radius=12, font_size=14)
@@ -147,7 +149,7 @@ class PageAuto(BasePage):
 
         # PAUSE button
         self.btn_pause = QPushButton("⏸   PAUSE", btn_frame)
-        self.btn_pause.setFixedHeight(48)
+        self.btn_pause.setFixedHeight(54)
         self.btn_pause.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_pause.setStyleSheet(
             btn_style(WARNING, "#D97706", radius=12, font_size=14)
@@ -163,7 +165,7 @@ class PageAuto(BasePage):
         status_card = QFrame(btn_frame)
         status_card.setStyleSheet(card_style(ROW_BG, PANEL_BORDER, 10))
         sc_layout = QVBoxLayout(status_card)
-        sc_layout.setContentsMargins(12, 10, 12, 10)
+        sc_layout.setContentsMargins(12, 16, 12, 16)
 
         self.lbl_operation = QLabel("● IDLE", status_card)
         self.lbl_operation.setStyleSheet(
@@ -175,7 +177,7 @@ class PageAuto(BasePage):
 
         # Capture & Classify button
         self.btn_capture = QPushButton("📸   CHỤP & PHÂN LOẠI", btn_frame)
-        self.btn_capture.setFixedHeight(48)
+        self.btn_capture.setFixedHeight(54)
         self.btn_capture.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_capture.setStyleSheet(
             btn_style(INFO, "#2563EB", radius=12, font_size=13)
@@ -189,7 +191,7 @@ class PageAuto(BasePage):
 
         # Reset counters button
         btn_reset = QPushButton("🔄   RESET COUNTERS", btn_frame)
-        btn_reset.setFixedHeight(36)
+        btn_reset.setFixedHeight(44)
         btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_reset.setStyleSheet(
             btn_style(
@@ -203,9 +205,9 @@ class PageAuto(BasePage):
         )
         btn_reset.clicked.connect(self._on_reset_counters)
         btn_layout.addWidget(btn_reset)
-        btn_layout.addStretch()
 
         layout.addWidget(btn_frame)
+        layout.addStretch(1)
 
         if parent.layout() is not None:
             parent.layout().addWidget(frame)
@@ -219,7 +221,9 @@ class PageAuto(BasePage):
         layout.setContentsMargins(8, 8, 8, 12)
         layout.setSpacing(6)
 
-        self.build_section_header(frame, "📊", "JOINT STATUS", ACCENT)
+        self.build_section_header(frame, "⚙", "JOINT STATUS", ACCENT)
+
+        layout.addStretch(1)
 
         data_frame = QWidget(frame)
         data_frame.setStyleSheet("background: transparent; border: none;")
@@ -287,7 +291,7 @@ class PageAuto(BasePage):
 
         lbl_g_title = QLabel("✅ TỐT", good_card)
         lbl_g_title.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 10px; font-weight: bold; "
+            f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; "
             f"border: none; background: transparent;"
         )
         lbl_g_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -295,7 +299,7 @@ class PageAuto(BasePage):
 
         self.lbl_good = QLabel("0", good_card)
         self.lbl_good.setStyleSheet(
-            f"color: {SUCCESS}; font-size: 22px; font-weight: bold; "
+            f"color: {SUCCESS}; font-size: 28px; font-weight: bold; "
             f"border: none; background: transparent;"
         )
         self.lbl_good.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -311,7 +315,7 @@ class PageAuto(BasePage):
 
         lbl_b_title = QLabel("❌ XẤU", bad_card)
         lbl_b_title.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 10px; font-weight: bold; "
+            f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; "
             f"border: none; background: transparent;"
         )
         lbl_b_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -319,7 +323,7 @@ class PageAuto(BasePage):
 
         self.lbl_bad = QLabel("0", bad_card)
         self.lbl_bad.setStyleSheet(
-            f"color: {DANGER}; font-size: 22px; font-weight: bold; "
+            f"color: {DANGER}; font-size: 28px; font-weight: bold; "
             f"border: none; background: transparent;"
         )
         self.lbl_bad.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -327,9 +331,9 @@ class PageAuto(BasePage):
         stats_layout.addWidget(bad_card)
 
         data_layout.addWidget(stats_widget)
-        data_layout.addStretch()
 
         layout.addWidget(data_frame)
+        layout.addStretch(1)
 
         if parent.layout() is not None:
             parent.layout().addWidget(frame)

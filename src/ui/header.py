@@ -189,8 +189,15 @@ class VAAHeader(QWidget):
         )
         setattr(self._btn_manual, "cget", lambda k: self._btn_manual.text() if k == "text" else "")
 
+        self._btn_settings = QPushButton("SETTINGS", tabs_widget)
+        self._btn_settings.setFixedSize(126, 38)
+        self._btn_settings.clicked.connect(
+            lambda: self.controller.show_frame("PageSettings") if self.controller else None
+        )
+
         tabs_layout.addWidget(self._btn_auto)
         tabs_layout.addWidget(self._btn_manual)
+        tabs_layout.addWidget(self._btn_settings)
         main_layout.addWidget(tabs_widget)
 
         # Apply initial highlight

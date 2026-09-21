@@ -327,17 +327,108 @@ def main() -> None:
     # 5. Create and run the app (it will use MockPLCController)
     from main import RobotApp
 
+    def custom_yolo_processing_loop(self) -> None:
+        """
+        Custom loop for testing that detects on the whole frame directly 
+        instead of waiting for a manual trigger on an ROI.
+        """
+        import time
+        from PySide6.QtGui import QImage
+        
+        cam_cfg = self.cfg.camera
+        preview_interval: float = 1.0 / max(cam_cfg.preview_fps, 1)
+        last_preview_time: float = 0.0
+
+        try:
+            if not self.detector.start_camera(cam_cfg.default_index):
+                log.error(
+                    "Cannot open default camera (index %d).", cam_cfg.default_index
+                )
+
+            frame_interval: float = 1.0 / max(cam_cfg.fps, 1)
+
+            while not self._stop_event.is_set():
+                frame = self.detector.read_frame()
+
+                if frame is not None:
+                    try:
+                        now = time.monotonic()
+                        if (now - last_preview_time) >= preview_interval:
+                            last_preview_time = now
+
+                            # Apply unsharp mask to improve detection (same as original code)
+                            import cv2
+                            if getattr(cam_cfg, "enable_unsharp_mask", True):
+                                blurred = cv2.GaussianBlur(frame, (0, 0), 2.0)
+                                frame_to_detect = cv2.addWeighted(frame, 1.5, blurred, -0.5, 0)
+                            else:
+                                frame_to_detect = frame
+
+                            # DIRECT DETECTION (Full frame, no ROI)
+                            result = self.detector.annotate_frame(frame_to_detect)
+                            
+                            # Handle manual capture trigger using the full-frame result
+                            if self._manual_classify_trigger.is_set():
+                                self._manual_classify_trigger.clear()
+                                if not result.has_defect:
+                                    log.info("Manual Capture: no object detected above threshold – skipped.")
+                                    self.log_tx("Capture: no object detected – sort skipped.")
+                                else:
+                                    from src.robot.sorting_controller import SortResult
+                                    sort_result = SortResult.BAD if result.class_id == 0 else SortResult.GOOD
+                                    log.info(
+                                        "Manual Capture (Full Frame): Object Classified as %s (class=%d, X=%.1fmm, Y=%.1fmm)",
+                                        sort_result.name,
+                                        result.class_id,
+                                        result.robot_x,
+                                        result.robot_y,
+                                    )
+                                    self.log_tx(f"Classified: {sort_result.name} ({result.class_name or 'obj'})")
+                                    self._start_sort_cycle(result.robot_x, result.robot_y, sort_result)
+                            
+                            if result.annotated_frame is not None:
+                                display_frame = result.annotated_frame
+                            else:
+                                display_frame = frame_to_detect.copy()
+
+                            if not self._frame_pending:
+                                self._frame_pending = True
+                                h, w, ch = display_frame.shape
+                                bytes_per_line = ch * w
+                                qimg = QImage(
+                                    display_frame.data,
+                                    w,
+                                    h,
+                                    bytes_per_line,
+                                    QImage.Format.Format_BGR888,
+                                ).copy()
+                                self.frame_ready.emit(qimg)
+
+                    except Exception as frame_exc:
+                        log.error(
+                            "Exception during frame processing: %s",
+                            frame_exc,
+                            exc_info=True,
+                        )
+
+                self._stop_event.wait(frame_interval)
+        except Exception as thread_exc:
+            log.critical(
+                "AIVisionThread crashed with exception: %s", thread_exc, exc_info=True
+            )
+
+        log.info("AI vision thread (test mode) exited cleanly.")
+
+    # Patch the loop before instantiation
+    RobotApp._yolo_processing_loop = custom_yolo_processing_loop
+    
     app = RobotApp(cfg=config)
     app.setWindowTitle(config.app.title + "  [🧪 TEST MODE – No PLC]")
 
     log.info("=" * 60)
     log.info("  🧪  TEST MODE ACTIVE – Mock PLC (no real PLC needed)")
     log.info("  📷  Camera + YOLO are LIVE (real hardware)")
-    log.info(
-        "  📸  Manual Capture Mode ACTIVE (ROI: %dx%d)",
-        config.yolo.roi_width,
-        config.yolo.roi_height,
-    )
+    log.info("  📸  Direct Frame Detection ACTIVE (ROI bypassed)")
     log.info("  ⏳  Post-sort cooldown: %.1fs", app._sort_cooldown_duration)
     log.info("=" * 60)
 

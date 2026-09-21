@@ -152,6 +152,7 @@ class PageManual(BasePage):
         layout.setSpacing(8)
 
         self.build_section_header(frame, "🎯", "KINEMATICS INPUT", MANUAL_ACCENT)
+        layout.addStretch(1)
 
         # Mode toggle – two buttons: THUẬN (16.5) and NGHỊCH (16.6)
         mode_widget = QWidget(frame)
@@ -301,10 +302,8 @@ class PageManual(BasePage):
         )
         self.btn_elbow_down.clicked.connect(lambda: self._set_elbow("down"))
         el_layout.addWidget(self.btn_elbow_down)
-        el_layout.addStretch()
 
         ik_l_layout.addWidget(elbow_widget)
-        ik_l_layout.addStretch()
         ik_layout.addWidget(ik_left, 1)
 
         # IK Right: RESULT
@@ -323,7 +322,7 @@ class PageManual(BasePage):
         self.lbl_ik_j2 = self.create_data_row(ik_right, "θ₂", "--- °", SUCCESS)
         self.lbl_ik_j3 = self.create_data_row(ik_right, "θ₃", "--- °", SUCCESS)
         self.lbl_ik_j4 = self.create_data_row(ik_right, "θ₄", "--- °", SUCCESS)
-        ik_r_layout.addStretch()
+        
         ik_layout.addWidget(ik_right, 1)
 
         self._entry_container_layout.addWidget(self._ik_frame)
@@ -356,7 +355,7 @@ class PageManual(BasePage):
         btn_row_layout.addWidget(btn_send, 1)
 
         layout.addWidget(btn_row)
-        layout.addStretch()
+        layout.addStretch(1)
 
         if parent.layout() is not None:
             parent.layout().addWidget(frame)
@@ -394,12 +393,12 @@ class PageManual(BasePage):
 
         btn_frame = QWidget(frame)
         btn_layout = QVBoxLayout(btn_frame)
-        btn_layout.setContentsMargins(15, 6, 15, 12)
-        btn_layout.setSpacing(8)
+        btn_layout.setContentsMargins(15, 12, 15, 12)
+        btn_layout.setSpacing(12)
 
         # HOME button
         btn_home = QPushButton("🏠   MOVE TO HOME", btn_frame)
-        btn_home.setFixedHeight(46)
+        btn_home.setFixedHeight(54)
         btn_home.setStyleSheet(
             btn_style(INFO, "#2563EB", radius=10, font_size=13)
         )
@@ -417,7 +416,7 @@ class PageManual(BasePage):
         grip_layout.setSpacing(8)
 
         btn_pick = QPushButton("✊   GẮP VẬT", grip_widget)
-        btn_pick.setFixedHeight(46)
+        btn_pick.setFixedHeight(54)
         btn_pick.setStyleSheet(
             btn_style(SUCCESS, SUCCESS_HOVER, radius=10, font_size=12)
         )
@@ -429,7 +428,7 @@ class PageManual(BasePage):
         grip_layout.addWidget(btn_pick, 1)
 
         btn_rel = QPushButton("🖐   NHẢ VẬT", grip_widget)
-        btn_rel.setFixedHeight(46)
+        btn_rel.setFixedHeight(54)
         btn_rel.setStyleSheet(
             btn_style("#475569", "#64748B", radius=10, font_size=12)
         )
@@ -443,7 +442,7 @@ class PageManual(BasePage):
 
         # STOP button
         btn_stop = QPushButton("⏹   STOP ROBOT", btn_frame)
-        btn_stop.setFixedHeight(46)
+        btn_stop.setFixedHeight(54)
         btn_stop.setStyleSheet(
             btn_style(DANGER, DANGER_HOVER, radius=10, font_size=13)
         )
@@ -515,8 +514,8 @@ class PageManual(BasePage):
 
             btn_layout.addWidget(row_widget)
 
-        btn_layout.addStretch()
         layout.addWidget(btn_frame)
+        layout.addStretch(1)
 
         if parent.layout() is not None:
             parent.layout().addWidget(frame)

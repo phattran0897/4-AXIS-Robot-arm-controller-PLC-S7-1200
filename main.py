@@ -45,6 +45,7 @@ from src.robot.sorting_controller import SortResult, SortingController
 from src.ui.header import VAAFooter, VAAHeader, apply_app_icon
 from src.ui.page_auto import PageAuto
 from src.ui.page_manual import PageManual
+from src.ui.page_settings import PageSettings
 from src.ui.theme import (
     ACCENT,
     ACCENT_DIM,
@@ -217,6 +218,8 @@ class RobotApp(QMainWindow):
         )
         self._plc_thread.start()
         self._ai_thread.start()
+        
+        self._frame_pending = False
 
         log.info("RobotApp initialised – all threads started.")
 
@@ -243,15 +246,19 @@ class RobotApp(QMainWindow):
 
         # Stacked pages
         self.stacked_widget = QStackedWidget(central_widget)
-        self.frames: dict[str, PageAuto | PageManual] = {}
+        self.frames = {}
 
         self.frames["PageAuto"] = PageAuto(parent=self.stacked_widget, controller=self)
         self.frames["PageManual"] = PageManual(
             parent=self.stacked_widget, controller=self
         )
+        self.frames["PageSettings"] = PageSettings(
+            parent=self.stacked_widget, controller=self
+        )
 
         self.stacked_widget.addWidget(self.frames["PageAuto"])
         self.stacked_widget.addWidget(self.frames["PageManual"])
+        self.stacked_widget.addWidget(self.frames["PageSettings"])
 
         main_layout.addWidget(self.stacked_widget, 1)
 
@@ -447,16 +454,18 @@ class RobotApp(QMainWindow):
                             )
 
                             h, w, ch = display_frame.shape
-                            bytes_per_line = ch * w
-                            # Create thread-safe detached QImage
-                            qimg = QImage(
-                                display_frame.data,
-                                w,
-                                h,
-                                bytes_per_line,
-                                QImage.Format.Format_BGR888,
-                            ).copy()
-                            self.frame_ready.emit(qimg)
+                            if not self._frame_pending:
+                                self._frame_pending = True
+                                h, w, ch = display_frame.shape
+                                bytes_per_line = ch * w
+                                qimg = QImage(
+                                    display_frame.data,
+                                    w,
+                                    h,
+                                    bytes_per_line,
+                                    QImage.Format.Format_BGR888,
+                                ).copy()  # Deep copy is essential because display_frame is temporary
+                                self.frame_ready.emit(qimg)
 
                     except Exception as frame_exc:
                         log.error(
@@ -569,6 +578,7 @@ class RobotApp(QMainWindow):
 
     def _on_frame_ready(self, qimg: QImage) -> None:
         """Deliver new frame to the currently active page."""
+        self._frame_pending = False
         current_page = self.stacked_widget.currentWidget()
         if hasattr(current_page, "update_video"):
             current_page.update_video(qimg)

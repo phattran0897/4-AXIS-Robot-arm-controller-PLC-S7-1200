@@ -141,6 +141,8 @@ class YOLODetector:
         self.camera_read_timeout: float = camera_read_timeout
         self._cap: cv2.VideoCapture | None = None
         self._current_idx: int = 0
+        self._last_robot_x: float | None = None
+        self._last_robot_y: float | None = None
 
         # Camera intrinsics calibration (optional)
         self._camera_matrix: np.ndarray | None = None
@@ -637,6 +639,7 @@ class YOLODetector:
         class_name = ""
         detection_count = 0
 
+        has_defect_hysteresis_set = False
         for i in range(len(boxes)):
             xyxy: np.ndarray = boxes[i].xyxy.cpu().numpy().squeeze()
             if xyxy.ndim == 0 or xyxy.size != 4:
@@ -659,19 +662,31 @@ class YOLODetector:
                 else f"class_{cls_id}"
             )
 
+            # Per-box coordinates for the overlay label (robot_x/robot_y keep
+            # the FIRST detection's values as the returned pick target).
+            box_robot_x = self.home_x + (defect_cx - frame_cx) * self.px2mm
+            box_robot_y = self.home_y + (defect_cy - frame_cy) * self.px2mm
+
+            # Apply coordinate hysteresis to stabilize stationary objects (reduce UI jitter)
+            if self._last_robot_x is not None and self._last_robot_y is not None:
+                if abs(box_robot_x - self._last_robot_x) < 3.0 and abs(box_robot_y - self._last_robot_y) < 3.0:
+                    box_robot_x = self._last_robot_x
+                    box_robot_y = self._last_robot_y
+            
+            # Store the stabilized coordinates of the first detected object to use as hysteresis center
+            if not has_defect_hysteresis_set:
+                self._last_robot_x = box_robot_x
+                self._last_robot_y = box_robot_y
+                has_defect_hysteresis_set = True
+
             if not has_defect:
-                robot_x = self.home_x + (defect_cx - frame_cx) * self.px2mm
-                robot_y = self.home_y + (defect_cy - frame_cy) * self.px2mm
+                robot_x = box_robot_x
+                robot_y = box_robot_y
                 class_id = cls_id
                 class_name = cls_name
                 has_defect = True
 
             detection_count += 1
-
-            # Per-box coordinates for the overlay label (robot_x/robot_y keep
-            # the FIRST detection's values as the returned pick target).
-            box_robot_x = self.home_x + (defect_cx - frame_cx) * self.px2mm
-            box_robot_y = self.home_y + (defect_cy - frame_cy) * self.px2mm
 
             # Determine quality label based on class_id
             # Model class mapping: 0 = Defect (XAU), 1 = Good (TOT)

@@ -463,3 +463,66 @@ def load_config(path: str | None = None) -> RobotConfig:
         app=app_cfg,
         sort_positions=sort_cfg,
     )
+
+
+def save_config(config: RobotConfig, path: str = _DEFAULT_CONFIG_PATH) -> None:
+    """
+    Save the runtime configuration back to YAML.
+    Uses regex replacements to preserve comments and file structure.
+    """
+    import re
+    
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    updates = {
+        ("yolo", "thresh"): config.yolo.thresh,
+        ("yolo", "px2mm"): config.yolo.px2mm,
+        ("yolo", "roi_x"): config.yolo.roi_x,
+        ("yolo", "roi_y"): config.yolo.roi_y,
+        ("yolo", "roi_width"): config.yolo.roi_width,
+        ("yolo", "roi_height"): config.yolo.roi_height,
+        ("app", "move_cooldown"): config.app.move_cooldown,
+        ("app", "plc_poll_interval"): config.app.plc_poll_interval,
+        ("sort_positions", "pick_z_down"): config.sort_positions.pick_z_down,
+        ("sort_positions", "pick_z_up"): config.sort_positions.pick_z_up,
+        ("place_good", "z_down"): config.sort_positions.place_good.z_down,
+        ("place_good", "z_up"): config.sort_positions.place_good.z_up,
+        ("place_bad", "z_down"): config.sort_positions.place_bad.z_down,
+        ("place_bad", "z_up"): config.sort_positions.place_bad.z_up,
+    }
+
+    current_section = None
+    current_subsection = None
+
+    for i, line in enumerate(lines):
+        sec_match = re.match(r"^([a-zA-Z0-9_]+):", line)
+        if sec_match:
+            current_section = sec_match.group(1)
+            current_subsection = None
+            continue
+
+        subsec_match = re.match(r"^\s{2}([a-zA-Z0-9_]+):", line)
+        if subsec_match and current_section == "sort_positions":
+            current_subsection = subsec_match.group(1)
+            continue
+
+        kv_match = re.match(r"^(\s+)([a-zA-Z0-9_]+):\s*([^#\n\r]+)(.*)$", line)
+        if kv_match:
+            indent = kv_match.group(1)
+            key = kv_match.group(2)
+            tail = kv_match.group(4)
+
+            lookup = None
+            if current_section == "sort_positions" and current_subsection in ("place_good", "place_bad"):
+                lookup = (current_subsection, key)
+            else:
+                lookup = (current_section, key)
+
+            if lookup in updates:
+                new_val = updates[lookup]
+                new_val_str = "true" if new_val is True else "false" if new_val is False else str(new_val)
+                lines[i] = f"{indent}{key}: {new_val_str} {tail}\n".replace("  \n", "\n")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(lines)

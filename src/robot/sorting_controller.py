@@ -281,9 +281,13 @@ class SortingController:
             ", ".join(f"{a:.2f}" for a in j_down),
         )
 
-        # Move to XY at z_up, lower to z_down
+        # Move to pick XY at z_up, then linearly interpolate down to z_down
         self._move_and_wait(*j_up)
-        self._move_and_wait(*j_down)
+        self._move_l_and_wait(
+            x, y, self.positions.pick_z_up,
+            x, y, self.positions.pick_z_down,
+            steps=5
+        )
 
         # Actuate gripper close
         self._state = RobotState.GRIPPING
@@ -291,9 +295,13 @@ class SortingController:
         self.plc.write_bit(*ADDR.GRIP, True)
         self._wait_event.wait(self.positions.gripper_delay)
 
-        # Raise back to z_up
+        # Raise back to z_up linearly
         self._state = RobotState.MOVING_PICK
-        self._move_and_wait(*j_up)
+        self._move_l_and_wait(
+            x, y, self.positions.pick_z_down,
+            x, y, self.positions.pick_z_up,
+            steps=5
+        )
 
     def _place(self, result: SortResult) -> None:
         """Move to designated bin, lower Z, release target, and raise Z."""
@@ -312,9 +320,13 @@ class SortingController:
             ", ".join(f"{a:.2f}" for a in j_down),
         )
 
-        # Move to placement XY at z_up, lower to z_down
+        # Move to placement XY at z_up, then linearly interpolate down to z_down
         self._move_and_wait(*j_up)
-        self._move_and_wait(*j_down)
+        self._move_l_and_wait(
+            target.x, target.y, target.z_up,
+            target.x, target.y, target.z_down,
+            steps=5
+        )
 
         # Actuate gripper open
         self._state = RobotState.RELEASING
@@ -322,9 +334,13 @@ class SortingController:
         self.plc.write_bit(*ADDR.GRIP, False)
         self._wait_event.wait(self.positions.gripper_delay)
 
-        # Raise back to z_up
+        # Raise back to z_up linearly
         self._state = RobotState.MOVING_PLACE
-        self._move_and_wait(*j_up)
+        self._move_l_and_wait(
+            target.x, target.y, target.z_down,
+            target.x, target.y, target.z_up,
+            steps=5
+        )
 
     def _return_home(self) -> None:
         """Bring all joints back to home coordinates and idle state."""
@@ -338,6 +354,34 @@ class SortingController:
         """Estimate travel time from the largest joint delta (deg/s model)."""
         delta = max(abs(t - c) for t, c in zip(target, self._previous_joints))
         return max(0.5, delta / _JOINT_SPEED_DPS)
+
+    def _move_l_and_wait(
+        self,
+        x0: float,
+        y0: float,
+        z0: float,
+        x1: float,
+        y1: float,
+        z1: float,
+        steps: int = 5,
+        timeout: float = 30.0,
+    ) -> None:
+        """
+        Cartesian linear interpolation between two points.
+        Divides the path into multiple waypoints to guarantee a straight line.
+        """
+        log.info(
+            "MoveL from (%.1f, %.1f, %.1f) to (%.1f, %.1f, %.1f) in %d steps",
+            x0, y0, z0, x1, y1, z1, steps
+        )
+        for i in range(1, steps + 1):
+            t = i / float(steps)
+            x_step = x0 + (x1 - x0) * t
+            y_step = y0 + (y1 - y0) * t
+            z_step = z0 + (z1 - z0) * t
+            
+            j1, j2, j3, j4 = self._ik(x_step, y_step, z_step)
+            self._move_and_wait(j1, j2, j3, j4, timeout=timeout)
 
     def _move_and_wait(
         self,

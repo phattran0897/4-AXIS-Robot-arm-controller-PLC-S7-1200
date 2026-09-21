@@ -214,11 +214,11 @@ class BasePage(QWidget):
         row_frame = QFrame(parent)
         row_frame.setStyleSheet(card_style(ROW_BG, PANEL_BORDER, 10))
         row_layout = QHBoxLayout(row_frame)
-        row_layout.setContentsMargins(12, 7, 12, 7)
+        row_layout.setContentsMargins(16, 12, 16, 12)
 
         name_label = QLabel(name, row_frame)
         name_label.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; "
+            f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; "
             f"border: none; background: transparent;"
         )
         row_layout.addWidget(name_label)
@@ -230,7 +230,7 @@ class BasePage(QWidget):
         val_label = QLabel(value, row_frame)
         val_label.setStyleSheet(
             f"color: {color}; font-family: '{font_family}', monospace; "
-            f"font-size: 13px; font-weight: bold; border: none; background: transparent;"
+            f"font-size: 16px; font-weight: bold; border: none; background: transparent;"
         )
         row_layout.addWidget(val_label)
 
