@@ -2,7 +2,7 @@
 
 A production-grade Python application for automated defect detection and
 robotic pick-and-sort using **YOLOv11**, a **Siemens S7-1200 PLC**, and a
-**CustomTkinter** GUI.
+**PySide6** GUI.
 
 ```
 Camera → YOLODetector (YOLO inference)
@@ -44,9 +44,10 @@ Camera → YOLODetector (YOLO inference)
 │   ├── plc/
 │   │   └── plc_controller.py    # snap7 S7-1200 wrapper; atomic writes
 │   └── ui/
-│       ├── base_page.py         # Abstract CTkFrame (deduplicated helpers)
+│       ├── base_page.py         # Abstract QWidget (deduplicated helpers)
 │       ├── page_auto.py         # Automatic mode page
-│       └── page_manual.py       # Manual mode page
+│       ├── page_manual.py       # Manual mode page
+│       └── page_settings.py     # Settings configuration page
 ├── tests/
 │   └── test_robot_system.py     # 26 test cases; hardware tests skipped without SDKs
 ├── requirements.txt
@@ -57,7 +58,7 @@ Camera → YOLODetector (YOLO inference)
 
 | Thread | Purpose | Shutdown |
 |--------|---------|----------|
-| Main (Tk) | GUI event loop | `on_closing()` → `_stop_event.set()` |
+| Main (Qt) | GUI event loop | `on_closing()` → `_stop_event.set()` |
 | `PLCPollThread` | Cyclic PLC read at 10 Hz | Wakes on `_stop_event` |
 | `AIVisionThread` | YOLO inference + PLC dispatch | Wakes on `_stop_event` |
 
@@ -218,7 +219,7 @@ src/ai/yolo_detector.py
 src/ui/base_page.py
 ```
 
-`BasePage(parent, controller, page_color)` – abstract `CTkFrame` providing
+`BasePage(parent, controller, page_color)` – abstract `QWidget` providing
 `build_camera_selector()`, `build_status_bar()`, and
 `_refresh_error_status()` shared by both pages.
 
@@ -270,7 +271,7 @@ model) so they execute in any headless environment without physical devices.
 | TC-27 | `TestPLCDbReadSize` | `compute_db_read_size()` rounds up to multiple of 4 |
 
 > Tests TC-04–TC-10 (PLC) and TC-12–TC-18 (YOLO) and TC-26 (BasePage) are
-> skipped when the respective hardware SDK (`snap7`, `cv2`, `customtkinter`)
+> skipped when the respective hardware SDK (`snap7`, `cv2`, `PySide6`)
 > is not installed, allowing the full suite to run in a headless CI environment.
 
 ---
@@ -299,7 +300,7 @@ replaced by `unittest.mock` stubs at test time.
 |----------|-----------|
 | `threading.Event` for shutdown | Threads wake immediately on stop, eliminating zombie processes |
 | Constructor-injected `RobotConfig` | No global state; fully testable without filesystem access |
-| `self.after(0, callback)` for GUI updates | Ensures PLC data is dispatched on the Tk main thread (thread-safety) |
+| Qt Signals & Slots for GUI updates | Ensures PLC data is dispatched on the Qt event loop (thread-safety) |
 | `BasePage` abstract base class | Eliminates camera-selector and status-bar duplication across pages |
 | `px2mm` in config | Camera-agnostic; recalibrate by changing one value, no code changes |
 | Bare `except` replaced with typed catches | Prevents silent swallowing of `KeyboardInterrupt` / `SystemExit` |
