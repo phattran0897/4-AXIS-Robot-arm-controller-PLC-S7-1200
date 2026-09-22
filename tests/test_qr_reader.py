@@ -22,13 +22,13 @@ class TestQRReader:
         
         # Frame 1 - Value A
         reader._detector.val = "A1"
-        assert reader.decode_qr(frame) is None
+        assert reader.decode_qr(frame) == ("none", None)
         
         # Frame 2 - Value A
-        assert reader.decode_qr(frame) is None
+        assert reader.decode_qr(frame) == ("none", None)
         
         # Frame 3 - Value A (Debounce reached)
-        assert reader.decode_qr(frame) == "A1"
+        assert reader.decode_qr(frame) == ("value", "A1")
 
     def test_debounce_logic_reset_on_change(self):
         reader = QRReader(debounce_frames=3)
@@ -44,20 +44,20 @@ class TestQRReader:
         
         # Frame 1 - Value A
         reader._detector.val = "A1"
-        assert reader.decode_qr(frame) is None
+        assert reader.decode_qr(frame) == ("none", None)
         
         # Frame 2 - Value B
         reader._detector.val = "B2"
-        assert reader.decode_qr(frame) is None
+        assert reader.decode_qr(frame) == ("none", None)
         
         # Frame 3 - Value B
-        assert reader.decode_qr(frame) is None
+        assert reader.decode_qr(frame) == ("none", None)
         
         # Frame 4 - Value B (Debounce reached for B2)
-        assert reader.decode_qr(frame) == "B2"
+        assert reader.decode_qr(frame) == ("value", "B2")
 
-    def test_debounce_logic_reset_on_none(self):
-        reader = QRReader(debounce_frames=3)
+    def test_debounce_logic_tolerance_on_none(self):
+        reader = QRReader(debounce_frames=3, miss_tolerance=1)
         
         class MockDetector:
             def __init__(self):
@@ -70,12 +70,24 @@ class TestQRReader:
         
         # Frame 1 - Value A
         reader._detector.val = "A1"
-        assert reader.decode_qr(frame) is None
+        assert reader.decode_qr(frame) == ("none", None)
         
-        # Frame 2 - Nothing
+        # Frame 2 - Nothing (missed frame, but within tolerance 1)
         reader._detector.val = ""
-        assert reader.decode_qr(frame) is None
+        assert reader.decode_qr(frame) == ("none", None)
         
-        # Frame 3 - Value A (Starts over)
+        # Frame 3 - Value A (Continues)
         reader._detector.val = "A1"
-        assert reader.decode_qr(frame) is None
+        assert reader.decode_qr(frame) == ("none", None)
+        
+        # Frame 4 - Value A (Debounce reached: 3 hits)
+        assert reader.decode_qr(frame) == ("value", "A1")
+        
+        # Frame 5, 6 - Nothing (exceeds tolerance 1)
+        reader._detector.val = ""
+        assert reader.decode_qr(frame) == ("none", None)
+        assert reader.decode_qr(frame) == ("none", None) # none_count=2, tolerance=1 -> resets
+        
+        # Frame 7 - Value A (Starts over)
+        reader._detector.val = "A1"
+        assert reader.decode_qr(frame) == ("none", None)

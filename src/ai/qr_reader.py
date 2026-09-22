@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+from typing import Literal
 
 
 class QRReader:
@@ -13,21 +14,23 @@ class QRReader:
     Decodes QR codes from camera frames with debounce logic to ensure stability.
     """
 
-    def __init__(self, debounce_frames: int = 3, clear_frames: int = 15) -> None:
+    def __init__(self, debounce_frames: int = 3, clear_frames: int = 15, miss_tolerance: int = 2) -> None:
         self.debounce_frames = debounce_frames
         self.clear_frames = clear_frames
+        self.miss_tolerance = miss_tolerance
         self._detector = cv2.QRCodeDetector()
         self._last_raw_value: str | None = None
         self._consecutive_count: int = 0
         self._none_count: int = 0
 
-    def decode_qr(self, frame: np.ndarray) -> str | None:
+    def decode_qr(self, frame: np.ndarray) -> tuple[Literal["value", "clear", "none"], str | None]:
         """
         Detect and decode a QR code in the frame.
         Applies debounce logic: the same value must be read N consecutive times.
+        Tolerates a few missed frames before resetting the consecutive count.
         
         Returns:
-            The decoded string if stable, else None.
+            A tuple of (status, value) where status is "value", "clear", or "none".
         """
         value, points, _ = self._detector.detectAndDecode(frame)
         
@@ -47,14 +50,16 @@ class QRReader:
                 self._consecutive_count = 1
                 
             if self._consecutive_count >= self.debounce_frames:
-                return value
+                return "value", value
         else:
             self._none_count += 1
-            # Reset debounce if no QR found
-            self._last_raw_value = None
-            self._consecutive_count = 0
+            # Reset debounce only if missing frames exceed the tolerance
+            if self._none_count > self.miss_tolerance:
+                self._last_raw_value = None
+                self._consecutive_count = 0
+                
             if self._none_count >= self.clear_frames:
                 self._none_count = 0
-                return "CLEAR"
+                return "clear", None
             
-        return None
+        return "none", None

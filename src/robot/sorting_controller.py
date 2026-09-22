@@ -23,7 +23,7 @@ import time
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from src.kinematics import InverseKinematicsError, inverse_kinematics
+from src.kinematics import InverseKinematicsError, inverse_kinematics, validate_joint_angles
 from src.plc.plc_controller import ADDR
 
 if TYPE_CHECKING:
@@ -108,6 +108,21 @@ class SortingController:
                     inverse_kinematics(pos.x, pos.y, z, phi=phi)
                 except InverseKinematicsError:
                     unreachable.append(f"{name}.{label} (x={pos.x}, y={pos.y}, z={z})")
+
+        # Validate QR presets (Joint targets)
+        if self.positions.pick is not None:
+            try:
+                p = self.positions.pick
+                validate_joint_angles(p.j1, p.j2, p.j3, p.j4)
+            except InverseKinematicsError as exc:
+                unreachable.append(f"pick ({exc})")
+        
+        for name, loc in self.positions.locations.items():
+            try:
+                validate_joint_angles(loc.j1, loc.j2, loc.j3, loc.j4)
+            except InverseKinematicsError as exc:
+                unreachable.append(f"locations[{name}] ({exc})")
+
         if unreachable:
             raise ValueError(
                 "Sort waypoints outside the reachable workspace – check "

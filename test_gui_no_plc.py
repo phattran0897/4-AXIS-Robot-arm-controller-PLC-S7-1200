@@ -365,18 +365,17 @@ def main() -> None:
                                 frame_to_detect = frame
 
                             if self.cfg.app.sorting_mode == "qr":
-                                qr_val = self.qr_reader.decode_qr(frame)
-                                if qr_val:
-                                    if qr_val == "CLEAR":
-                                        self.sorter.process_qr_target("CLEAR")
-                                        self.qr_status_ready.emit("QR: Băng chuyền đang chạy...", "#94A3B8")
+                                status, qr_val = self.qr_reader.decode_qr(frame)
+                                if status == "clear":
+                                    self.sorter.process_qr_target("CLEAR")
+                                    self.qr_status_ready.emit("QR: Băng chuyền đang chạy...", "#94A3B8")
+                                elif status == "value" and qr_val:
+                                    if self.sorter.process_qr_target(qr_val):
+                                        self.log_tx(f"QR Scanned & Sent: {qr_val}")
+                                        self.qr_status_ready.emit(f"QR: Gửi lệnh thành công [{qr_val}]", "#10B981") # SUCCESS green
                                     else:
-                                        if self.sorter.process_qr_target(qr_val):
-                                            self.log_tx(f"QR Scanned & Sent: {qr_val}")
-                                            self.qr_status_ready.emit(f"QR: Gửi lệnh thành công [{qr_val}]", "#10B981") # SUCCESS green
-                                        else:
-                                            if qr_val not in self.cfg.sort_positions.locations:
-                                                self.qr_status_ready.emit(f"QR: Không tồn tại [{qr_val}]", "#EF4444") # ERROR red
+                                        if qr_val not in self.cfg.sort_positions.locations:
+                                            self.qr_status_ready.emit(f"QR: Không tồn tại [{qr_val}]", "#EF4444") # ERROR red
                                 
                                 # We still just display the raw frame in QR mode, maybe draw bounding box which QR reader handles
                                 display_frame = frame.copy()
