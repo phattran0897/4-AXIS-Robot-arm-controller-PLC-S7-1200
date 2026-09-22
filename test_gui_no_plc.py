@@ -364,32 +364,49 @@ def main() -> None:
                             else:
                                 frame_to_detect = frame
 
-                            # DIRECT DETECTION (Full frame, no ROI)
-                            result = self.detector.annotate_frame(frame_to_detect)
-                            
-                            # Handle manual capture trigger using the full-frame result
-                            if self._manual_classify_trigger.is_set():
-                                self._manual_classify_trigger.clear()
-                                if not result.has_defect:
-                                    log.info("Manual Capture: no object detected above threshold – skipped.")
-                                    self.log_tx("Capture: no object detected – sort skipped.")
-                                else:
-                                    from src.robot.sorting_controller import SortResult
-                                    sort_result = SortResult.BAD if result.class_id == 0 else SortResult.GOOD
-                                    log.info(
-                                        "Manual Capture (Full Frame): Object Classified as %s (class=%d, X=%.1fmm, Y=%.1fmm)",
-                                        sort_result.name,
-                                        result.class_id,
-                                        result.robot_x,
-                                        result.robot_y,
-                                    )
-                                    self.log_tx(f"Classified: {sort_result.name} ({result.class_name or 'obj'})")
-                                    self._start_sort_cycle(result.robot_x, result.robot_y, sort_result)
-                            
-                            if result.annotated_frame is not None:
-                                display_frame = result.annotated_frame
+                            if self.cfg.app.sorting_mode == "qr":
+                                qr_val = self.qr_reader.decode_qr(frame)
+                                if qr_val:
+                                    if qr_val == "CLEAR":
+                                        self.sorter.process_qr_target("CLEAR")
+                                        self.qr_status_ready.emit("QR: Băng chuyền đang chạy...", "#94A3B8")
+                                    else:
+                                        if self.sorter.process_qr_target(qr_val):
+                                            self.log_tx(f"QR Scanned & Sent: {qr_val}")
+                                            self.qr_status_ready.emit(f"QR: Gửi lệnh thành công [{qr_val}]", "#10B981") # SUCCESS green
+                                        else:
+                                            if qr_val not in self.cfg.sort_positions.locations:
+                                                self.qr_status_ready.emit(f"QR: Không tồn tại [{qr_val}]", "#EF4444") # ERROR red
+                                
+                                # We still just display the raw frame in QR mode, maybe draw bounding box which QR reader handles
+                                display_frame = frame.copy()
                             else:
-                                display_frame = frame_to_detect.copy()
+                                # DIRECT DETECTION (Full frame, no ROI)
+                                result = self.detector.annotate_frame(frame_to_detect)
+                                
+                                # Handle manual capture trigger using the full-frame result
+                                if self._manual_classify_trigger.is_set():
+                                    self._manual_classify_trigger.clear()
+                                    if not result.has_defect:
+                                        log.info("Manual Capture: no object detected above threshold – skipped.")
+                                        self.log_tx("Capture: no object detected – sort skipped.")
+                                    else:
+                                        from src.robot.sorting_controller import SortResult
+                                        sort_result = SortResult.BAD if result.class_id == 0 else SortResult.GOOD
+                                        log.info(
+                                            "Manual Capture (Full Frame): Object Classified as %s (class=%d, X=%.1fmm, Y=%.1fmm)",
+                                            sort_result.name,
+                                            result.class_id,
+                                            result.robot_x,
+                                            result.robot_y,
+                                        )
+                                        self.log_tx(f"Classified: {sort_result.name} ({result.class_name or 'obj'})")
+                                        self._start_sort_cycle(result.robot_x, result.robot_y, sort_result)
+                                
+                                if result.annotated_frame is not None:
+                                    display_frame = result.annotated_frame
+                                else:
+                                    display_frame = frame_to_detect.copy()
 
                             if not self._frame_pending:
                                 self._frame_pending = True

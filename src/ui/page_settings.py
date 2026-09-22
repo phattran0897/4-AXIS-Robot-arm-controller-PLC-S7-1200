@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QDoubleValidator, QIntValidator
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -108,6 +109,30 @@ class PageSettings(BasePage):
         parent.layout().addWidget(row_frame)
         self._inputs[key] = (inp, is_int)
 
+    def _create_combo_row(self, parent: QWidget, name: str, options: list[str], default_val: str, key: str) -> None:
+        row_frame = QFrame(parent)
+        row_frame.setStyleSheet(card_style(ROW_BG, PANEL_BORDER, 10))
+        row_layout = QHBoxLayout(row_frame)
+        row_layout.setContentsMargins(12, 7, 12, 7)
+
+        name_label = QLabel(name, row_frame)
+        name_label.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; border: none; background: transparent;"
+        )
+        row_layout.addWidget(name_label)
+        row_layout.addStretch()
+
+        combo = QComboBox(row_frame)
+        combo.addItems(options)
+        combo.setCurrentText(default_val)
+        combo.setStyleSheet(
+            f"background-color: {ENTRY_BG}; color: {TEXT_PRIMARY}; border: 1px solid {PANEL_BORDER}; border-radius: 4px; padding: 2px 4px;"
+        )
+        combo.setFixedWidth(80)
+        row_layout.addWidget(combo)
+        parent.layout().addWidget(row_frame)
+        self._inputs[key] = (combo, "combo")
+
     def _build_vision_panel(self, parent: QWidget) -> None:
         frame = self._create_card(parent)
         layout = QVBoxLayout(frame)
@@ -143,6 +168,10 @@ class PageSettings(BasePage):
         self.build_section_header(frame, "⏱", "TIMING", INFO)
         self._create_input_row(frame, "Move Cooldown (s)", cfg.app.move_cooldown, "app.move_cooldown")
         self._create_input_row(frame, "PLC Poll Rate (s)", cfg.app.plc_poll_interval, "app.plc_poll_interval")
+        
+        self.build_section_header(frame, "🔄", "SORTING", INFO)
+        self._create_combo_row(frame, "Sorting Mode", ["vision", "qr"], cfg.app.sorting_mode, "app.sorting_mode")
+        
         # Removed addStretch
         btn_save = QPushButton("💾 APPLY & SAVE")
         btn_save.setFixedHeight(46)
@@ -178,6 +207,8 @@ class PageSettings(BasePage):
             # Extract
             def get_val(key):
                 inp, is_int = self._inputs[key]
+                if is_int == "combo":
+                    return inp.currentText()
                 text = inp.text().replace(",", ".")
                 if not text:
                     text = "0"
@@ -198,6 +229,7 @@ class PageSettings(BasePage):
 
             cfg.app.move_cooldown = get_val("app.move_cooldown")
             cfg.app.plc_poll_interval = get_val("app.plc_poll_interval")
+            cfg.app.sorting_mode = get_val("app.sorting_mode")
 
             save_config(cfg)
             

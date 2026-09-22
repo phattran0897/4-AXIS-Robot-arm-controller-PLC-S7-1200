@@ -123,6 +123,7 @@ class AppConfig:
     geometry: str = "1150x700"
     appearance_mode: str = "dark"
     color_theme: str = "blue"
+    sorting_mode: str = "vision"
     plc_poll_interval: float = 0.10
     move_cooldown: float = 1.50
 
@@ -146,12 +147,25 @@ def _default_place_bad() -> PlacePosition:
 
 
 @dataclass(slots=True)
+class JointPosition:
+    j1: float = 0.0
+    j2: float = 0.0
+    j3: float = 0.0
+    j4: float = 0.0
+
+
+@dataclass(slots=True)
 class SortPositionsConfig:
+    # Vision mode settings
     place_good: PlacePosition = field(default_factory=_default_place_good)
     place_bad: PlacePosition = field(default_factory=_default_place_bad)
     pick_z_down: float = 80.0
     pick_z_up: float = 150.0
     gripper_delay: float = 0.5
+    
+    # QR mode settings
+    pick: JointPosition | None = None
+    locations: dict[str, JointPosition] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -168,7 +182,14 @@ class RobotConfig:
 # Loader
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
+import sys
+
+if getattr(sys, 'frozen', False):
+    # PyInstaller creates a frozen executable. Look for config.yaml next to the .exe
+    _DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(sys.executable), "config.yaml")
+else:
+    # Running from source. Look for config.yaml in the project root (above src/)
+    _DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
 
 
 def _nested_get(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -327,6 +348,7 @@ def load_config(path: str | None = None) -> RobotConfig:
         geometry=app_raw.get("geometry", "1150x700"),
         appearance_mode=app_raw.get("appearance_mode", "dark"),
         color_theme=app_raw.get("color_theme", "blue"),
+        sorting_mode=app_raw.get("sorting_mode", "vision"),
         plc_poll_interval=float(app_raw.get("plc_poll_interval", 0.10)),
         move_cooldown=float(app_raw.get("move_cooldown", 1.50)),
     )
@@ -350,12 +372,30 @@ def load_config(path: str | None = None) -> RobotConfig:
         z_down=float(bad_raw.get("z_down", 80.0)),
         z_up=float(bad_raw.get("z_up", 150.0)),
     )
+    def _parse_joint_pos(node: dict[str, Any] | None) -> JointPosition | None:
+        if not node:
+            return None
+        return JointPosition(
+            j1=float(node.get("j1", 0.0)),
+            j2=float(node.get("j2", 0.0)),
+            j3=float(node.get("j3", 0.0)),
+            j4=float(node.get("j4", 0.0)),
+        )
+
+    parsed_locations: dict[str, JointPosition] = {}
+    for loc_name, loc_data in sort_raw.get("locations", {}).items():
+        parsed_loc = _parse_joint_pos(loc_data)
+        if parsed_loc:
+            parsed_locations[loc_name] = parsed_loc
+
     sort_cfg = SortPositionsConfig(
         place_good=place_good,
         place_bad=place_bad,
         pick_z_down=float(sort_raw.get("pick_z_down", 80.0)),
         pick_z_up=float(sort_raw.get("pick_z_up", 150.0)),
         gripper_delay=float(sort_raw.get("gripper_delay", 0.5)),
+        pick=_parse_joint_pos(sort_raw.get("pick")),
+        locations=parsed_locations,
     )
 
     # ── Validation ──────────────────────────────────────────────────────────
@@ -454,6 +494,11 @@ def load_config(path: str | None = None) -> RobotConfig:
             f"yolo.roi_x/roi_y must be non-negative "
             f"(got {yolo_cfg.roi_x}, {yolo_cfg.roi_y})."
         )
+    if app_cfg.sorting_mode == "qr":
+        if not sort_cfg.pick:
+            raise ValueError("sorting_mode is 'qr' but sort_positions.pick is missing.")
+        if not sort_cfg.locations:
+            raise ValueError("sorting_mode is 'qr' but sort_positions.locations is empty.")
 
     return RobotConfig(
         plc=plc_cfg,
@@ -484,6 +529,7 @@ def save_config(config: RobotConfig, path: str = _DEFAULT_CONFIG_PATH) -> None:
         ("yolo", "roi_height"): config.yolo.roi_height,
         ("app", "move_cooldown"): config.app.move_cooldown,
         ("app", "plc_poll_interval"): config.app.plc_poll_interval,
+        ("app", "sorting_mode"): f'"{config.app.sorting_mode}"',
         ("sort_positions", "pick_z_down"): config.sort_positions.pick_z_down,
         ("sort_positions", "pick_z_up"): config.sort_positions.pick_z_up,
         ("place_good", "z_down"): config.sort_positions.place_good.z_down,

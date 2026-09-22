@@ -41,6 +41,7 @@ from src.ai.yolo_detector import YOLODetector
 from src.config_loader import RobotConfig, load_config
 from src.kinematics import configure as configure_kinematics
 from src.plc.plc_controller import ADDR, PLCController
+from src.ai.qr_reader import QRReader
 from src.robot.sorting_controller import SortResult, SortingController
 from src.ui.header import VAAFooter, VAAHeader, apply_app_icon
 from src.ui.page_auto import PageAuto
@@ -112,6 +113,7 @@ class RobotApp(QMainWindow):
     plc_data_ready = Signal(dict)
     tx_logged = Signal(str)
     show_error_dialog = Signal(str)
+    qr_status_ready = Signal(str, str)
 
     def __init__(self, cfg: RobotConfig) -> None:
         super().__init__()
@@ -165,6 +167,7 @@ class RobotApp(QMainWindow):
             kinematics=cfg.kinematics,
             plc_commands=cfg.plc.commands,
         )
+        self.qr_reader = QRReader(debounce_frames=5)
         self._sort_thread: threading.Thread | None = None
         self._sort_start_lock = threading.Lock()
 
@@ -246,19 +249,25 @@ class RobotApp(QMainWindow):
 
         # Stacked pages
         self.stacked_widget = QStackedWidget(central_widget)
-        self.frames = {}
+        self.page_auto = PageAuto(parent=self.stacked_widget, controller=self)
+        self.page_manual = PageManual(parent=self.stacked_widget, controller=self)
+        self.page_settings = PageSettings(parent=self.stacked_widget, controller=self)
 
-        self.frames["PageAuto"] = PageAuto(parent=self.stacked_widget, controller=self)
-        self.frames["PageManual"] = PageManual(
-            parent=self.stacked_widget, controller=self
-        )
-        self.frames["PageSettings"] = PageSettings(
-            parent=self.stacked_widget, controller=self
-        )
+        self.stacked_widget.addWidget(self.page_auto)
+        self.stacked_widget.addWidget(self.page_manual)
+        self.stacked_widget.addWidget(self.page_settings)
 
-        self.stacked_widget.addWidget(self.frames["PageAuto"])
-        self.stacked_widget.addWidget(self.frames["PageManual"])
-        self.stacked_widget.addWidget(self.frames["PageSettings"])
+        self.frames = {
+            "PageAuto": self.page_auto,
+            "PageManual": self.page_manual,
+            "PageSettings": self.page_settings,
+        }
+
+        # Ensure page_auto has update_qr_status, connect signal
+        if hasattr(self.page_auto, "update_qr_status"):
+            self.qr_status_ready.connect(
+                self.page_auto.update_qr_status, Qt.ConnectionType.QueuedConnection
+            )
 
         main_layout.addWidget(self.stacked_widget, 1)
 
@@ -421,11 +430,27 @@ class RobotApp(QMainWindow):
                     try:
                         force_preview = False
 
-                        # Manual Trigger Check (uses the raw frame)
-                        if self._manual_classify_trigger.is_set():
-                            self._manual_classify_trigger.clear()
-                            self._handle_manual_classification(frame)
-                            force_preview = True
+                        if self.cfg.app.sorting_mode == "qr":
+                            # PLC-driven autonomous QR mode
+                            qr_val = self.qr_reader.decode_qr(frame)
+                            if qr_val:
+                                if qr_val == "CLEAR":
+                                    self.sorter.process_qr_target("CLEAR")
+                                    self.qr_status_ready.emit("QR: Băng chuyền đang chạy...", "#94A3B8")
+                                else:
+                                    if self.sorter.process_qr_target(qr_val):
+                                        self.log_tx(f"QR Scanned & Sent: {qr_val}")
+                                        self.qr_status_ready.emit(f"QR: Gửi lệnh thành công [{qr_val}]", "#10B981") # SUCCESS green
+                                    else:
+                                        if qr_val not in self.cfg.sort_positions.locations:
+                                            self.qr_status_ready.emit(f"QR: Không tồn tại [{qr_val}]", "#EF4444") # ERROR red
+                                force_preview = True
+                        else:
+                            # PC-Master YOLO Vision Mode
+                            if self._manual_classify_trigger.is_set():
+                                self._manual_classify_trigger.clear()
+                                self._handle_manual_classification(frame)
+                                force_preview = True
 
                         now = time.monotonic()
                         if (
@@ -434,24 +459,25 @@ class RobotApp(QMainWindow):
                         ):
                             last_preview_time = now
 
-                            # Draw ROI overlay on a copy for display
+                            # Draw ROI overlay if in Vision Mode
                             display_frame = frame.copy()
-                            cv2.rectangle(
-                                display_frame,
-                                (roi_x, roi_y),
-                                (roi_x + roi_w, roi_y + roi_h),
-                                (0, 255, 0),
-                                2,
-                            )
-                            cv2.putText(
-                                display_frame,
-                                "ROI - Dat Hop Vao Day",
-                                (roi_x, roi_y - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6,
-                                (0, 255, 0),
-                                2,
-                            )
+                            if self.cfg.app.sorting_mode != "qr":
+                                cv2.rectangle(
+                                    display_frame,
+                                    (roi_x, roi_y),
+                                    (roi_x + roi_w, roi_y + roi_h),
+                                    (0, 255, 0),
+                                    2,
+                                )
+                                cv2.putText(
+                                    display_frame,
+                                    "ROI - Dat Hop Vao Day",
+                                    (roi_x, roi_y - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    (0, 255, 0),
+                                    2,
+                                )
 
                             h, w, ch = display_frame.shape
                             if not self._frame_pending:

@@ -40,7 +40,7 @@ plc:
 # ── YOLO / AI Vision ─────────────────────────────────────────────────────────
 yolo:
   model_path: "my_model/my_model.pt"
-  thresh: 0.30
+  thresh: 0.3 
 
   # Pixel → millimetre scale factor (calibrate per camera/lens/mounting height)
   px2mm: 0.5 
@@ -113,15 +113,19 @@ app:
   geometry: "1280x820"
   appearance_mode: "dark"       # "dark" | "light" | "system"
   color_theme: "blue"
+  
+  # "qr" for PLC-driven autonomous QR sorting, "vision" for PC-Master YOLO sorting
+  sorting_mode: "qr" 
 
   # Background cyclic PLC polling rate (seconds)
   plc_poll_interval: 0.1 
 
-  # Minimum delay (seconds) after a MOVE command before re-triggering
+  # Minimum delay (seconds) after a MOVE command before re-triggering (Vision mode only)
   move_cooldown: 1.5 
 
 # ── Sort Positions ──────────────────────────────────────────────────────────
 sort_positions:
+  # Legacy Vision Mode configurations
   place_good:
     x: 150.0
     y: 100.0
@@ -135,4 +139,22 @@ sort_positions:
   pick_z_down: 80.0
   pick_z_up: 150.0
   gripper_delay: 0.5
+
+  # QR Mode configurations (Joint angles in degrees)
+  pick:
+    j1: 0.0
+    j2: 45.0
+    j3: 90.0
+    j4: 0.0
+  locations:
+    A1:
+      j1: 90.0
+      j2: 45.0
+      j3: 90.0
+      j4: 0.0
+    B2:
+      j1: -90.0
+      j2: 45.0
+      j3: 90.0
+      j4: 0.0
 

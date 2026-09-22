@@ -173,6 +173,16 @@ class PageAuto(BasePage):
             f"border: none; background: transparent;"
         )
         sc_layout.addWidget(self.lbl_operation)
+        
+        # QR Status label
+        self.lbl_qr_status = QLabel("QR: Băng chuyền đang chạy...", status_card)
+        self.lbl_qr_status.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; "
+            f"border: none; background: transparent; margin-top: 4px;"
+        )
+        self.lbl_qr_status.setWordWrap(True)
+        sc_layout.addWidget(self.lbl_qr_status)
+        
         btn_layout.addWidget(status_card)
 
         # Capture & Classify button
@@ -188,6 +198,13 @@ class PageAuto(BasePage):
             else None
         )
         btn_layout.addWidget(self.btn_capture)
+        
+        mode = "vision"
+        if self.controller and hasattr(self.controller, "cfg"):
+            mode = self.controller.cfg.app.sorting_mode
+            
+        if mode == "qr":
+            self.btn_capture.hide()
 
         # Reset counters button
         btn_reset = QPushButton("🔄   RESET COUNTERS", btn_frame)
@@ -289,7 +306,11 @@ class PageAuto(BasePage):
         good_layout.setContentsMargins(10, 8, 10, 8)
         good_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        lbl_g_title = QLabel("✅ TỐT", good_card)
+        mode = "vision"
+        if self.controller and hasattr(self.controller, "cfg"):
+            mode = self.controller.cfg.app.sorting_mode
+
+        lbl_g_title = QLabel("✅ TỐT" if mode == "vision" else "📦 TỔNG SỐ QR", good_card)
         lbl_g_title.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; "
             f"border: none; background: transparent;"
@@ -313,7 +334,7 @@ class PageAuto(BasePage):
         bad_layout.setContentsMargins(10, 8, 10, 8)
         bad_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        lbl_b_title = QLabel("❌ XẤU", bad_card)
+        lbl_b_title = QLabel("❌ XẤU" if mode == "vision" else "⚠ QR LỖI", bad_card)
         lbl_b_title.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; "
             f"border: none; background: transparent;"
@@ -343,10 +364,24 @@ class PageAuto(BasePage):
     # ------------------------------------------------------------------
 
     def _on_reset_counters(self) -> None:
-        if self.controller and hasattr(self.controller, "sorter"):
+        """Reset good/bad counts."""
+        if self.controller and self.controller.sorter:
             self.controller.sorter.reset_counters()
+            if hasattr(self, "_update_telemetry"):
+                self._update_telemetry()
+            if hasattr(self.controller, "log_tx"):
+                self.controller.log_tx("Counters manually reset.")
         self.lbl_good.setText("0")
         self.lbl_bad.setText("0")
+
+    def update_qr_status(self, message: str, color_hex: str) -> None:
+        """Update the QR code status label."""
+        if hasattr(self, "lbl_qr_status"):
+            self.lbl_qr_status.setText(message)
+            self.lbl_qr_status.setStyleSheet(
+                f"color: {color_hex}; font-size: 13px; font-weight: bold; "
+                f"border: none; background: transparent; margin-top: 4px;"
+            )
 
     # ------------------------------------------------------------------
     # BasePage contract
@@ -406,22 +441,32 @@ class PageAuto(BasePage):
                 )
 
         # Update classification status
-        if not sorter.is_idle() and sorter.last_sort_result is not None:
-            if sorter.last_sort_result == SortResult.GOOD:
-                self.lbl_classification.setText("✅ HÀNG TỐT")
-                self.lbl_classification.setStyleSheet(
-                    f"color: {SUCCESS}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
-                )
-            else:
-                self.lbl_classification.setText("❌ HÀNG XẤU")
-                self.lbl_classification.setStyleSheet(
-                    f"color: {DANGER}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
-                )
-        else:
-            self.lbl_classification.setText("⏳ CHỜ PHÂN LOẠI")
+        mode = "vision"
+        if self.controller and hasattr(self.controller, "cfg"):
+            mode = self.controller.cfg.app.sorting_mode
+
+        if mode == "qr":
+            self.lbl_classification.setText("⚙ MÔ HÌNH: PLC QR")
             self.lbl_classification.setStyleSheet(
-                f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
+                f"color: {INFO}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
             )
+        else:
+            if not sorter.is_idle() and sorter.last_sort_result is not None:
+                if sorter.last_sort_result == SortResult.GOOD:
+                    self.lbl_classification.setText("✅ HÀNG TỐT")
+                    self.lbl_classification.setStyleSheet(
+                        f"color: {SUCCESS}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
+                    )
+                else:
+                    self.lbl_classification.setText("❌ HÀNG XẤU")
+                    self.lbl_classification.setStyleSheet(
+                        f"color: {DANGER}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
+                    )
+            else:
+                self.lbl_classification.setText("⏳ CHỜ PHÂN LOẠI")
+                self.lbl_classification.setStyleSheet(
+                    f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
+                )
 
         self._refresh_error_status(data)
 

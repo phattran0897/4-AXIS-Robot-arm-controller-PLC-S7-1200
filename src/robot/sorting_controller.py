@@ -77,6 +77,7 @@ class SortingController:
         self._counter_good: int = 0
         self._counter_bad: int = 0
         self._last_sort_result: SortResult | None = None
+        self._last_qr_value: str | None = None
 
         # Commanded joint angles mirrored to the GUI (NOT the motion feedback)
         self._current_joints: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
@@ -152,6 +153,7 @@ class SortingController:
         """Reset the internal controller state to IDLE after an error has been resolved."""
         self._state = RobotState.IDLE
         self._last_sort_result = None
+        self._last_qr_value = None
         # Unblock any _wait_event.wait() calls so the sort thread can exit
         self._wait_event.set()
         self._wait_event.clear()
@@ -174,6 +176,46 @@ class SortingController:
         except InverseKinematicsError as exc:
             log.error("IK failed for target (%.2f, %.2f, %.2f): %s", x, y, z, exc)
             raise
+
+    def process_qr_target(self, qr_value: str) -> bool:
+        """
+        Process a decoded QR code in autonomous PLC mode.
+        Does not wait for motion to finish. Only writes to DB if it's a new QR code.
+        
+        Returns:
+            True if the target was written successfully, False if skipped or error.
+        """
+        if qr_value == "CLEAR":
+            self._last_qr_value = None
+            return False
+
+        if qr_value == self._last_qr_value:
+            # Already sent this one, wait until a new box comes along
+            return False
+
+        if qr_value not in self.positions.locations:
+            log.warning("Decoded QR '%s' but it is not configured in locations map.", qr_value)
+            # Update last_qr_value so we don't spam the warning
+            self._last_qr_value = qr_value
+            return False
+
+        loc = self.positions.locations[qr_value]
+        
+        log.info(
+            "QR Target Valid: [%s] -> Writing targets: J1=%.2f, J2=%.2f, J3=%.2f, J4=%.2f",
+            qr_value, loc.j1, loc.j2, loc.j3, loc.j4
+        )
+        
+        try:
+            # db_write directly to joint targets in DB
+            self.plc.send_joint_targets(loc.j1, loc.j2, loc.j3, loc.j4)
+            self._last_qr_value = qr_value
+            self._current_joints = (loc.j1, loc.j2, loc.j3, loc.j4)
+            self._counter_good += 1  # Or generic count
+            return True
+        except Exception as exc:
+            log.error("Failed to write QR targets to PLC: %s", exc)
+            return False
 
     def execute_sort(self, pick_x: float, pick_y: float, result: SortResult) -> None:
         """
