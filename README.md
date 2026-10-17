@@ -1,313 +1,155 @@
-# 4-Axis Robot Control System
+﻿# 4-Axis Robot Arm Controller
 
-A production-grade Python application for automated defect detection and
-robotic pick-and-sort using **YOLOv11**, a **Siemens S7-1200 PLC**, and a
-**PySide6** GUI.
+Python/PySide6 GUI for an articulated robot arm, a Siemens S7-1200 PLC,
+YOLO object detection and QR destination selection. Runtime settings live in
+`config.yaml`.
 
-```
-Camera → YOLODetector (YOLO inference)
-                ↓ defect coords (mm)
-        Inverse Kinematics
-                ↓ joint angles
-        PLCController (snap7) → S7-1200 → SCARA Robot
-```
+## Operating modes
 
----
+- **QR / PLC sequencer**: the camera debounces QR values, looks up joint presets
+  in `sort_positions.locations`, and writes the destination targets. This path
+  does not pulse START_AUTO. The PLC owns the conveyor sensor, gripping and
+  pick/place sequence. A successful target write is counted as QR WRITTEN; this
+  is not confirmation that a physical box was sorted. Unknown codes increment
+  INVALID QR once per visible item; connection failures are retried, not counted
+  as invalid codes.
+- **Vision / PC Master**: the preview runs continuously; YOLO classification runs
+  when the operator presses CAPTURE. The PC computes IK waypoints, commands each
+  move, waits for fresh motion completion, operates the gripper and returns home.
+  Continuous automatic inference is not implemented.
 
-## Table of Contents
+## Install and run
 
-1. [Architecture](#architecture)
-2. [Prerequisites](#prerequisites)
-3. [Installation](#installation)
-4. [Configuration](#configuration)
-5. [Running the Application](#running-the-application)
-6. [Project Structure](#project-structure)
-7. [Running Tests](#running-tests)
-8. [CI Pipeline](#ci-pipeline)
-9. [Key Design Decisions](#key-design-decisions)
+Use Python 3.11 or later in an isolated environment:
 
----
-
-## Architecture
-
-```
-.
-├── config.yaml                  # Single source-of-truth for all parameters
-├── main.py                      # App entry point, thread management
-├── src/
-│   ├── config_loader.py         # Typed YAML loader (dataclasses, __slots__)
-│   ├── kinematics/
-│   │   ├── __init__.py
-│   │   └── kinematics.py        # 2-DOF planar IK with workspace validation
-│   ├── ai/
-│   │   └── yolo_detector.py     # Camera + YOLO; read/annotate split, watchdog
-│   ├── plc/
-│   │   └── plc_controller.py    # snap7 S7-1200 wrapper; atomic writes
-│   └── ui/
-│       ├── base_page.py         # Abstract QWidget (deduplicated helpers)
-│       ├── page_auto.py         # Automatic mode page
-│       ├── page_manual.py       # Manual mode page
-│       └── page_settings.py     # Settings configuration page
-├── tests/
-│   └── test_robot_system.py     # 26 test cases; hardware tests skipped without SDKs
-├── requirements.txt
-└── .github/workflows/ci.yml     # GitHub Actions: lint + test
-```
-
-### Thread model
-
-| Thread | Purpose | Shutdown |
-|--------|---------|----------|
-| Main (Qt) | GUI event loop | `on_closing()` → `_stop_event.set()` |
-| `PLCPollThread` | Cyclic PLC read at 10 Hz | Wakes on `_stop_event` |
-| `AIVisionThread` | YOLO inference + PLC dispatch | Wakes on `_stop_event` |
-
-`threading.Event._stop_event` is used instead of a raw boolean so threads
-wake **immediately** on shutdown rather than sleeping through their full
-interval.
-
----
-
-## Prerequisites
-
-| Requirement | Version |
-|-------------|---------|
-| Python | ≥ 3.11 |
-| Siemens S7-1200 PLC | Firmware ≥ V4.x, PUT/GET enabled |
-| USB camera | Any OpenCV-compatible device |
-| YOLO model | `best.pt` trained with Ultralytics YOLOv8/v11 |
-| OS | Windows 10/11, Ubuntu 22.04+ |
-
----
-
-## Installation
-
-```bash
-# 1. Clone the repository
-git clone https://github.com/your-org/robot-control-system.git
-cd robot-control-system
-
-# 2. Create and activate a virtual environment
+```powershell
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Linux / macOS
-source .venv/bin/activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-```
-
-> **GPU acceleration (optional)**  
-> Replace the `torch` line in `requirements.txt` with the CUDA-enabled wheel
-> from [pytorch.org](https://pytorch.org/get-started/locally/).
-
----
-
-## Configuration
-
-All runtime parameters live in **`config.yaml`**. No source code changes
-are needed for a new installation.
-
-```yaml
-plc:
-  ip: "192.168.0.1"     # PLC IP address
-  rack: 0
-  slot: 1
-  db_number: 10          # Data Block number
-
-  offsets:               # Byte offsets within the DB
-    cmd_word: 0          # INT  – command register
-    status: 2            # INT  – PLC status word
-    j1_target: 4         # REAL – joint 1 target angle
-    j2_target: 8         # REAL – joint 2 target angle
-    j3_target: 12        # REAL – joint 3 target angle
-    j4_target: 16        # REAL – joint 4 target angle
-    motion_done_byte: 20 # BOOL byte
-    motion_done_bit: 0
-    error_flag_byte: 20
-    error_flag_bit: 1
-
-  commands:
-    idle: 0
-    home: 1
-    move: 2
-    stop: 3
-
-yolo:
-  model_path: "models/best.pt"   # Path to your trained .pt file
-  thresh: 0.50                   # Confidence threshold (0–1)
-  px2mm: 0.50                    # Pixels → mm calibration factor
-  home_x: 200.0                  # Robot home X in mm
-  home_y: 0.0                    # Robot home Y in mm
-
-camera:
-  default_index: 0               # OpenCV camera index
-  display_width: 440             # Preview width (px)
-  display_height: 310            # Preview height (px)
-  fps: 30                        # Target inference rate
-
-kinematics:
-  l1: 200.0                      # Link-1 length (mm)
-  l2: 150.0                      # Link-2 length (mm)
-
-app:
-  plc_poll_interval: 0.10        # Seconds between PLC reads
-  move_cooldown: 1.50            # Seconds to wait after issuing MOVE
-```
-
-### Calibrating `px2mm`
-
-1. Place a known-size object (e.g. 100 mm ruler) in the camera field of view.
-2. Measure its pixel width in the captured frame.
-3. `px2mm = physical_width_mm / pixel_width_px`
-
----
-
-## Running the Application
-
-```bash
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 python main.py
 ```
 
-The application opens in **Automatic Mode** by default. Use the
-**"SWITCH TO MANUAL >>"** button in the status bar to navigate to Manual Mode.
+Put the trained detection model at the configured `yolo.model_path` (the supplied
+configuration uses `my_model/my_model.pt`). Camera access, the model file and a
+matching PLC project are required for operation. For a simulated PLC with the
+real camera/model, use `python test_gui_no_plc.py`.
 
-### Automatic Mode
+## Configuration and calibration
 
-- Live YOLO inference runs continuously.
-- Detected defects trigger inverse-kinematics computation and a `MOVE`
-  command to the PLC.
-- Joint angles are displayed in real time from the cyclic PLC read.
+- `kinematics`: DH dimensions `a1, d1, a2, a3, a4`, joint limits and tool pitch.
+  Keep the configured limits consistent with the physical robot. Elbow DOWN is
+  disabled when the configured J3 range has no negative angles.
+- `yolo`: threshold, pixel-to-mm scale, ROI and optional OpenCV calibration file.
+  Model and calibration paths are relative to the source project root, or to the
+  executable directory in a frozen build. Settings applies threshold, scale and
+  cooldown immediately; ROI edits update the live overlay.
+- `yolo.class_quality`: explicit model class name or numeric ID to GOOD/BAD map.
+  Class names take precedence over IDs. Update this map with every retrained
+  model; prefer names to protect against reordered IDs. Unknown classes are
+  drawn as UNKNOWN and do not trigger motion. The supplied numeric mapping keeps
+  the original model convention: 0 = BAD, 1 = GOOD.
+- `app.move_cooldown`: delay after a Vision sort attempt before accepting another.
+- `app.qr_debounce_frames`, `qr_clear_frames`, `qr_miss_tolerance`: defaults are
+  5, 3 and 2. Three decoded blank frames rearm the same QR; up to two missed
+  frames tolerate decoding flicker. Tune to frames actually processed, not the
+  camera's advertised frame rate. Two identical boxes without a detectable gap
+  cannot be distinguished by this camera-only method; production item identity
+  should come from a conveyor sensor or PLC item counter.
+- Settings is validated before save, and the YAML file is replaced atomically.
+  Apply settings after the current sort cycle has finished.
 
-### Manual Mode
+Calibrate `px2mm` with a known physical length at the working plane. Validate the
+ROI centre against `home_x/home_y`, camera mounting and image axis directions.
+A scalar pixel conversion is not a substitute for camera-to-robot calibration
+across varying object heights. The application does not plan collision-free
+paths or check obstructions. MoveL samples Cartesian waypoints; the PLC decides
+how it interpolates motion between those waypoints.
 
-- Enter joint angles directly (Forward Kinematics) or target XY coordinates
-  (toggle to Inverse Kinematics).
-- Individual gripper GRIP / RELEASE buttons.
-- **MOVE TO HOME** sends `CMD_HOME` to the PLC.
+## PLC integration contract
 
----
+Use an accessible, non-optimized DB with PUT/GET configured in the TIA project.
+Check every address and field meaning against that project before commanding
+motion. `PLCOffsets` contains configurable REAL and status addresses; `ADDR`
+contains the fixed command, gripper and JOG bits.
 
-## Project Structure
+**The supplied DB map needs verification:** status byte 20 overlaps the
+`theta_j1` REAL at bytes 18-21. PC-supervised sorting refuses to move with this
+layout. Assign dedicated motion/error status bytes in both TIA and config;
+changing only the Python address is insufficient. The current target offsets
+42/46/50 also alias the XYZ input view `px_j1/py_j2/pz_j3`. Confirm whether the
+PLC expects joint angles or Cartesian coordinates in each operating mode and
+remap these fields together with the PLC program as necessary. J4 is currently
+unmapped (`j4_target: -1`), so Python writes only J1-J3; a four-axis physical
+sequence requires a corresponding PLC mapping.
 
-```
-src/config_loader.py
-```
+For **each PC-commanded waypoint and autonomous sequence**:
 
-`load_config(path?)` → `RobotConfig` – fully-typed dataclass tree.
-All other modules receive their configuration through constructor injection
-(no global state).
+1. Accept a fresh command edge and clear `motion_done`.
+2. Hold `motion_done` LOW long enough for the PC to observe a busy state.
+3. Raise it only after that command reaches its destination.
+4. Keep the error flag accurate throughout the motion.
 
-```
-src/plc/plc_controller.py
-```
+The PC polls every 50 ms and accepts completion only after seeing LOW then HIGH
+following the command. A stale HIGH never advances the gripper sequence. A
+reset pulse shorter than the polling/network interval can be missed; the PLC
+must provide a visible busy interval or a request/acknowledgement protocol.
+The default waypoint timeout is 30 seconds, not a joint-speed estimate. On a
+fault, the cycle enters ERROR and requires correction and an explicit reset.
 
-`PLCController(cfg)` – wraps `snap7.client.Client`.  All methods guard
-against disconnected state and log errors rather than raising, keeping the
-GUI alive during transient faults.
+Joint targets are written before a command; a failed target write suppresses
+that command. Noncontiguous target fields are written in separate groups so the
+bytes in gaps are preserved. HOME issues one HOME command, without START_AUTO.
+Bit-group writes are serialized against other PC threads; read-modify-write
+cannot prevent the PLC itself from changing another bit in the same byte.
+Keep PC-owned command bytes separate from PLC-owned status bytes.
 
-```
-src/ai/yolo_detector.py
-```
+Software fault detection is not an emergency-stop system. Machine stopping,
+interlocks and actuator safety belong in the PLC/hardware design.
 
-`YOLODetector(model_path, thresh, px2mm, home_x, home_y)` – owns a single
-`cv2.VideoCapture`.  `process_frame()` returns
-`(has_defect, robot_x_mm, robot_y_mm, PIL.Image)`.
+## Source layout
 
-```
-src/ui/base_page.py
-```
-
-`BasePage(parent, controller, page_color)` – abstract `QWidget` providing
-`build_camera_selector()`, `build_status_bar()`, and
-`_refresh_error_status()` shared by both pages.
-
----
-
-## Running Tests
-
-```bash
-# Run all tests with coverage
-pytest tests/ --cov=src --cov-report=term-missing -v
-
-# Run a single test class
-pytest tests/test_robot_system.py::TestPLCController -v
-```
-
-Tests mock all hardware (`snap7.client.Client`, `cv2.VideoCapture`, YOLO
-model) so they execute in any headless environment without physical devices.
-
-### Test matrix
-
-| ID | Class | What is tested |
-|----|-------|---------------|
-| TC-01 | `TestConfigLoader` | Full YAML parses to correct fields (incl. new camera fields) |
-| TC-02 | `TestConfigLoader` | Missing file → `FileNotFoundError` |
-| TC-03 | `TestConfigLoader` | Partial YAML uses safe defaults (incl. inference/resolution fields) |
-| TC-04 | `TestPLCController` | `connect()` returns `True` on success |
-| TC-05 | `TestPLCController` | `connect()` returns `False` on exception |
-| TC-06 | `TestPLCController` | `read_status()` decodes DB bytes correctly |
-| TC-07 | `TestPLCController` | `read_status()` returns `{}` when offline |
-| TC-08 | `TestPLCController` | `send_command()` writes correct 2-byte buffer |
-| TC-09 | `TestPLCController` | `send_command()` skips when disconnected |
-| TC-10 | `TestPLCController` | `send_joint_targets()` writes 16-byte buffer |
-| TC-11 | `TestPLCController` | `send_joint_targets_and_command()` atomic write |
-| TC-12 | `TestYOLODetector` | `start_camera()` returns `True` on success |
-| TC-13 | `TestYOLODetector` | `read_frame()` returns `None` when no camera |
-| TC-14 | `TestYOLODetector` | `annotate_frame()` – no detections → home coordinates |
-| TC-15 | `TestYOLODetector` | `annotate_frame()` – above-thresh defect → robot coords |
-| TC-16 | `TestYOLODetector` | `switch_camera()` releases previous capture |
-| TC-17 | `TestYOLODetector` | `DetectionResult.to_pil()` resizes and converts |
-| TC-18 | `TestYOLODetector` | Model path not found → `FileNotFoundError` |
-| TC-19 | `TestInverseKinematics` | Reachable point → non-zero joint angles |
-| TC-20 | `TestInverseKinematics` | Out-of-reach point → `WorkspaceError` raised |
-| TC-21 | `TestInverseKinematics` | J3 / J4 are always `0.0` |
-| TC-22 | `TestInverseKinematics` | Negative link length → `ValueError` |
-| TC-23 | `TestInverseKinematics` | Edge-of-workspace (fully extended) |
-| TC-24 | `TestInverseKinematics` | Edge-of-workspace (fully folded) |
-| TC-25 | `TestInverseKinematics` | `reachable()` correctly classifies workspace |
-| TC-26 | `TestBasePage` | `update_video()` stores PhotoImage reference |
-| TC-27 | `TestPLCDbReadSize` | `compute_db_read_size()` rounds up to multiple of 4 |
-
-> Tests TC-04–TC-10 (PLC) and TC-12–TC-18 (YOLO) and TC-26 (BasePage) are
-> skipped when the respective hardware SDK (`snap7`, `cv2`, `PySide6`)
-> is not installed, allowing the full suite to run in a headless CI environment.
-
----
-
-## CI Pipeline
-
-GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push and
-pull request to `main` / `develop`:
-
-```
-Push / PR
-  └── lint-and-test (ubuntu-latest, Python 3.11 & 3.12)
-        ├── black --check          # Formatting gate
-        ├── ruff check             # Linting gate
-        └── pytest --cov-fail-under=80
+```text
+main.py                         Qt application, camera/PLC threads, sort worker
+src/config_loader.py            Typed config, validation, atomic settings save
+src/ai/yolo_detector.py          Camera read worker, inference, overlays
+src/ai/qr_reader.py              QR decoding, debounce and rearming
+src/ai/stability_tracker.py      Standalone tracker; not used by the live loop
+src/kinematics/                  Articulated-arm FK/IK and joint limits
+src/plc/plc_controller.py        Serialized snap7 access, grouped writes, pulses
+src/robot/sorting_controller.py  QR destinations and PC pick/place state machine
+src/ui/                         Auto, Manual, Settings, header and shared widgets
+tests/                          Mock-based automated tests
+tools/prepare_build.py          Icon conversion and external runtime asset copy
 ```
 
-The pipeline installs only lightweight CI-safe packages; hardware SDKs are
-replaced by `unittest.mock` stubs at test time.
+The Qt thread owns widgets. PLC polling, camera processing, camera reads, pulse
+resets and sorting run on workers. Signals deliver UI updates to the Qt thread.
+No CI workflow is currently shipped; run the tests locally.
 
----
+## Tests
 
-## Key Design Decisions
+```powershell
+python -m pip install -r requirements-dev.txt
+$env:QT_QPA_PLATFORM = "offscreen"
+$env:PYTEST_QT_API = "pyside6"
+python -m pytest tests -q
+```
 
-| Decision | Rationale |
-|----------|-----------|
-| `threading.Event` for shutdown | Threads wake immediately on stop, eliminating zombie processes |
-| Constructor-injected `RobotConfig` | No global state; fully testable without filesystem access |
-| Qt Signals & Slots for GUI updates | Ensures PLC data is dispatched on the Qt event loop (thread-safety) |
-| `BasePage` abstract base class | Eliminates camera-selector and status-bar duplication across pages |
-| `px2mm` in config | Camera-agnostic; recalibrate by changing one value, no code changes |
-| Bare `except` replaced with typed catches | Prevents silent swallowing of `KeyboardInterrupt` / `SystemExit` |
-| `src/kinematics/` module | Inverse kinematics isolated for unit-testing without GUI dependencies |
-| `read_frame` / `annotate_frame` split | Camera lock held only during fast read; YOLO inference runs unlocked |
-| `DetectionResult` dataclass | Separates detection state from PIL conversion; enables lazy rendering |
-| Exponential backoff for PLC reconnect | Avoids network flood when PLC is offline (max 30 s backoff) |
-| `__slots__` on all dataclasses | Reduces per-instance memory overhead during 10 Hz polling loops |
-| Rotating file log handler | Production-grade log retention without manual rotation |
-| Atomic `send_joint_targets_and_command` | Single `db_write` avoids PLC race condition between targets and command |
+Tests mock the PLC/camera/model and do not certify the physical robot or TIA
+logic. If importing `PySide6.QtCore` fails with a DLL error, repair that Python
+environment or use an environment with a working matching PySide6 installation.
+
+## Windows executable
+
+```powershell
+python -m pip install pyinstaller
+.\build_exe.bat
+```
+
+Run the build in the same environment that imports the application dependencies.
+The batch script generates an ICO, builds `RobotController.spec`, and copies
+config, assets, the configured model and optional calibration file beside
+`dist/RobotController/RobotController.exe`. It stops on failures. For portable
+builds, model/calibration paths must be relative and stay inside the project.
+Distribute the entire output directory. Validate the EXE on the target Windows
+machine with the actual camera, model and PLC before use.

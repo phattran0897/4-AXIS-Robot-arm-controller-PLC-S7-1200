@@ -14,7 +14,9 @@ class QRReader:
     Decodes QR codes from camera frames with debounce logic to ensure stability.
     """
 
-    def __init__(self, debounce_frames: int = 3, clear_frames: int = 15, miss_tolerance: int = 2) -> None:
+    def __init__(self, debounce_frames: int = 3, clear_frames: int = 3, miss_tolerance: int = 2) -> None:
+        if debounce_frames < 1 or miss_tolerance < 0 or clear_frames <= miss_tolerance:
+            raise ValueError("Require debounce_frames >= 1 and clear_frames > miss_tolerance >= 0")
         self.debounce_frames = debounce_frames
         self.clear_frames = clear_frames
         self.miss_tolerance = miss_tolerance
@@ -22,6 +24,12 @@ class QRReader:
         self._last_raw_value: str | None = None
         self._consecutive_count: int = 0
         self._none_count: int = 0
+
+    def reset(self) -> None:
+        """Forget the current item when changing camera or sorting mode."""
+        self._last_raw_value = None
+        self._consecutive_count = 0
+        self._none_count = 0
 
     def decode_qr(self, frame: np.ndarray) -> tuple[Literal["value", "clear", "none"], str | None]:
         """

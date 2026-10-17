@@ -17,7 +17,23 @@ plc:
     j1_target: 42
     j2_target: 46
     j3_target: 50
+    # FK/IK views below are separate configured addresses, even when intentionally
+    # aliased with joint targets. Verify their meanings against your TIA project.
+    theta_j1: 18
+    theta_j2: 22
+    theta_j3: 26
+    py_j2_ht: 30
+    pz_j3_ht: 34
+    px_j1_ht: 38
+    px_j1: 42
+    py_j2: 46
+    pz_j3: 50
+    theta_j2_ht: 54
+    theta_j3_ht: 58
+    theta_j1_ht: 62
     j4_target: -1  # Not mapped in PLC Image, set to -1 to ignore
+    # WARNING: byte 20 overlaps theta_j1 REAL (18..21). Match dedicated
+    # status bytes to the real TIA DB before enabling PC-Master motion.
     motion_done_byte: 20
     motion_done_bit: 0
     error_flag_byte: 20
@@ -40,6 +56,11 @@ plc:
 # ── YOLO / AI Vision ─────────────────────────────────────────────────────────
 yolo:
   model_path: "my_model/my_model.pt"
+  # Explicit model class mapping; names may be used instead of numeric IDs.
+  # Update this map when retraining; unmapped classes do not trigger sorting.
+  class_quality:
+    "0": "BAD"
+    "1": "GOOD"
   thresh: 0.3 
 
   # Pixel → millimetre scale factor (calibrate per camera/lens/mounting height)
@@ -115,6 +136,10 @@ app:
   color_theme: "blue"
   
   # "qr" for PLC-driven autonomous QR sorting, "vision" for PC-Master YOLO sorting
+  # Tune these to the observed gap between boxes (frames actually decoded).
+  qr_debounce_frames: 5
+  qr_clear_frames: 3
+  qr_miss_tolerance: 2
   sorting_mode: "qr" 
 
   # Background cyclic PLC polling rate (seconds)

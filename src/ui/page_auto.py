@@ -310,7 +310,7 @@ class PageAuto(BasePage):
         if self.controller and hasattr(self.controller, "cfg"):
             mode = self.controller.cfg.app.sorting_mode
 
-        lbl_g_title = QLabel("✅ TỐT" if mode == "vision" else "📦 TỔNG SỐ QR", good_card)
+        self.lbl_g_title = lbl_g_title = QLabel("✅ TỐT" if mode == "vision" else "📦 TỔNG SỐ QR", good_card)
         lbl_g_title.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; "
             f"border: none; background: transparent;"
@@ -334,7 +334,7 @@ class PageAuto(BasePage):
         bad_layout.setContentsMargins(10, 8, 10, 8)
         bad_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        lbl_b_title = QLabel("❌ XẤU" if mode == "vision" else "⚠ QR LỖI", bad_card)
+        self.lbl_b_title = lbl_b_title = QLabel("❌ XẤU" if mode == "vision" else "⚠ QR LỖI", bad_card)
         lbl_b_title.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; "
             f"border: none; background: transparent;"
@@ -400,9 +400,13 @@ class PageAuto(BasePage):
             return
 
         sorter = self.controller.sorter
+        mode = self.controller.cfg.app.sorting_mode
+        self.btn_capture.setVisible(mode == "vision")
+        self.lbl_g_title.setText("GOOD" if mode == "vision" else "QR WRITTEN")
+        self.lbl_b_title.setText("BAD" if mode == "vision" else "INVALID QR")
         # Update sorting counters
-        self.lbl_good.setText(str(sorter.counter_good))
-        self.lbl_bad.setText(str(sorter.counter_bad))
+        self.lbl_good.setText(str(sorter.counter_good if mode == "vision" else sorter.qr_written))
+        self.lbl_bad.setText(str(sorter.counter_bad if mode == "vision" else sorter.qr_invalid))
 
         # Update state displays
         state_str = sorter.state.name

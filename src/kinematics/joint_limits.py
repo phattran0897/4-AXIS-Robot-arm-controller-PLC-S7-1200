@@ -7,6 +7,7 @@ Manual Mode, and Automatic Sorting pipelines.
 
 from __future__ import annotations
 
+import math
 import threading
 from typing import Mapping
 
@@ -49,6 +50,8 @@ def validate_joint_angles(
 
     angles = {"j1": j1, "j2": j2, "j3": j3, "j4": j4}
     for name, val in angles.items():
+        if not math.isfinite(val):
+            raise WorkspaceError(f"Joint {name} must be finite.")
         if name in JOINT_LIMITS:
             lo, hi = JOINT_LIMITS[name]
             if val < (lo - tol) or val > (hi + tol):

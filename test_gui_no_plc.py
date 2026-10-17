@@ -92,6 +92,10 @@ class MockPLCController:
 
     # ── Data Block reads ─────────────────────────────────────────────────
 
+    def validate_motion_layout(self) -> None:
+        """The in-memory mock does not share raw REAL/status bytes."""
+        return
+
     def read_status(self) -> dict[str, Any]:
         """Return simulated PLC status data with smooth interpolation."""
         now = time.monotonic()

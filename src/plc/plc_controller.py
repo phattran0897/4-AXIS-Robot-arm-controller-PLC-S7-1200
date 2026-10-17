@@ -110,6 +110,9 @@ class PLCController:
         self._db_read_size: int = max(80, compute_db_read_size(cfg.offsets))
         self._lock: threading.RLock = threading.RLock()
         self._is_connected_cached: bool = False
+        # TTL cache for is_connected() – avoids calling get_connected() on every poll
+        self._connection_cache_time: float = 0.0
+        self._CONNECTION_CACHE_TTL: float = 0.5
         self.tx_callback: Callable[[str], None] | None = None
 
         # Active push-button pulses keyed by (byte, bit).
@@ -191,20 +194,48 @@ class PLCController:
                 log.warning("Error during PLC disconnect: %s", exc)
 
     def is_connected(self) -> bool:
-        """Return ``True`` if the snap7 client reports an active connection."""
+        """
+        Return ``True`` if the PLC is connected.
+
+        Uses ``get_connected()`` as the primary source of truth.  A short TTL
+        cache (0.5 s) prevents hammering the snap7 API on every poll cycle.
+        Cache is invalidated immediately by :meth:`_mark_disconnected`.
+        """
+        import time as _time
+
         with self._lock:
+            now = _time.monotonic()
+            if now - self._connection_cache_time < self._CONNECTION_CACHE_TTL:
+                return self._is_connected_cached
             try:
-                return self._is_connected_cached or bool(self._client.get_connected())
+                live = bool(self._client.get_connected())
             except Exception:
-                return False
+                live = False
+            self._is_connected_cached = live
+            self._connection_cache_time = now
+            return live
 
     def _mark_disconnected(self) -> None:
         """Flag the connection as lost after an I/O error (lock must be held)."""
         self._is_connected_cached = False
+        self._connection_cache_time = 0.0  # Invalidate TTL cache immediately
 
     # ------------------------------------------------------------------
     # Data Block reads
     # ------------------------------------------------------------------
+
+    def validate_motion_layout(self) -> None:
+        """PC-supervised motion requires dedicated status bits, never REAL bytes."""
+        off = self._cfg.offsets
+        real_names = ("j1_target", "j2_target", "j3_target", "j4_target",
+                      "theta_j1", "theta_j2", "theta_j3", "py_j2_ht", "pz_j3_ht",
+                      "px_j1_ht", "px_j1", "py_j2", "pz_j3", "theta_j2_ht",
+                      "theta_j3_ht", "theta_j1_ht")
+        for flag in ("motion_done_byte", "error_flag_byte"):
+            for name in real_names:
+                offset = getattr(off, name)
+                if offset >= 0 and offset <= getattr(off, flag) < offset + 4:
+                    raise ValueError(f"PLC {flag} overlaps REAL {name}; match dedicated status bytes to the TIA DB before PC-Master motion.")
 
     def read_status(self) -> dict[str, Any]:
         """
@@ -249,19 +280,19 @@ class PLCController:
                     "dong_hoc_thuan": get_bool(raw, *ADDR.KINE_FORWARD),
                     "dong_hoc_nghich": get_bool(raw, *ADDR.KINE_INVERSE),
                     # FK results block (word offsets 18-38)
-                    "theta_j1": get_real(raw, 18),
-                    "theta_j2": get_real(raw, 22),
-                    "theta_j3": get_real(raw, 26),
-                    "py_j2_ht": get_real(raw, 30),
-                    "pz_j3_ht": get_real(raw, 34),
-                    "px_j1_ht": get_real(raw, 38),
+                    "theta_j1": get_real(raw, off.theta_j1),
+                    "theta_j2": get_real(raw, off.theta_j2),
+                    "theta_j3": get_real(raw, off.theta_j3),
+                    "py_j2_ht": get_real(raw, off.py_j2_ht),
+                    "pz_j3_ht": get_real(raw, off.pz_j3_ht),
+                    "px_j1_ht": get_real(raw, off.px_j1_ht),
                     # IK data block (word offsets 42-62)
-                    "px_j1": get_real(raw, 42),
-                    "py_j2": get_real(raw, 46),
-                    "pz_j3": get_real(raw, 50),
-                    "theta_j2_ht": get_real(raw, 54),
-                    "theta_j3_ht": get_real(raw, 58),
-                    "theta_j1_ht": get_real(raw, 62),
+                    "px_j1": get_real(raw, off.px_j1),
+                    "py_j2": get_real(raw, off.py_j2),
+                    "pz_j3": get_real(raw, off.pz_j3),
+                    "theta_j2_ht": get_real(raw, off.theta_j2_ht),
+                    "theta_j3_ht": get_real(raw, off.theta_j3_ht),
+                    "theta_j1_ht": get_real(raw, off.theta_j1_ht),
                     # Status flags (config-driven offsets)
                     "motion_done": get_bool(
                         raw, off.motion_done_byte, off.motion_done_bit
@@ -285,11 +316,11 @@ class PLCController:
     # Data Block writes
     # ------------------------------------------------------------------
 
-    def write_bit(self, byte_offset: int, bit_offset: int, value: bool) -> None:
+    def write_bit(self, byte_offset: int, bit_offset: int, value: bool) -> bool:
         """Write a single bit to the PLC Data Block (thread-safe)."""
-        self.write_bits(byte_offset, {bit_offset: value})
+        return self.write_bits(byte_offset, {bit_offset: value})
 
-    def write_bits(self, byte_offset: int, bit_values: dict[int, bool]) -> None:
+    def write_bits(self, byte_offset: int, bit_values: dict[int, bool]) -> bool:
         """
         Set multiple bits within ONE byte using a single read-modify-write
         cycle (thread-safe).
@@ -299,10 +330,10 @@ class PLCController:
         own RMW sequences and silently losing each other's changes.
         """
         if not bit_values:
-            return
+            return True
         with self._lock:
             if not self.is_connected():
-                return
+                return False
             try:
                 data = bytearray(
                     self._client.db_read(self._cfg.db_number, byte_offset, 1)
@@ -310,6 +341,7 @@ class PLCController:
                 for bit_offset, value in bit_values.items():
                     set_bool(data, 0, bit_offset, value)
                 self._client.db_write(self._cfg.db_number, byte_offset, data)
+                return True
             except Exception as exc:
                 log.error(
                     "Failed to write bits at byte %d %s: %s",
@@ -318,8 +350,9 @@ class PLCController:
                     exc,
                 )
                 self._mark_disconnected()
+                return False
 
-    def write_classification(self, is_good: bool) -> None:
+    def write_classification(self, is_good: bool) -> bool:
         """
         Write the classification result bits to the PLC
         (PHAN_LOAI_HANG, HANG_TOT, HANG_XAU) in a single atomic cycle
@@ -335,12 +368,14 @@ class PLCController:
             groups.setdefault(byte_off, {})[bit_off] = value
 
         for byte_off, bit_values in groups.items():
-            self.write_bits(byte_off, bit_values)
+            if not self.write_bits(byte_off, bit_values):
+                return False
 
         label = "HANG_TOT" if is_good else "HANG_XAU"
         if self.tx_callback:
             self.tx_callback(f"Classification written: {label}")
         log.info("Classification written to PLC: is_good=%s", is_good)
+        return True
 
     def clear_classification(self) -> None:
         """Reset all classification bits to False on the PLC."""
@@ -387,7 +422,7 @@ class PLCController:
             self._pulse_worker_event.wait(timeout)
             self._pulse_worker_event.clear()
 
-    def send_pulse(self, byte_offset: int, bit_offset: int) -> None:
+    def send_pulse(self, byte_offset: int, bit_offset: int) -> bool:
         """
         Simulate a push-button press: write True immediately, then reset to
         False after :data:`PULSE_WIDTH_S` seconds via a single worker thread.
@@ -408,12 +443,18 @@ class PLCController:
             if previous is not None and hasattr(previous[0], "cancel"):
                 previous[0].cancel()
 
+            # A repeated command needs an observable LOW before the next edge.
+            if previous is not None:
+                threading.Event().wait(0.05)
+            if not self.write_bit(byte_offset, bit_offset, True):
+                self._pulse_expiries.pop(key, None)
+                return False
             self._pulse_expiries[key] = _time.monotonic() + self.PULSE_WIDTH_S
             handle = _PulseHandle(lambda b=byte_offset, o=bit_offset: self.cancel_pulse(b, o))
             self._pulse_timers[key] = (handle, generation)
 
-        self.write_bit(byte_offset, bit_offset, True)
         self._pulse_worker_event.set()
+        return True
 
     def cancel_pulse(self, byte_offset: int, bit_offset: int) -> None:
         """Immediately cancel a pending pulse and reset the bit to False."""
@@ -421,7 +462,7 @@ class PLCController:
         with self._lock:
             self._pulse_timers.pop(key, None)
             self._pulse_expiries.pop(key, None)
-        self.write_bit(byte_offset, bit_offset, False)
+            self.write_bit(byte_offset, bit_offset, False)
 
     def _finish_pulse(self, byte_offset: int, bit_offset: int, generation: int) -> None:
         """
@@ -438,9 +479,9 @@ class PLCController:
                 return  # Superseded by a newer pulse – do not reset.
             self._pulse_timers.pop(key, None)
             self._pulse_expiries.pop(key, None)
-        self.write_bit(byte_offset, bit_offset, False)
+            self.write_bit(byte_offset, bit_offset, False)
 
-    def send_command(self, cmd: int) -> None:
+    def send_command(self, cmd: int) -> bool:
         """
         Map a legacy command word to its push-button pulse.
 
@@ -449,71 +490,89 @@ class PLCController:
             3 → STOP_ROBOT · 4 → GAP_VAT
         """
         mapping: dict[int, tuple[int, int]] = {
-            0: ADDR.PAUSE,
-            1: ADDR.MOVE_TO_HOME,
-            2: ADDR.START_AUTO,
-            3: ADDR.STOP_ROBOT,
-            4: ADDR.GAP_VAT,
+            self._cfg.commands.idle: ADDR.PAUSE,
+            self._cfg.commands.home: ADDR.MOVE_TO_HOME,
+            self._cfg.commands.move: ADDR.START_AUTO,
+            self._cfg.commands.stop: ADDR.STOP_ROBOT,
+            self._cfg.commands.grip: ADDR.GAP_VAT,
         }
         addr = mapping.get(cmd)
         if addr is None:
             log.warning("Unknown PLC command word: %d", cmd)
-            return
-        self.send_pulse(addr[0], addr[1])
+            return False
+        return self.send_pulse(addr[0], addr[1])
 
-    def send_joint_targets(
+    def write_joint_targets(
         self,
         j1: float = 0.0,
         j2: float = 0.0,
         j3: float = 0.0,
         j4: float = 0.0,
-    ) -> None:
+    ) -> bool:
         """
-        Write joint-angle targets (degrees) to the PLC Data Block in a
-        single dynamic transaction and pulse START_AUTO to trigger motion.
+        Write joint-angle targets (degrees) to the PLC Data Block **without**
+        pulsing any command bit.
+
+        This is the correct primitive for the QR autonomous mode where the PLC
+        ladder program reads the targets and drives the sequence itself after the
+        NPN sensor fires.  Calling this function never triggers START_AUTO.
+
         When j4_target < 0 (unmapped), only J1..J3 are written (12 bytes),
         preventing memory overwrite of subsequent data.
+
+        Returns
+        -------
+        bool
+            ``True`` when db_write succeeds; ``False`` when the PLC is not
+            connected, no valid offset is configured, or the write raises.
         """
+        import math
+        if not all(math.isfinite(value) for value in (j1, j2, j3, j4)):
+            log.error("Non-finite joint targets rejected.")
+            return False
         with self._lock:
             if not self.is_connected():
-                log.warning("send_joint_targets skipped – PLC not connected.")
-                return
+                log.warning("write_joint_targets skipped – PLC not connected.")
+                return False
+
+            off = self._cfg.offsets
+            # Collect mapped joint targets (offset, value)
+            targets: list[tuple[int, float]] = []
+            if off.j1_target >= 0:
+                targets.append((off.j1_target, j1))
+            if off.j2_target >= 0:
+                targets.append((off.j2_target, j2))
+            if off.j3_target >= 0:
+                targets.append((off.j3_target, j3))
+            if off.j4_target >= 0:
+                targets.append((off.j4_target, j4))
+
+            if not targets:
+                log.warning(
+                    "write_joint_targets skipped – no valid target offsets configured."
+                )
+                return False
 
             try:
-                off = self._cfg.offsets
-                # Collect mapped joint targets (offset, value)
-                targets: list[tuple[int, float]] = []
-                if off.j1_target >= 0:
-                    targets.append((off.j1_target, j1))
-                if off.j2_target >= 0:
-                    targets.append((off.j2_target, j2))
-                if off.j3_target >= 0:
-                    targets.append((off.j3_target, j3))
-                if off.j4_target >= 0:
-                    targets.append((off.j4_target, j4))
-
-                if not targets:
-                    log.warning(
-                        "send_joint_targets skipped – no valid target offsets configured."
-                    )
-                    return
-
-                min_offset = min(o for o, _ in targets)
-                max_offset = max(o for o, _ in targets)
-                buf_len = (max_offset - min_offset) + 4
-                buf = bytearray(buf_len)
-
-                for offset, val in targets:
-                    set_real(buf, offset - min_offset, val)
-
-                self._client.db_write(self._cfg.db_number, min_offset, buf)
-
-                # Pulse the START_AUTO bit to command motion execution
-                self.send_pulse(*ADDR.START_AUTO)
+                # Never write across unmapped gaps: the PLC may own those bytes.
+                targets.sort()
+                groups = []
+                for offset, value in targets:
+                    if groups and offset == groups[-1][-1][0] + 4:
+                        groups[-1].append((offset, value))
+                    else:
+                        groups.append([(offset, value)])
+                for group in groups:
+                    buf = bytearray(4 * len(group))
+                    for index, (_, value) in enumerate(group):
+                        set_real(buf, 4 * index, value)
+                    self._client.db_write(self._cfg.db_number, group[0][0], buf)
+                min_offset = targets[0][0]
+                buf_len = 4 * len(targets)
 
                 log.debug(
-                    "Joint targets written to DB%d offset %d (len=%d bytes) – "
-                    "J1=%.2f J2=%.2f J3=%.2f J4=%.2f. Triggered START_AUTO.",
+                    "write_joint_targets: DB%d offset %d len=%d – "
+                    "J1=%.2f J2=%.2f J3=%.2f J4=%.2f (no pulse).",
                     self._cfg.db_number,
                     min_offset,
                     buf_len,
@@ -533,19 +592,60 @@ class PLCController:
                             f"Write Targets (3-DOF): J1={j1:.2f}°, J2={j2:.2f}°, "
                             f"J3={j3:.2f}°"
                         )
+                return True
             except Exception as exc:
-                log.error("send_joint_targets failed: %s", exc)
+                log.error("write_joint_targets failed: %s", exc)
                 self._mark_disconnected()
+                return False
+
+    def send_joint_targets(
+        self,
+        j1: float = 0.0,
+        j2: float = 0.0,
+        j3: float = 0.0,
+        j4: float = 0.0,
+    ) -> bool:
+        """
+        Write joint-angle targets (degrees) to the PLC Data Block and then
+        pulse START_AUTO to trigger motion (vision / manual mode).
+
+        For the QR autonomous mode use :meth:`write_joint_targets` instead –
+        it writes the same data but does **not** pulse any command bit.
+        """
+        wrote = self.write_joint_targets(j1, j2, j3, j4)
+        if wrote:
+            # Pulse the START_AUTO bit to command motion execution
+            if not self.send_pulse(*ADDR.START_AUTO):
+                return False
+            log.debug(
+                "send_joint_targets: triggered START_AUTO after writing "
+                "J1=%.2f J2=%.2f J3=%.2f J4=%.2f.",
+                j1,
+                j2,
+                j3,
+                j4,
+            )
+        return wrote
 
     def send_joint_targets_and_command(
         self, j1: float, j2: float, j3: float, j4: float, cmd: int
     ) -> None:
-        """Write joint targets and issue a specific command (e.g. MOVE)."""
-        self.send_joint_targets(j1, j2, j3, j4)
-        # Note: send_joint_targets already pulses START_AUTO (cmd 2);
-        # avoid double-pulsing when the caller requests exactly that.
-        if cmd != 2:
-            self.send_command(cmd)
+        """
+        Write joint targets then issue a specific command pulse.
+
+        If *cmd* maps to START_AUTO (cmd=2) use :meth:`send_joint_targets`
+        directly.  For all other commands (e.g. MOVE_TO_HOME = cmd=1) this
+        method writes the targets via :meth:`write_joint_targets` (no pulse)
+        and then calls :meth:`send_command` once – ensuring exactly one pulse
+        per move command regardless of which variant the caller uses.
+        """
+        if cmd == self._cfg.commands.move:
+            # START_AUTO is already included in send_joint_targets
+            self.send_joint_targets(j1, j2, j3, j4)
+        else:
+            # Write targets without START_AUTO, then pulse the requested command
+            if self.write_joint_targets(j1, j2, j3, j4):
+                self.send_command(cmd)
 
     def send_forward_kinematics_data(
         self,
@@ -561,14 +661,19 @@ class PLCController:
             if not self.is_connected():
                 return
             try:
-                buf = bytearray(24)
-                set_real(buf, 0, j1)  # THETA_J1 at 18.0
-                set_real(buf, 4, j2)  # THETA_J2 at 22.0
-                set_real(buf, 8, j3)  # THETA_J3 at 26.0
-                set_real(buf, 12, y)  # Py_J2_HT at 30.0
-                set_real(buf, 16, z)  # Pz_J3_HT at 34.0
-                set_real(buf, 20, x)  # Px_J1_HT at 38.0
-                self._client.db_write(self._cfg.db_number, 18, buf)
+                off = self._cfg.offsets
+                for offset, value in (
+                    (off.theta_j1, j1),
+                    (off.theta_j2, j2),
+                    (off.theta_j3, j3),
+                    (off.py_j2_ht, y),
+                    (off.pz_j3_ht, z),
+                    (off.px_j1_ht, x),
+                ):
+                    buf = bytearray(4)
+                    set_real(buf, 0, value)
+                    self._client.db_write(self._cfg.db_number, offset, buf)
+
                 log.info(
                     "Sent FK data: Theta=[%.2f, %.2f, %.2f], XYZ=[%.2f, %.2f, %.2f]",
                     j1,
@@ -596,14 +701,19 @@ class PLCController:
             if not self.is_connected():
                 return
             try:
-                buf = bytearray(24)
-                set_real(buf, 0, x)  # PX_J1 at 42.0
-                set_real(buf, 4, y)  # PY_J2 at 46.0
-                set_real(buf, 8, z)  # PZ_J3 at 50.0
-                set_real(buf, 12, j2)  # THETA_J2_HT at 54.0
-                set_real(buf, 16, j3)  # THETA_J3_HT at 58.0
-                set_real(buf, 20, j1)  # THETA_J1_HT at 62.0
-                self._client.db_write(self._cfg.db_number, 42, buf)
+                off = self._cfg.offsets
+                for offset, value in (
+                    (off.px_j1, x),
+                    (off.py_j2, y),
+                    (off.pz_j3, z),
+                    (off.theta_j2_ht, j2),
+                    (off.theta_j3_ht, j3),
+                    (off.theta_j1_ht, j1),
+                ):
+                    buf = bytearray(4)
+                    set_real(buf, 0, value)
+                    self._client.db_write(self._cfg.db_number, offset, buf)
+
                 log.info(
                     "Sent IK data: XYZ=[%.2f, %.2f, %.2f], Theta=[%.2f, %.2f, %.2f]",
                     x,

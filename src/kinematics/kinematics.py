@@ -188,6 +188,8 @@ def forward_kinematics(
     >>> round(x, 2), round(y, 2), round(z, 2), round(pitch, 2)
     (454.0, 0.0, 189.6, 0.0)
     """
+    if not all(math.isfinite(value) for value in (j1, j2, j3, j4)):
+        raise WorkspaceError("FK joint angles must be finite.")
     t1 = math.radians(j1)
     t2 = math.radians(j2)
     t23 = math.radians(j2 + j3)
@@ -269,6 +271,8 @@ def _inverse_kinematics_impl(
 ) -> tuple[float, float, float, float]:
     """Internal IK implementation (shared by ``inverse_kinematics`` and ``reachable``)."""
 
+    if not all(math.isfinite(value) for value in (x, y, z, phi)):
+        raise WorkspaceError("IK coordinates and pitch must be finite.")
     if elbow not in ("up", "down"):
         raise ValueError(
             f"elbow must be 'up' or 'down' (got {elbow!r})."

@@ -5,6 +5,8 @@ src/ui/page_settings.py – Application settings configuration page.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
+from dataclasses import fields
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import Qt
@@ -192,7 +194,7 @@ class PageSettings(BasePage):
             w = int(self._inputs["yolo.roi_width"][0].text() or 0)
             h = int(self._inputs["yolo.roi_height"][0].text() or 0)
             
-            if w > 0 and h > 0:
+            if x >= 0 and y >= 0 and w > 0 and h > 0:
                 self.controller.cfg.yolo.roi_x = x
                 self.controller.cfg.yolo.roi_y = y
                 self.controller.cfg.yolo.roi_width = w
@@ -202,8 +204,10 @@ class PageSettings(BasePage):
 
     def _save_settings(self) -> None:
         try:
-            cfg = self.controller.cfg
-            
+            if self.controller._sort_thread is not None and self.controller._sort_thread.is_alive():
+                raise ValueError("Wait for the current sorting cycle before applying settings.")
+            cfg = deepcopy(self.controller.cfg)
+
             # Extract
             def get_val(key):
                 inp, is_int = self._inputs[key]
@@ -234,7 +238,19 @@ class PageSettings(BasePage):
             save_config(cfg)
             
             # Reload YOLO threshold
-            self.controller.detector.conf_thresh = cfg.yolo.thresh
+            live = self.controller.cfg
+            # Preserve objects already referenced by the sorting worker.
+            for name in ("yolo", "app"):
+                for item in fields(getattr(cfg, name)):
+                    setattr(getattr(live, name), item.name, getattr(getattr(cfg, name), item.name))
+            for name in ("pick_z_down", "pick_z_up"):
+                setattr(live.sort_positions, name, getattr(cfg.sort_positions, name))
+            live.sort_positions.place_good.z_down = cfg.sort_positions.place_good.z_down
+            live.sort_positions.place_bad.z_down = cfg.sort_positions.place_bad.z_down
+            self.controller.detector.thresh = cfg.yolo.thresh
+            self.controller.detector.px2mm = cfg.yolo.px2mm
+            self.controller._sort_cooldown_duration = cfg.app.move_cooldown
+            self.controller.page_auto.btn_capture.setVisible(cfg.app.sorting_mode == "vision")
             
             QMessageBox.information(self, "Success", "Settings saved successfully to config.yaml!")
             

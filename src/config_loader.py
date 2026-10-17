@@ -20,6 +20,22 @@ import yaml
 
 
 # ---------------------------------------------------------------------------
+# Custom exception
+# ---------------------------------------------------------------------------
+
+
+class ConfigValidationError(ValueError):
+    """
+    Raised by :func:`load_config` when a required key is absent from the
+    YAML file (or from its expected sub-section).
+
+    Unlike a plain :exc:`ValueError` this signals to the caller (e.g.
+    ``main.py``) that the problem is a missing *configuration key* rather
+    than an invalid value, so a more actionable error message can be shown.
+    """
+
+
+# ---------------------------------------------------------------------------
 # Typed configuration dataclasses (all use __slots__ for memory efficiency)
 # ---------------------------------------------------------------------------
 
@@ -32,6 +48,18 @@ class PLCOffsets:
     j2_target: int = 8
     j3_target: int = 12
     j4_target: int = 16
+    theta_j1: int = 18
+    theta_j2: int = 22
+    theta_j3: int = 26
+    py_j2_ht: int = 30
+    pz_j3_ht: int = 34
+    px_j1_ht: int = 38
+    px_j1: int = 42
+    py_j2: int = 46
+    pz_j3: int = 50
+    theta_j2_ht: int = 54
+    theta_j3_ht: int = 58
+    theta_j1_ht: int = 62
     motion_done_byte: int = 20
     motion_done_bit: int = 0
     error_flag_byte: int = 20
@@ -77,6 +105,7 @@ class YOLOConfig:
     roi_height: int = 240
     # Optional camera calibration file path (OpenCV YAML/JSON)
     calibration_path: str = ""
+    class_quality: dict[str, str] = field(default_factory=lambda: {"0": "BAD", "1": "GOOD"})
 
 
 @dataclass(slots=True)
@@ -99,11 +128,11 @@ class CameraConfig:
 @dataclass(slots=True)
 class KinematicsConfig:
     # DH link parameters (mm)
-    a1: float = 0.0  # Base horizontal offset
+    a1: float = 0.0   # Base horizontal offset
     d1: float = 189.6  # Base height
     a2: float = 190.0  # Link 2 length
     a3: float = 190.0  # Link 3 length
-    a4: float = 74.0  # Link 4 / end-effector length
+    a4: float = 74.0   # Link 4 / end-effector length
     # Joint angle limits (degrees)
     j1_min: float = -180.0
     j1_max: float = 180.0
@@ -126,6 +155,9 @@ class AppConfig:
     sorting_mode: str = "vision"
     plc_poll_interval: float = 0.10
     move_cooldown: float = 1.50
+    qr_debounce_frames: int = 5
+    qr_clear_frames: int = 3
+    qr_miss_tolerance: int = 2
 
 
 @dataclass(slots=True)
@@ -211,16 +243,17 @@ def compute_db_read_size(offsets: PLCOffsets) -> int:
     Negative offsets (e.g. ``j4_target = -1``) indicate unmapped fields
     and are excluded from the size calculation.
     """
-    # j4_target may be -1 to indicate "not mapped" – ignore negative offsets
-    j4_end = (offsets.j4_target + 4) if offsets.j4_target >= 0 else 0
-    last_byte = max(
-        j4_end,
-        offsets.error_flag_byte + 1,
-        offsets.phan_loai_hang_byte + 1,
-        offsets.hang_tot_byte + 1,
-        offsets.hang_xau_byte + 1,
-    )
-    return ((last_byte + 3) // 4) * 4  # round up to nearest multiple of 4
+    real_fields = ("j1_target", "j2_target", "j3_target", "j4_target",
+                   "theta_j1", "theta_j2", "theta_j3", "py_j2_ht", "pz_j3_ht",
+                   "px_j1_ht", "px_j1", "py_j2", "pz_j3", "theta_j2_ht",
+                   "theta_j3_ht", "theta_j1_ht")
+    ends = [getattr(offsets, name) + 4 for name in real_fields if getattr(offsets, name) >= 0]
+    ends += [offsets.cmd_word + 2, offsets.status + 2,
+             offsets.motion_done_byte + 1, offsets.error_flag_byte + 1,
+             offsets.phan_loai_hang_byte + 1, offsets.hang_tot_byte + 1,
+             offsets.hang_xau_byte + 1, 17]
+    return ((max(ends) + 3) // 4) * 4
+
 
 
 def load_config(path: str | None = None) -> RobotConfig:
@@ -252,20 +285,44 @@ def load_config(path: str | None = None) -> RobotConfig:
     with open(resolved, encoding="utf-8") as fh:
         raw: dict[str, Any] = yaml.safe_load(fh) or {}
 
-    # ── PLC ─────────────────────────────────────────────────────────────────
+    # Helper: raise ConfigValidationError on missing required keys.
+    def _require(section_data: dict[str, Any], section: str, *keys: str) -> None:
+        for key in keys:
+            if key not in section_data:
+                raise ConfigValidationError(
+                    f"Missing required config key: {section}.{key}"
+                )
+
+    # PLC
     # NOTE: `or {}` (not `default={}`) because an *empty* YAML section parses
     # to None while still being a present key, which would crash `.get()`.
     plc_raw: dict[str, Any] = raw.get("plc") or {}
     off_raw: dict[str, Any] = plc_raw.get("offsets") or {}
     cmd_raw: dict[str, Any] = plc_raw.get("commands") or {}
 
+    # Validate required PLC keys (fail-fast: no silent fallback to wrong numbers)
+    _require(plc_raw, "plc", "db_number")
+    _require(off_raw, "plc.offsets", "j1_target", "j2_target", "j3_target", "j4_target")
+
     offsets = PLCOffsets(
         cmd_word=off_raw.get("cmd_word", 0),
         status=off_raw.get("status", 2),
-        j1_target=off_raw.get("j1_target", 4),
-        j2_target=off_raw.get("j2_target", 8),
-        j3_target=off_raw.get("j3_target", 12),
-        j4_target=off_raw.get("j4_target", 16),
+        j1_target=off_raw["j1_target"],
+        j2_target=off_raw["j2_target"],
+        j3_target=off_raw["j3_target"],
+        j4_target=off_raw["j4_target"],
+        theta_j1=off_raw.get("theta_j1", 18),
+        theta_j2=off_raw.get("theta_j2", 22),
+        theta_j3=off_raw.get("theta_j3", 26),
+        py_j2_ht=off_raw.get("py_j2_ht", 30),
+        pz_j3_ht=off_raw.get("pz_j3_ht", 34),
+        px_j1_ht=off_raw.get("px_j1_ht", 38),
+        px_j1=off_raw.get("px_j1", 42),
+        py_j2=off_raw.get("py_j2", 46),
+        pz_j3=off_raw.get("pz_j3", 50),
+        theta_j2_ht=off_raw.get("theta_j2_ht", 54),
+        theta_j3_ht=off_raw.get("theta_j3_ht", 58),
+        theta_j1_ht=off_raw.get("theta_j1_ht", 62),
         motion_done_byte=off_raw.get("motion_done_byte", 20),
         motion_done_bit=off_raw.get("motion_done_bit", 0),
         error_flag_byte=off_raw.get("error_flag_byte", 20),
@@ -288,7 +345,7 @@ def load_config(path: str | None = None) -> RobotConfig:
         ip=plc_raw.get("ip", "192.168.0.1"),
         rack=plc_raw.get("rack", 0),
         slot=plc_raw.get("slot", 1),
-        db_number=plc_raw.get("db_number", 10),
+        db_number=plc_raw["db_number"],
         offsets=offsets,
         commands=commands,
     )
@@ -306,6 +363,7 @@ def load_config(path: str | None = None) -> RobotConfig:
         roi_width=int(yolo_raw.get("roi_width", 240)),
         roi_height=int(yolo_raw.get("roi_height", 240)),
         calibration_path=str(yolo_raw.get("calibration_path", "")),
+        class_quality={str(k): v for k, v in yolo_raw.get("class_quality", {"0": "BAD", "1": "GOOD"}).items()},
     )
 
     # ── Camera ──────────────────────────────────────────────────────────────
@@ -323,21 +381,42 @@ def load_config(path: str | None = None) -> RobotConfig:
     )
 
     # ── Kinematics ──────────────────────────────────────────────────────────
+    # Kinematics
     kin_raw: dict[str, Any] = raw.get("kinematics") or {}
+
+    # Validate required kinematics keys (fail-fast: no silent fallback to wrong numbers)
+    _require(
+        kin_raw,
+        "kinematics",
+        "a1",
+        "d1",
+        "a2",
+        "a3",
+        "a4",
+        "j1_min",
+        "j1_max",
+        "j2_min",
+        "j2_max",
+        "j3_min",
+        "j3_max",
+        "j4_min",
+        "j4_max",
+    )
+
     kin_cfg = KinematicsConfig(
-        a1=float(kin_raw.get("a1", 40.0)),
-        d1=float(kin_raw.get("d1", 300.0)),
-        a2=float(kin_raw.get("a2", 190.0)),
-        a3=float(kin_raw.get("a3", 110.0)),
-        a4=float(kin_raw.get("a4", 65.0)),
-        j1_min=float(kin_raw.get("j1_min", -180.0)),
-        j1_max=float(kin_raw.get("j1_max", 180.0)),
-        j2_min=float(kin_raw.get("j2_min", 0.0)),
-        j2_max=float(kin_raw.get("j2_max", 250.0)),
-        j3_min=float(kin_raw.get("j3_min", 0.0)),
-        j3_max=float(kin_raw.get("j3_max", 200.0)),
-        j4_min=float(kin_raw.get("j4_min", -180.0)),
-        j4_max=float(kin_raw.get("j4_max", 180.0)),
+        a1=float(kin_raw["a1"]),
+        d1=float(kin_raw["d1"]),
+        a2=float(kin_raw["a2"]),
+        a3=float(kin_raw["a3"]),
+        a4=float(kin_raw["a4"]),
+        j1_min=float(kin_raw["j1_min"]),
+        j1_max=float(kin_raw["j1_max"]),
+        j2_min=float(kin_raw["j2_min"]),
+        j2_max=float(kin_raw["j2_max"]),
+        j3_min=float(kin_raw["j3_min"]),
+        j3_max=float(kin_raw["j3_max"]),
+        j4_min=float(kin_raw["j4_min"]),
+        j4_max=float(kin_raw["j4_max"]),
         default_phi=float(kin_raw.get("default_phi", 0.0)),
     )
 
@@ -351,6 +430,9 @@ def load_config(path: str | None = None) -> RobotConfig:
         sorting_mode=app_raw.get("sorting_mode", "vision"),
         plc_poll_interval=float(app_raw.get("plc_poll_interval", 0.10)),
         move_cooldown=float(app_raw.get("move_cooldown", 1.50)),
+        qr_debounce_frames=app_raw.get("qr_debounce_frames", 5),
+        qr_clear_frames=app_raw.get("qr_clear_frames", 3),
+        qr_miss_tolerance=app_raw.get("qr_miss_tolerance", 2),
     )
 
     # ── Sort Positions ──────────────────────────────────────────────────────
@@ -399,6 +481,61 @@ def load_config(path: str | None = None) -> RobotConfig:
     )
 
     # ── Validation ──────────────────────────────────────────────────────────
+    config = RobotConfig(
+        plc=plc_cfg,
+        yolo=yolo_cfg,
+        camera=cam_cfg,
+        kinematics=kin_cfg,
+        app=app_cfg,
+        sort_positions=sort_cfg,
+    )
+
+    validate_config(config)
+    return config
+
+
+def validate_config(config: RobotConfig) -> None:
+    """Validate loaded files and live settings before applying them."""
+    import math
+    from dataclasses import fields, is_dataclass
+
+    def check_finite(value):
+        if is_dataclass(value):
+            for item in fields(value):
+                check_finite(getattr(value, item.name))
+        elif isinstance(value, dict):
+            for item in value.values():
+                check_finite(item)
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("Configuration numbers must be finite.")
+    check_finite(config)
+    yolo_cfg, cam_cfg = config.yolo, config.camera
+    app_cfg, kin_cfg = config.app, config.kinematics
+    sort_cfg, offsets = config.sort_positions, config.plc.offsets
+    if app_cfg.move_cooldown < 0:
+        raise ValueError("app.move_cooldown must be non-negative.")
+    if any(type(getattr(app_cfg, name)) is not int for name in ("qr_debounce_frames", "qr_clear_frames", "qr_miss_tolerance")):
+        raise ValueError("QR frame thresholds must be integers.")
+    if app_cfg.qr_debounce_frames < 1 or not 0 <= app_cfg.qr_miss_tolerance < app_cfg.qr_clear_frames:
+        raise ValueError("Require qr_debounce_frames >= 1 and qr_clear_frames > qr_miss_tolerance >= 0.")
+    commands = [getattr(config.plc.commands, name) for name in config.plc.commands.__dataclass_fields__]
+    if any(type(value) is not int for value in commands) or len(set(commands)) != len(commands):
+        raise ValueError("PLC command values must be distinct integers.")
+    if app_cfg.sorting_mode not in ("qr", "vision"):
+        raise ValueError("app.sorting_mode must be qr or vision.")
+    if not yolo_cfg.class_quality or any(v not in ("GOOD", "BAD") for v in yolo_cfg.class_quality.values()):
+        raise ValueError("yolo.class_quality must map class names or IDs to GOOD or BAD.")
+    if not sort_cfg.pick_z_down < sort_cfg.pick_z_up:
+        raise ValueError("pick_z_down must be below pick_z_up.")
+    for name in offsets.__dataclass_fields__:
+        value = getattr(offsets, name)
+        if type(value) is not int:
+            raise ValueError(f"plc.offsets.{name} must be an integer.")
+        if name != "j4_target" and value < 0:
+            raise ValueError(f"plc.offsets.{name} must be non-negative.")
+    spans = sorted((getattr(offsets, f"j{i}_target"), i) for i in range(1, 5) if getattr(offsets, f"j{i}_target") >= 0)
+    if any(right[0] < left[0] + 4 for left, right in zip(spans, spans[1:])):
+        raise ValueError("PLC joint target REAL fields must not overlap.")
     if not 0.0 < yolo_cfg.thresh <= 1.0:
         raise ValueError(f"yolo.thresh must be in (0, 1] (got {yolo_cfg.thresh}).")
     if yolo_cfg.px2mm <= 0.0:
@@ -500,14 +637,6 @@ def load_config(path: str | None = None) -> RobotConfig:
         if not sort_cfg.locations:
             raise ValueError("sorting_mode is 'qr' but sort_positions.locations is empty.")
 
-    return RobotConfig(
-        plc=plc_cfg,
-        yolo=yolo_cfg,
-        camera=cam_cfg,
-        kinematics=kin_cfg,
-        app=app_cfg,
-        sort_positions=sort_cfg,
-    )
 
 
 def save_config(config: RobotConfig, path: str = _DEFAULT_CONFIG_PATH) -> None:
@@ -516,7 +645,9 @@ def save_config(config: RobotConfig, path: str = _DEFAULT_CONFIG_PATH) -> None:
     Uses regex replacements to preserve comments and file structure.
     """
     import re
-    
+    import tempfile
+    validate_config(config)
+
     with open(path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
@@ -548,7 +679,7 @@ def save_config(config: RobotConfig, path: str = _DEFAULT_CONFIG_PATH) -> None:
             current_subsection = None
             continue
 
-        subsec_match = re.match(r"^\s{2}([a-zA-Z0-9_]+):", line)
+        subsec_match = re.match(r"^ {2}([a-zA-Z0-9_]+):\s*(?:#.*)?$", line)
         if subsec_match and current_section == "sort_positions":
             current_subsection = subsec_match.group(1)
             continue
@@ -559,6 +690,8 @@ def save_config(config: RobotConfig, path: str = _DEFAULT_CONFIG_PATH) -> None:
             key = kv_match.group(2)
             tail = kv_match.group(4)
 
+            if current_section == "sort_positions" and len(indent) == 2:
+                current_subsection = None
             lookup = None
             if current_section == "sort_positions" and current_subsection in ("place_good", "place_bad"):
                 lookup = (current_subsection, key)
@@ -570,5 +703,13 @@ def save_config(config: RobotConfig, path: str = _DEFAULT_CONFIG_PATH) -> None:
                 new_val_str = "true" if new_val is True else "false" if new_val is False else str(new_val)
                 lines[i] = f"{indent}{key}: {new_val_str} {tail}\n".replace("  \n", "\n")
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(os.path.abspath(path)), suffix=".yaml", delete=False) as f:
+            temp_path = f.name
+            f.writelines(lines)
+        load_config(temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)

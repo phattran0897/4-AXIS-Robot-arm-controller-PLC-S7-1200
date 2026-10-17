@@ -118,6 +118,7 @@ class YOLODetector:
         inference_height: int = _DEFAULT_INFERENCE_HEIGHT,
         camera_read_timeout: float = 2.0,
         calibration_path: str = "",
+        class_quality: dict[str, str] | None = None,
     ) -> None:
         resolved = self._resolve_model_path(model_path)
         self.model: YOLO = YOLO(resolved, task="detect")
@@ -132,6 +133,7 @@ class YOLODetector:
                 f"'detect' is required. Check model_path or retrain for detection."
             )
 
+        self.class_quality = {"0": "BAD", "1": "GOOD"} if class_quality is None else dict(class_quality)
         self.thresh: float = float(thresh)
         self.px2mm: float = float(px2mm)
         self.home_x: float = float(home_x)
@@ -183,7 +185,8 @@ class YOLODetector:
         (as produced by ``cv2.calibrateCamera`` and ``cv2.FileStorage``).
         Falls back silently to px2mm when the file is missing or malformed.
         """
-        resolved = os.path.abspath(path)
+        root = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.join(os.path.dirname(__file__), "..", "..")
+        resolved = os.path.abspath(os.path.join(root, path))
         if not os.path.isfile(resolved):
             log.warning(
                 "Calibration file not found: %s – falling back to px2mm.", resolved
@@ -238,12 +241,17 @@ class YOLODetector:
                 "Background camera probe complete. Available cameras: %s", available
             )
 
+    def classify_quality(self, class_id: int, class_name: str = "") -> str | None:
+        """Names take precedence over IDs; unknown classes never authorize a sort."""
+        return self.class_quality.get(class_name, self.class_quality.get(str(class_id)))
+
     def _resolve_model_path(self, model_path: str) -> str:
         """Resolve model path relative to project root if not absolute."""
         if os.path.isabs(model_path) and os.path.isfile(model_path):
             return model_path
         resolved = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", model_path)
+            os.path.join(os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+                         else os.path.join(os.path.dirname(__file__), "..", ".."), model_path)
         )
         if not os.path.isfile(resolved):
             raise FileNotFoundError(
@@ -629,7 +637,7 @@ class YOLODetector:
         -------
         has_defect, robot_x, robot_y, class_id, class_name
         """
-        results = self.model(frame, verbose=False)
+        results = self.model(frame, verbose=False, conf=self.thresh)
         boxes = results[0].boxes
 
         has_defect = False
@@ -640,7 +648,7 @@ class YOLODetector:
         detection_count = 0
 
         has_defect_hysteresis_set = False
-        for i in range(len(boxes)):
+        for i in sorted(range(len(boxes)), key=lambda i: float(boxes[i].conf.item()), reverse=True):
             xyxy: np.ndarray = boxes[i].xyxy.cpu().numpy().squeeze()
             if xyxy.ndim == 0 or xyxy.size != 4:
                 continue
@@ -649,18 +657,19 @@ class YOLODetector:
             conf: float = float(boxes[i].conf.item())
             cls_id: int = int(boxes[i].cls.item())
 
-            if conf <= self.thresh:
+            if conf < self.thresh:
                 continue
 
             defect_cx = (xmin + xmax) / 2.0
             defect_cy = (ymin + ymax) / 2.0
 
             # Get class name from model
-            cls_name = (
-                self.model.names.get(cls_id, f"class_{cls_id}")
-                if hasattr(self.model, "names")
-                else f"class_{cls_id}"
-            )
+            names = getattr(self.model, "names", {})
+            if isinstance(names, dict):
+                cls_name = names.get(cls_id, f"class_{cls_id}")
+            else:
+                cls_name = names[cls_id] if 0 <= cls_id < len(names) else f"class_{cls_id}"
+
 
             # Per-box coordinates for the overlay label (robot_x/robot_y keep
             # the FIRST detection's values as the returned pick target).
@@ -690,8 +699,9 @@ class YOLODetector:
 
             # Determine quality label based on class_id
             # Model class mapping: 0 = Defect (XAU), 1 = Good (TOT)
-            quality_label = "XAU" if cls_id == 0 else "TOT"
-            quality_color = (0, 0, 255) if cls_id == 0 else (0, 255, 0)  # Red / Green
+            quality = self.classify_quality(cls_id, cls_name)
+            quality_label = {"BAD": "XAU", "GOOD": "TOT"}.get(quality, "UNKNOWN")
+            quality_color = {"BAD": (0, 0, 255), "GOOD": (0, 255, 0)}.get(quality, (0, 165, 255))
 
             cv2.rectangle(
                 frame, (xmin, ymin), (xmax, ymax), quality_color, _BBOX_THICKNESS
@@ -739,6 +749,8 @@ class YOLODetector:
                 _TEXT_THICKNESS,
             )
 
+        if not has_defect:
+            self._last_robot_x = self._last_robot_y = None
         return has_defect, robot_x, robot_y, class_id, class_name
 
     # ------------------------------------------------------------------

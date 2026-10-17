@@ -145,6 +145,10 @@ class TestConfigLoader(unittest.TestCase):
               offsets:
                 cmd_word: 0
                 status: 2
+                j1_target: 4
+                j2_target: 8
+                j3_target: 12
+                j4_target: 16
               commands:
                 idle: 0
                 home: 1
@@ -170,6 +174,14 @@ class TestConfigLoader(unittest.TestCase):
               a2: 190.0
               a3: 110.0
               a4: 65.0
+              j1_min: -180.0
+              j1_max: 180.0
+              j2_min: -180.0
+              j2_max: 250.0
+              j3_min: 0.0
+              j3_max: 200.0
+              j4_min: -180.0
+              j4_max: 180.0
             app:
               title: "Test Robot"
               geometry: "800x600"
@@ -209,8 +221,33 @@ class TestConfigLoader(unittest.TestCase):
 
     # ── TC-03 ────────────────────────────────────────────────────────────────
     def test_partial_yaml_uses_safe_defaults(self) -> None:
-        """Missing YAML keys must fall back to sensible defaults."""
-        path = self._write_yaml("plc:\n  ip: '192.168.1.50'\n")
+        """Missing optional YAML keys must fall back to sensible defaults."""
+        path = self._write_yaml(
+            """
+            plc:
+              ip: "192.168.1.50"
+              db_number: 1
+              offsets:
+                j1_target: 4
+                j2_target: 8
+                j3_target: 12
+                j4_target: 16
+            kinematics:
+              a1: 0.0
+              d1: 189.6
+              a2: 190.0
+              a3: 190.0
+              a4: 74.0
+              j1_min: -180.0
+              j1_max: 180.0
+              j2_min: -180.0
+              j2_max: 250.0
+              j3_min: 0.0
+              j3_max: 200.0
+              j4_min: -180.0
+              j4_max: 180.0
+            """
+        )
         try:
             from src.config_loader import load_config
 
@@ -221,6 +258,42 @@ class TestConfigLoader(unittest.TestCase):
             self.assertEqual(cfg.camera.fps, 30)
             self.assertEqual(cfg.camera.inference_width, 640)
             self.assertAlmostEqual(cfg.camera.read_timeout, 2.0)
+        finally:
+            os.unlink(path)
+
+    def test_missing_required_plc_key_raises_validation_error(self) -> None:
+        """load_config() must raise ConfigValidationError when plc.db_number is missing."""
+        from src.config_loader import ConfigValidationError, load_config
+
+        path = self._write_yaml("plc:\n  ip: '192.168.1.50'\n")
+        try:
+            with self.assertRaises(ConfigValidationError) as ctx:
+                load_config(path)
+            self.assertIn("plc.db_number", str(ctx.exception))
+        finally:
+            os.unlink(path)
+
+    def test_missing_required_kinematics_key_raises_validation_error(self) -> None:
+        """load_config() must raise ConfigValidationError when kinematics keys are missing."""
+        from src.config_loader import ConfigValidationError, load_config
+
+        path = self._write_yaml(
+            """
+            plc:
+              db_number: 1
+              offsets:
+                j1_target: 4
+                j2_target: 8
+                j3_target: 12
+                j4_target: 16
+            kinematics:
+              a1: 0.0
+            """
+        )
+        try:
+            with self.assertRaises(ConfigValidationError) as ctx:
+                load_config(path)
+            self.assertIn("kinematics.d1", str(ctx.exception))
         finally:
             os.unlink(path)
 
@@ -426,6 +499,30 @@ class TestPLCController(unittest.TestCase):
         mock_client.db_write.assert_any_call(
             ctrl._cfg.db_number, target_offset, unittest.mock.ANY
         )
+
+    def test_write_joint_targets_writes_targets_without_pulse(self) -> None:
+        """write_joint_targets() must write targets and return True WITHOUT pulsing START_AUTO."""
+        ctrl, mock_client = self._make_controller()
+        mock_client.get_connected.return_value = True
+
+        with patch.object(ctrl, "send_pulse") as mock_pulse:
+            success = ctrl.write_joint_targets(10.0, 20.0, 30.0, 40.0)
+            self.assertTrue(success)
+            mock_pulse.assert_not_called()
+
+        target_offset = ctrl._cfg.offsets.j1_target
+        mock_client.db_write.assert_called_once_with(
+            ctrl._cfg.db_number, target_offset, unittest.mock.ANY
+        )
+
+    def test_write_joint_targets_returns_false_when_disconnected(self) -> None:
+        """write_joint_targets() must return False and skip write when offline."""
+        ctrl, mock_client = self._make_controller()
+        mock_client.get_connected.return_value = False
+
+        success = ctrl.write_joint_targets(10.0, 20.0, 30.0, 40.0)
+        self.assertFalse(success)
+        mock_client.db_write.assert_not_called()
 
 
 # ===========================================================================
@@ -760,6 +857,106 @@ class TestSortingController(unittest.TestCase):
         self.assertEqual(sorter.counter_good, 0)
         self.assertEqual(sorter.counter_bad, 0)
 
+    def test_process_qr_target_calls_write_joint_targets_not_send_pulse(self) -> None:
+        """process_qr_target() must call write_joint_targets without firing START_AUTO pulse."""
+        from src.config_loader import (
+            JointPosition,
+            KinematicsConfig,
+            PLCCommands,
+            SortPositionsConfig,
+        )
+        from src.robot.sorting_controller import SortingController
+
+        positions = SortPositionsConfig(
+            locations={"A1": JointPosition(j1=90.0, j2=45.0, j3=90.0, j4=0.0)}
+        )
+        mock_plc = MagicMock()
+        mock_plc.write_joint_targets.return_value = True
+
+        sorter = SortingController(
+            mock_plc, positions, KinematicsConfig(), PLCCommands()
+        )
+        result = sorter.process_qr_target("A1")
+
+        self.assertTrue(result)
+        mock_plc.write_joint_targets.assert_called_once_with(90.0, 45.0, 90.0, 0.0)
+        mock_plc.send_joint_targets.assert_not_called()
+        mock_plc.send_pulse.assert_not_called()
+        self.assertEqual(sorter.qr_written, 1)
+        self.assertEqual(sorter.counter_good, 0)
+
+    def test_process_qr_target_unknown_code_returns_false(self) -> None:
+        """process_qr_target() must reject codes not configured in locations."""
+        from src.config_loader import KinematicsConfig, PLCCommands, SortPositionsConfig
+        from src.robot.sorting_controller import SortingController
+
+        mock_plc = MagicMock()
+        sorter = SortingController(
+            mock_plc, SortPositionsConfig(), KinematicsConfig(), PLCCommands()
+        )
+        result = sorter.process_qr_target("UNKNOWN_CODE")
+        self.assertFalse(result)
+        mock_plc.write_joint_targets.assert_not_called()
+
+    def test_process_qr_target_clear_resets_and_allows_rescan(self) -> None:
+        """'CLEAR' sentinel must reset last QR value and allow rescanning same code."""
+        from src.config_loader import (
+            JointPosition,
+            KinematicsConfig,
+            PLCCommands,
+            SortPositionsConfig,
+        )
+        from src.robot.sorting_controller import SortingController
+
+        positions = SortPositionsConfig(
+            locations={"B2": JointPosition(j1=-90.0, j2=45.0, j3=90.0, j4=0.0)}
+        )
+        mock_plc = MagicMock()
+        mock_plc.write_joint_targets.return_value = True
+
+        sorter = SortingController(
+            mock_plc, positions, KinematicsConfig(), PLCCommands()
+        )
+
+        # 1. First scan succeeds
+        self.assertTrue(sorter.process_qr_target("B2"))
+        self.assertEqual(mock_plc.write_joint_targets.call_count, 1)
+
+        # 2. Duplicate scan without CLEAR is ignored
+        self.assertFalse(sorter.process_qr_target("B2"))
+        self.assertEqual(mock_plc.write_joint_targets.call_count, 1)
+
+        # 3. CLEAR resets
+        self.assertFalse(sorter.process_qr_target("CLEAR"))
+        self.assertIsNone(sorter._last_qr_value)
+
+        # 4. Rescanning B2 now succeeds again
+        self.assertTrue(sorter.process_qr_target("B2"))
+        self.assertEqual(mock_plc.write_joint_targets.call_count, 2)
+
+    def test_process_qr_target_failed_write_permits_retry(self) -> None:
+        """When write_joint_targets fails, _last_qr_value must not be locked."""
+        from src.config_loader import (
+            JointPosition,
+            KinematicsConfig,
+            PLCCommands,
+            SortPositionsConfig,
+        )
+        from src.robot.sorting_controller import SortingController
+
+        positions = SortPositionsConfig(
+            locations={"A1": JointPosition(j1=90.0, j2=45.0, j3=90.0, j4=0.0)}
+        )
+        mock_plc = MagicMock()
+        mock_plc.write_joint_targets.return_value = False
+
+        sorter = SortingController(
+            mock_plc, positions, KinematicsConfig(), PLCCommands()
+        )
+        result = sorter.process_qr_target("A1")
+        self.assertFalse(result)
+        self.assertIsNone(sorter._last_qr_value)
+
 
 # ---------------------------------------------------------------------------
 # 8 – Regression tests for reviewed bug fixes
@@ -774,7 +971,32 @@ class TestConfigDefaultsRegression(unittest.TestCase):
         """Empty sort_positions section must fall back to z=80/150, never -50/0."""
         from src.config_loader import load_config
 
-        path = TestConfigLoader()._write_yaml("sort_positions:\n")
+        path = TestConfigLoader()._write_yaml(
+            """
+            plc:
+              db_number: 1
+              offsets:
+                j1_target: 4
+                j2_target: 8
+                j3_target: 12
+                j4_target: 16
+            kinematics:
+              a1: 0.0
+              d1: 189.6
+              a2: 190.0
+              a3: 190.0
+              a4: 74.0
+              j1_min: -180.0
+              j1_max: 180.0
+              j2_min: -180.0
+              j2_max: 250.0
+              j3_min: 0.0
+              j3_max: 200.0
+              j4_min: -180.0
+              j4_max: 180.0
+            sort_positions:
+            """
+        )
         try:
             cfg = load_config(path)
             self.assertAlmostEqual(cfg.sort_positions.place_good.z_down, 80.0)
@@ -790,7 +1012,31 @@ class TestConfigDefaultsRegression(unittest.TestCase):
         """Every sort-position fallback must equal its dataclass default."""
         from src.config_loader import SortPositionsConfig, load_config
 
-        path = TestConfigLoader()._write_yaml("")
+        path = TestConfigLoader()._write_yaml(
+            """
+            plc:
+              db_number: 1
+              offsets:
+                j1_target: 4
+                j2_target: 8
+                j3_target: 12
+                j4_target: 16
+            kinematics:
+              a1: 0.0
+              d1: 189.6
+              a2: 190.0
+              a3: 190.0
+              a4: 74.0
+              j1_min: -180.0
+              j1_max: 180.0
+              j2_min: -180.0
+              j2_max: 250.0
+              j3_min: 0.0
+              j3_max: 200.0
+              j4_min: -180.0
+              j4_max: 180.0
+            """
+        )
         try:
             cfg = load_config(path)
             defaults = SortPositionsConfig()
@@ -901,19 +1147,16 @@ class TestMoveAndWaitRegression(unittest.TestCase):
         return sorter, mock_plc
 
     # ── R-04 ────────────────────────────────────────────────────────────────
-    def test_motion_done_true_returns_quickly(self) -> None:
+    def test_stale_motion_done_never_completes_waypoint(self) -> None:
         """A motion_done=True status must complete the wait without timeout."""
         import time as _time
 
         sorter, mock_plc = self._make_sorter()
         mock_plc.read_status.return_value = {"motion_done": True, "error_flag": False}
 
-        start = _time.monotonic()
-        sorter._move_and_wait(10.0, 20.0, 30.0, 0.0)
-        elapsed = _time.monotonic() - start
-
-        self.assertLess(elapsed, 1.0)
-        self.assertEqual(sorter._previous_joints, (10.0, 20.0, 30.0, 0.0))
+        with self.assertRaises(TimeoutError):
+            sorter._move_and_wait(10.0, 20.0, 30.0, 0.0, timeout=0.08)
+        self.assertEqual(sorter._previous_joints, (0.0, 0.0, 0.0, 0.0))
 
     def test_plc_offline_during_motion_raises(self) -> None:
         """An empty read_status mid-motion must raise RuntimeError."""
@@ -956,7 +1199,51 @@ class TestConfigRangeValidation(unittest.TestCase):
     """Out-of-range config values must raise ValueError at load time."""
 
     def _assert_load_raises(self, yaml_fragment: str) -> None:
-        path = TestConfigLoader()._write_yaml(yaml_fragment)
+        import yaml as _yaml
+
+        base: dict[str, Any] = {
+            "plc": {
+                "db_number": 1,
+                "offsets": {
+                    "cmd_word": 0,
+                    "status": 2,
+                    "j1_target": 4,
+                    "j2_target": 8,
+                    "j3_target": 12,
+                    "j4_target": 16,
+                },
+            },
+            "kinematics": {
+                "a1": 0.0,
+                "d1": 189.6,
+                "a2": 190.0,
+                "a3": 190.0,
+                "a4": 74.0,
+                "j1_min": -180.0,
+                "j1_max": 180.0,
+                "j2_min": -180.0,
+                "j2_max": 250.0,
+                "j3_min": 0.0,
+                "j3_max": 200.0,
+                "j4_min": -180.0,
+                "j4_max": 180.0,
+            },
+        }
+        parsed_frag = _yaml.safe_load(yaml_fragment) or {}
+        for section, content in parsed_frag.items():
+            if isinstance(content, dict) and section in base:
+                if (
+                    "offsets" in content
+                    and isinstance(content["offsets"], dict)
+                    and "offsets" in base[section]
+                ):
+                    base[section]["offsets"].update(content["offsets"])
+                    content = {k: v for k, v in content.items() if k != "offsets"}
+                base[section].update(content)
+            else:
+                base[section] = content
+
+        path = TestConfigLoader()._write_yaml(_yaml.safe_dump(base))
         try:
             from src.config_loader import load_config
 
@@ -988,7 +1275,31 @@ class TestConfigRangeValidation(unittest.TestCase):
 
     def test_j4_sentinel_minus_one_is_allowed(self) -> None:
         """j4_target = -1 is the documented 'unmapped' sentinel – must pass."""
-        path = TestConfigLoader()._write_yaml("plc:\n  offsets:\n    j4_target: -1\n")
+        path = TestConfigLoader()._write_yaml(
+            """
+            plc:
+              db_number: 1
+              offsets:
+                j1_target: 4
+                j2_target: 8
+                j3_target: 12
+                j4_target: -1
+            kinematics:
+              a1: 0.0
+              d1: 189.6
+              a2: 190.0
+              a3: 190.0
+              a4: 74.0
+              j1_min: -180.0
+              j1_max: 180.0
+              j2_min: -180.0
+              j2_max: 250.0
+              j3_min: 0.0
+              j3_max: 200.0
+              j4_min: -180.0
+              j4_max: 180.0
+            """
+        )
         try:
             from src.config_loader import load_config
 
@@ -1375,6 +1686,36 @@ class TestPLCBufferContents(unittest.TestCase):
         self.assertEqual(len(call_buf), 12)
         # Verify bytes 42..53 are written; byte 54 is never touched
         self.assertEqual(42 + len(call_buf), 54)
+
+    def test_write_joint_targets_unmapped_j4_writes_12_bytes(self) -> None:
+        """When j4_target == -1, write_joint_targets must write exactly 12 bytes and no pulse."""
+        from src.config_loader import PLCOffsets
+        from src.plc.plc_controller import PLCController
+
+        cfg = _make_robot_config().plc
+        cfg.offsets = PLCOffsets(
+            j1_target=42,
+            j2_target=46,
+            j3_target=50,
+            j4_target=-1,
+        )
+        ctrl = PLCController(cfg)
+        mock_client = MagicMock()
+        mock_client.get_connected.return_value = True
+        mock_client.db_read.return_value = bytearray(1)
+        ctrl._client = mock_client
+
+        with patch.object(ctrl, "send_pulse") as mock_pulse:
+            success = ctrl.write_joint_targets(10.0, 20.0, 30.0, 40.0)
+            self.assertTrue(success)
+            mock_pulse.assert_not_called()
+
+        target_offset = 42
+        mock_client.db_write.assert_called_once_with(
+            cfg.db_number, target_offset, unittest.mock.ANY
+        )
+        call_buf = mock_client.db_write.call_args[0][2]
+        self.assertEqual(len(call_buf), 12)
 
     def test_ik_raises_when_joint_limits_exceeded(self) -> None:
         """Target with joint angle exceeding JOINT_LIMITS must raise WorkspaceError."""

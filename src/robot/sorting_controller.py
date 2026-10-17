@@ -32,10 +32,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-#: Assumed worst-case joint speed used to estimate travel times (deg/s).
-_JOINT_SPEED_DPS: float = 45.0
-#: Extra seconds added on top of the estimated travel time before giving up.
-_MOTION_GRACE_S: float = 1.0
 
 
 class SortResult(Enum):
@@ -73,11 +69,17 @@ class SortingController:
         self.kinematics: KinematicsConfig = kinematics
         self.plc_commands: PLCCommands = plc_commands
 
+        self._qr_lock = threading.RLock()
         self._state: RobotState = RobotState.IDLE
         self._counter_good: int = 0
         self._counter_bad: int = 0
+        self._qr_written: int = 0
+        self._qr_invalid: int = 0
         self._last_sort_result: SortResult | None = None
         self._last_qr_value: str | None = None
+        # Timestamp of the last (failed) write attempt for the same QR code.
+        # Used to rate-limit retries to at most once per second.
+        self._last_qr_retry_time: float = 0.0
 
         # Commanded joint angles mirrored to the GUI (NOT the motion feedback)
         self._current_joints: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
@@ -144,6 +146,14 @@ class SortingController:
         """Get count of bad items processed."""
         return self._counter_bad
 
+    @property
+    def qr_written(self) -> int:
+        return self._qr_written
+
+    @property
+    def qr_invalid(self) -> int:
+        return self._qr_invalid
+
     def is_idle(self) -> bool:
         """Check if robot state is IDLE (ready for next task)."""
         return self._state == RobotState.IDLE
@@ -160,18 +170,20 @@ class SortingController:
 
     def reset_counters(self) -> None:
         """Reset good and bad sorting statistics counters."""
-        self._counter_good = 0
-        self._counter_bad = 0
+        with self._qr_lock:
+            self._counter_good = 0
+            self._counter_bad = 0
+            self._qr_written = 0
+            self._qr_invalid = 0
         log.info("Sorting counters reset to zero.")
 
     def clear_error(self) -> None:
         """Reset the internal controller state to IDLE after an error has been resolved."""
         self._state = RobotState.IDLE
         self._last_sort_result = None
-        self._last_qr_value = None
-        # Unblock any _wait_event.wait() calls so the sort thread can exit
-        self._wait_event.set()
-        self._wait_event.clear()
+        with self._qr_lock:
+            self._last_qr_value = None
+            self._last_qr_retry_time = 0.0
         log.info("SortingController error state cleared; reset to IDLE.")
 
     def _ik(self, x: float, y: float, z: float) -> tuple[float, float, float, float]:
@@ -192,16 +204,31 @@ class SortingController:
             log.error("IK failed for target (%.2f, %.2f, %.2f): %s", x, y, z, exc)
             raise
 
+    def is_qr_handled(self, qr_value: str) -> bool:
+        with self._qr_lock:
+            return self._last_qr_value == qr_value
+
     def process_qr_target(self, qr_value: str) -> bool:
+        with self._qr_lock:
+            return self._process_qr_target(qr_value)
+
+    def _process_qr_target(self, qr_value: str) -> bool:
         """
         Process a decoded QR code in autonomous PLC mode.
-        Does not wait for motion to finish. Only writes to DB if it's a new QR code.
-        
-        Returns:
-            True if the target was written successfully, False if skipped or error.
+
+        Writes joint targets to the PLC DB via :meth:`PLCController.write_joint_targets`
+        (no START_AUTO pulse – the PLC ladder triggers motion after the NPN sensor).
+
+        Returns
+        -------
+        bool
+            ``True`` only when the targets were successfully written to the PLC.
+            ``False`` when: the code is a duplicate, not in the location table,
+            or the PLC write failed (so the caller may retry).
         """
         if qr_value == "CLEAR":
             self._last_qr_value = None
+            self._last_qr_retry_time = 0.0
             return False
 
         if qr_value == self._last_qr_value:
@@ -210,26 +237,42 @@ class SortingController:
 
         if qr_value not in self.positions.locations:
             log.warning("Decoded QR '%s' but it is not configured in locations map.", qr_value)
-            # Update last_qr_value so we don't spam the warning
+            # Update last_qr_value so we don't spam the warning for the same code
             self._last_qr_value = qr_value
+            self._qr_invalid += 1  # One invalid QR per visible item.
+            return False
+
+        # Rate-limit retries: if the last attempt for a DIFFERENT code failed
+        # (last_qr_value is still None) do not spam the PLC more than once/s.
+        now = time.monotonic()
+        if self._last_qr_retry_time > 0.0 and now - self._last_qr_retry_time < 1.0:
             return False
 
         loc = self.positions.locations[qr_value]
-        
+
         log.info(
             "QR Target Valid: [%s] -> Writing targets: J1=%.2f, J2=%.2f, J3=%.2f, J4=%.2f",
             qr_value, loc.j1, loc.j2, loc.j3, loc.j4
         )
-        
-        try:
-            # db_write directly to joint targets in DB
-            self.plc.send_joint_targets(loc.j1, loc.j2, loc.j3, loc.j4)
+
+        # Write targets only – no START_AUTO pulse.
+        # The PLC ladder reads these values and executes the pick-place sequence
+        # autonomously once the NPN sensor detects a box.
+        wrote = self.plc.write_joint_targets(loc.j1, loc.j2, loc.j3, loc.j4)
+
+        if wrote:
             self._last_qr_value = qr_value
+            self._last_qr_retry_time = 0.0
             self._current_joints = (loc.j1, loc.j2, loc.j3, loc.j4)
-            self._counter_good += 1  # Or generic count
+            self._qr_written += 1  # Successful destination writes, not completed moves.
             return True
-        except Exception as exc:
-            log.error("Failed to write QR targets to PLC: %s", exc)
+        else:
+            # Write failed (PLC offline / not connected).  Do NOT set
+            # _last_qr_value so the next camera frame will retry the same code.
+            self._last_qr_retry_time = now
+            log.warning(
+                "QR target write failed for [%s] – will retry after 1 s.", qr_value
+            )
             return False
 
     def execute_sort(self, pick_x: float, pick_y: float, result: SortResult) -> None:
@@ -247,11 +290,14 @@ class SortingController:
         )
 
         try:
+            # Reject an invalid DB layout before writing any cycle trigger bits.
+            self.plc.validate_motion_layout()
             # Store the classification for GUI display
             self._last_sort_result = result
 
             # 0. Write classification to PLC (atomic bit-group write)
-            self.plc.write_classification(result == SortResult.GOOD)
+            if self.plc.write_classification(result == SortResult.GOOD) is False:
+                raise RuntimeError("Failed to write classification; cycle aborted.")
 
             # 1. Pick (approach -> lower -> close gripper -> retreat)
             self._state = RobotState.MOVING_PICK
@@ -296,18 +342,24 @@ class SortingController:
             result.name,
         )
         try:
+            self.plc.validate_motion_layout()
             self._last_sort_result = result
-            self.plc.write_classification(result == SortResult.GOOD)
-            self.plc.send_pulse(*ADDR.START_AUTO)
+            if self.plc.write_classification(result == SortResult.GOOD) is False:
+                raise RuntimeError("Failed to write classification; cycle aborted.")
+            if self.plc.send_pulse(*ADDR.START_AUTO) is False:
+                raise RuntimeError("Failed to dispatch sequence command.")
             self._state = RobotState.MOVING_PICK
 
             # Wait for PLC sequence to complete
             deadline = time.monotonic() + 60.0
+            saw_busy = False
             while True:
                 status = self.plc.read_status()
                 if not status or status.get("error_flag", False):
                     raise RuntimeError("PLC error during autonomous sequence.")
-                if status.get("motion_done", False):
+                if not status.get("motion_done", False):
+                    saw_busy = True
+                elif saw_busy:
                     break
                 if time.monotonic() >= deadline:
                     raise TimeoutError("PLC autonomous sequence timed out.")
@@ -349,7 +401,8 @@ class SortingController:
         # Actuate gripper close
         self._state = RobotState.GRIPPING
         log.info("Closing gripper (GRIP = True)")
-        self.plc.write_bit(*ADDR.GRIP, True)
+        if self.plc.write_bit(*ADDR.GRIP, True) is False:
+            raise RuntimeError("Failed to close gripper.")
         self._wait_event.wait(self.positions.gripper_delay)
 
         # Raise back to z_up linearly
@@ -388,7 +441,8 @@ class SortingController:
         # Actuate gripper open
         self._state = RobotState.RELEASING
         log.info("Opening gripper (GRIP = False)")
-        self.plc.write_bit(*ADDR.GRIP, False)
+        if self.plc.write_bit(*ADDR.GRIP, False) is False:
+            raise RuntimeError("Failed to open gripper.")
         self._wait_event.wait(self.positions.gripper_delay)
 
         # Raise back to z_up linearly
@@ -405,13 +459,6 @@ class SortingController:
         self._move_and_wait(0.0, 0.0, 0.0, 0.0, cmd=self.plc_commands.home)
         self._state = RobotState.IDLE
 
-    def _estimate_motion_seconds(
-        self, target: tuple[float, float, float, float]
-    ) -> float:
-        """Estimate travel time from the largest joint delta (deg/s model)."""
-        delta = max(abs(t - c) for t, c in zip(target, self._previous_joints))
-        return max(0.5, delta / _JOINT_SPEED_DPS)
-
     def _move_l_and_wait(
         self,
         x0: float,
@@ -425,12 +472,17 @@ class SortingController:
     ) -> None:
         """
         Cartesian linear interpolation between two points.
-        Divides the path into multiple waypoints to guarantee a straight line.
+        Samples a straight Cartesian path; the PLC controls interpolation
+        between joint targets, so this alone cannot guarantee straight travel.
         """
         log.info(
             "MoveL from (%.1f, %.1f, %.1f) to (%.1f, %.1f, %.1f) in %d steps",
             x0, y0, z0, x1, y1, z1, steps
         )
+        if steps <= 0:
+            raise ValueError("MoveL steps must be positive.")
+        # Preflight every waypoint so a bad path fails before any motion starts.
+        waypoints = []
         for i in range(1, steps + 1):
             t = i / float(steps)
             x_step = x0 + (x1 - x0) * t
@@ -438,7 +490,9 @@ class SortingController:
             z_step = z0 + (z1 - z0) * t
             
             j1, j2, j3, j4 = self._ik(x_step, y_step, z_step)
-            self._move_and_wait(j1, j2, j3, j4, timeout=timeout)
+            waypoints.append((j1, j2, j3, j4))
+        for joints in waypoints:
+            self._move_and_wait(*joints, timeout=timeout)
 
     def _move_and_wait(
         self,
@@ -466,6 +520,9 @@ class SortingController:
         timeout:
             Absolute upper bound on the wait in seconds.
         """
+        self.plc.validate_motion_layout()
+        if timeout <= 0:
+            raise ValueError("Motion timeout must be positive.")
         target = (j1, j2, j3, j4)
         self._current_joints = target
         log.info(
@@ -477,32 +534,41 @@ class SortingController:
         )
 
         # 1. Transmit joint targets to PLC
-        self.plc.send_joint_targets(j1, j2, j3, j4)
-
-        # 2. Issue optional specific command (e.g. HOME)
         if cmd is not None:
-            self.plc.send_command(cmd)
+            # Write targets WITHOUT START_AUTO, then fire the specific command pulse
+            # (e.g. MOVE_TO_HOME).  This guarantees exactly one pulse per move.
+            if self.plc.write_joint_targets(j1, j2, j3, j4) is False:
+                raise RuntimeError("Failed to write joint targets; command suppressed.")
+            if self.plc.send_command(cmd) is False:
+                raise RuntimeError("Failed to dispatch motion command.")
+        else:
+            # Standard vision/auto mode: write targets + pulse START_AUTO (one combined call)
+            if self.plc.send_joint_targets(j1, j2, j3, j4) is False:
+                raise RuntimeError("Failed to send joint targets.")
 
-        estimated = self._estimate_motion_seconds(target)
-        deadline = time.monotonic() + min(timeout, estimated + _MOTION_GRACE_S)
+        deadline = time.monotonic() + timeout
 
         # Allow brief settling time for PLC to register motion start
         self._wait_event.wait(0.05)
 
-        motion_confirmed = False
+        # PLC contract: each command must hold motion_done LOW until the PC
+        # observes it, then raise it only after this waypoint is reached.
+        # A stale HIGH must never authorize the next gripper action.
+        saw_busy = False
         while True:
             status = self.plc.read_status()
             if not status:
                 raise RuntimeError("PLC offline during active pick-and-place motion.")
             if status.get("error_flag", False):
                 raise RuntimeError("PLC error flag activated during active motion.")
-            if status.get("motion_done", False):
-                motion_confirmed = True
+            if not status.get("motion_done", False):
+                saw_busy = True
+            elif saw_busy:
                 break
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"Motion to targets (J1={j1:.1f}°, J2={j2:.1f}°, J3={j3:.1f}°, J4={j4:.1f}°) "
-                    f"timed out after {estimated + _MOTION_GRACE_S:.1f}s without motion_done signal."
+                    f"timed out after {timeout:.1f}s without a fresh motion_done transition."
                 )
             self._wait_event.wait(0.05)
 

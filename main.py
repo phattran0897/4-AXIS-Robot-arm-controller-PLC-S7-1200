@@ -160,6 +160,7 @@ class RobotApp(QMainWindow):
             inference_height=cfg.camera.inference_height,
             camera_read_timeout=cfg.camera.read_timeout,
             calibration_path=cfg.yolo.calibration_path,
+            class_quality=cfg.yolo.class_quality,
         )
         self.sorter: SortingController = SortingController(
             plc=self.plc,
@@ -167,7 +168,9 @@ class RobotApp(QMainWindow):
             kinematics=cfg.kinematics,
             plc_commands=cfg.plc.commands,
         )
-        self.qr_reader = QRReader(debounce_frames=5)
+        self.qr_reader = QRReader(debounce_frames=cfg.app.qr_debounce_frames,
+                                  clear_frames=cfg.app.qr_clear_frames,
+                                  miss_tolerance=cfg.app.qr_miss_tolerance)
         self._sort_thread: threading.Thread | None = None
         self._sort_start_lock = threading.Lock()
 
@@ -187,7 +190,7 @@ class RobotApp(QMainWindow):
         self._manual_classify_trigger: threading.Event = threading.Event()
 
         # ── Post-sort cooldown (prevents rapid re-detection) ─────────────────
-        self._sort_cooldown_duration: float = 3.0  # seconds
+        self._sort_cooldown_duration: float = cfg.app.move_cooldown
         self._sort_cooldown_end: float = 0.0
 
         # ── Signal / Slot connections ────────────────────────────────────────
@@ -219,10 +222,10 @@ class RobotApp(QMainWindow):
             name="AIVisionThread",
             daemon=True,
         )
+        self._frame_pending = False
         self._plc_thread.start()
         self._ai_thread.start()
-        
-        self._frame_pending = False
+
 
         log.info("RobotApp initialised – all threads started.")
 
@@ -407,13 +410,9 @@ class RobotApp(QMainWindow):
         overlay. Direct QImage conversion without PIL.
         """
         cam_cfg = self.cfg.camera
-        roi_x = self.cfg.yolo.roi_x
-        roi_y = self.cfg.yolo.roi_y
-        roi_w = self.cfg.yolo.roi_width
-        roi_h = self.cfg.yolo.roi_height
-
         preview_interval: float = 1.0 / max(cam_cfg.preview_fps, 1)
         last_preview_time: float = 0.0
+        last_mode = self.cfg.app.sorting_mode
 
         try:
             if not self.detector.start_camera(cam_cfg.default_index):
@@ -429,6 +428,11 @@ class RobotApp(QMainWindow):
                 if frame is not None:
                     try:
                         force_preview = False
+                        if self.cfg.app.sorting_mode != last_mode:
+                            self.qr_reader.reset()
+                            self.sorter.process_qr_target("CLEAR")
+                            self._manual_classify_trigger.clear()
+                            last_mode = self.cfg.app.sorting_mode
 
                         if self.cfg.app.sorting_mode == "qr":
                             # PLC-driven autonomous QR mode
@@ -438,12 +442,19 @@ class RobotApp(QMainWindow):
                                 self.qr_status_ready.emit("QR: Băng chuyền đang chạy...", "#94A3B8")
                                 force_preview = True
                             elif status == "value" and qr_val:
-                                if self.sorter.process_qr_target(qr_val):
-                                    self.log_tx(f"QR Scanned & Sent: {qr_val}")
-                                    self.qr_status_ready.emit(f"QR: Gửi lệnh thành công [{qr_val}]", "#10B981") # SUCCESS green
-                                else:
-                                    if qr_val not in self.cfg.sort_positions.locations:
-                                        self.qr_status_ready.emit(f"QR: Không tồn tại [{qr_val}]", "#EF4444") # ERROR red
+                                if qr_val not in self.cfg.sort_positions.locations:
+                                    # Mã không có trong bảng cấu hình
+                                    self.sorter.process_qr_target(qr_val)
+                                    self.qr_status_ready.emit(f"QR: Không tồn tại [{qr_val}]", "#EF4444")
+                                elif self.sorter.process_qr_target(qr_val):
+                                    # Ghi xuống PLC thành công
+                                    self.log_tx(f"QR Scanned & Written: {qr_val}")
+                                    self.qr_status_ready.emit(f"QR: Ghi thành công [{qr_val}]", "#10B981")
+                                elif not self.sorter.is_qr_handled(qr_val):
+                                    # Ghi thất bại (PLC offline hoặc rate-limited)
+                                    self.qr_status_ready.emit(
+                                        f"QR: Không ghi được xuống PLC [{qr_val}]", "#EF4444"
+                                    )
                                 force_preview = True
                         else:
                             # PC-Master YOLO Vision Mode
@@ -462,6 +473,10 @@ class RobotApp(QMainWindow):
                             # Draw ROI overlay if in Vision Mode
                             display_frame = frame.copy()
                             if self.cfg.app.sorting_mode != "qr":
+                                roi_x = self.cfg.yolo.roi_x
+                                roi_y = self.cfg.yolo.roi_y
+                                roi_w = self.cfg.yolo.roi_width
+                                roi_h = self.cfg.yolo.roi_height
                                 cv2.rectangle(
                                     display_frame,
                                     (roi_x, roi_y),
@@ -479,7 +494,6 @@ class RobotApp(QMainWindow):
                                     2,
                                 )
 
-                            h, w, ch = display_frame.shape
                             if not self._frame_pending:
                                 self._frame_pending = True
                                 h, w, ch = display_frame.shape
@@ -539,7 +553,11 @@ class RobotApp(QMainWindow):
             self.log_tx("Capture: no object detected – sort skipped.")
             return
 
-        sort_result = SortResult.BAD if result.class_id == 0 else SortResult.GOOD
+        quality = self.detector.classify_quality(result.class_id, result.class_name)
+        if quality is None:
+            self.log_tx(f"Capture skipped: unmapped model class {result.class_name!r}.")
+            return
+        sort_result = SortResult(quality)
         log.info(
             "Manual Capture: Object Classified as %s (class=%d, X=%.1fmm, Y=%.1fmm)",
             sort_result.name,
@@ -559,6 +577,9 @@ class RobotApp(QMainWindow):
             return False
 
         with self._sort_start_lock:
+            if not self.sorter.is_idle():
+                self.log_tx("Sort suppressed: controller is not IDLE; clear the fault first.")
+                return False
             if self._sort_thread is not None and self._sort_thread.is_alive():
                 log.warning("Sort thread still running – skipping new sort.")
                 return False
@@ -576,7 +597,10 @@ class RobotApp(QMainWindow):
     ) -> None:
         """Execute sorting cycle, guarding against PLC faults."""
         status = self.plc.read_status()
-        if status and status.get("error_flag", False):
+        if not status:
+            self.log_tx("Sort ABORTED: PLC status unavailable.")
+            return
+        if status.get("error_flag", False):
             log.error("Sort aborted – PLC error flag is active.")
             self.log_tx("Sort ABORTED: PLC error flag active.")
             return
@@ -590,11 +614,15 @@ class RobotApp(QMainWindow):
         except Exception as exc:
             log.error("Sorting cycle failed: %s", exc)
         finally:
+            self._sort_cooldown_duration = self.cfg.app.move_cooldown
             self._sort_cooldown_end = time.monotonic() + self._sort_cooldown_duration
             log.info("Post-sort cooldown activated (%.1fs).", self._sort_cooldown_duration)
 
     def clear_all_errors(self) -> None:
         """Clear errors on PLC and reset sorting controller state."""
+        if self._sort_thread is not None and self._sort_thread.is_alive():
+            self.log_tx("Cannot clear errors while a sort cycle is running.")
+            return
         self.plc.send_command(self.cfg.plc.commands.idle)
         self.sorter.clear_error()
 

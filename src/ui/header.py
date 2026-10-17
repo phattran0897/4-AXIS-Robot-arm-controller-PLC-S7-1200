@@ -212,12 +212,11 @@ class VAAHeader(QWidget):
             bg=VAA_SECONDARY, hover="#274B75", text=VAA_TEXT, radius=9, font_size=12
         )
 
-        if page_name == "PageAuto":
-            self._btn_auto.setStyleSheet(active_css)
-            self._btn_manual.setStyleSheet(inactive_css)
-        else:
-            self._btn_manual.setStyleSheet(active_css)
-            self._btn_auto.setStyleSheet(inactive_css)
+        for name, button in (("PageAuto", self._btn_auto),
+                             ("PageManual", self._btn_manual),
+                             ("PageSettings", self._btn_settings)):
+            button.setStyleSheet(active_css if page_name == name else inactive_css)
+
 
 
 class VAAFooter(QWidget):

@@ -301,6 +301,9 @@ class PageManual(BasePage):
             )
         )
         self.btn_elbow_down.clicked.connect(lambda: self._set_elbow("down"))
+        if self.controller and self.controller.cfg.kinematics.j3_min >= 0:
+            self.btn_elbow_down.setEnabled(False)
+            self.btn_elbow_down.setToolTip("Elbow DOWN requires a negative J3 range in the hardware configuration.")
         el_layout.addWidget(self.btn_elbow_down)
 
         ik_l_layout.addWidget(elbow_widget)
@@ -558,6 +561,8 @@ class PageManual(BasePage):
 
     def _set_elbow(self, config: str) -> None:
         """Switch elbow configuration for IK and update toggle visuals."""
+        if config == "down" and self.controller.cfg.kinematics.j3_min >= 0:
+            return
         self._elbow_config = config
         if config == "up":
             self.btn_elbow_up.setStyleSheet(
