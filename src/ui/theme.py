@@ -5,47 +5,47 @@ All colour values are defined here once and imported by every page.
 This eliminates duplication and makes theme changes trivial.
 
 The palette is a dark, industrial "mission control" look:
-deep navy surfaces, cyan accents for AUTO mode, purple accents for
+deep navy surfaces, teal accents for AUTO mode, blue accents for
 MANUAL mode, and semantic status colours (emerald / amber / rose).
 """
 
 from __future__ import annotations
 
 # ── Accents ──────────────────────────────────────────────────────────────────
-ACCENT: str = "#00E5FF"  # Sleek cyan accent (AUTO mode)
-ACCENT_DARK: str = "#00B0FF"  # Darker cyan for active elements
-ACCENT_DIM: str = "#0E7490"  # Muted cyan for secondary highlights
-ACCENT_GLOW: str = "#00E5FF40"  # Translucent glow (for borders/shadows)
-MANUAL_ACCENT: str = "#A855F7"  # Vibrant purple manual-mode accent
-MANUAL_GLOW: str = "#A855F740"  # Purple glow
-INFO: str = "#3B82F6"  # Informational blue (primary actions)
+ACCENT: str = "#54D6BB"  # Teal accent (AUTO mode)
+ACCENT_DARK: str = "#35B99E"  # Darker teal for active elements
+ACCENT_DIM: str = "#247E70"  # Muted teal for secondary highlights
+ACCENT_GLOW: str = "#54D6BB40"  # Translucent glow (for borders/shadows)
+MANUAL_ACCENT: str = "#84A9FF"  # Blue manual-mode accent
+MANUAL_GLOW: str = "#84A9FF40"  # Blue glow
+INFO: str = "#527FEB"  # Informational blue (primary actions)
 
 # ── Surfaces ─────────────────────────────────────────────────────────────────
-PANEL_BG: str = "#1E293B"  # Dark slate panel background
-CARD_BG: str = "#0B1329"  # Deep blue-gray card background
-CARD_BG_ALT: str = "#0D1530"  # Slightly lighter card variant
-ROW_BG: str = "#090E1A"  # Darkest interior row background
-HEADER_BG: str = "#050B1A"  # Deepest navy header/footer background
-CONTENT_BG: str = "#0F172A"  # Page content background
+PANEL_BG: str = "#1B2738"  # Dark slate panel background
+CARD_BG: str = "#141D2B"  # Deep blue-gray card background
+CARD_BG_ALT: str = "#182333"  # Slightly lighter card variant
+ROW_BG: str = "#101824"  # Darkest interior row background
+HEADER_BG: str = "#0D1420"  # Deepest navy header/footer background
+CONTENT_BG: str = "#0B111B"  # Page content background
 
 # ── Lines & borders ──────────────────────────────────────────────────────────
-PANEL_BORDER: str = "#1E3A5F"  # Refined slate-blue border
-PANEL_BORDER_LIGHT: str = "#2D4A6F"  # Lighter border for hover states
-ENTRY_BG: str = "#1E293B"  # Text-entry background
-NEUTRAL_BTN: str = "#475569"  # Neutral button fill / OFF state
-NEUTRAL_HOVER: str = "#64748B"  # Neutral button hover
+PANEL_BORDER: str = "#273549"  # Refined slate-blue border
+PANEL_BORDER_LIGHT: str = "#3B526D"  # Lighter border for hover states
+ENTRY_BG: str = "#1B2738"  # Text-entry background
+NEUTRAL_BTN: str = "#243349"  # Neutral button fill / OFF state
+NEUTRAL_HOVER: str = "#34465D"  # Neutral button hover
 
 # ── Semantic status colours ──────────────────────────────────────────────────
-SUCCESS: str = "#10B981"  # Modern emerald green
-SUCCESS_HOVER: str = "#059669"  # Emerald hover
-WARNING: str = "#F59E0B"  # Professional amber warning
-DANGER: str = "#EF4444"  # Clean rose-red danger
-DANGER_HOVER: str = "#DC2626"  # Rose hover
+SUCCESS: str = "#39C6A0"  # Modern emerald green
+SUCCESS_HOVER: str = "#2BAE8A"  # Emerald hover
+WARNING: str = "#E7B768"  # Professional amber warning
+DANGER: str = "#F27078"  # Clean rose-red danger
+DANGER_HOVER: str = "#DE5964"  # Rose hover
 
 # ── Typography ───────────────────────────────────────────────────────────────
-TEXT_PRIMARY: str = "#F8FAFC"  # Soft white text
-TEXT_SECONDARY: str = "#94A3B8"  # High-contrast dimmed text
-TEXT_DIM: str = "#64748B"  # Very dim text for decorative elements
+TEXT_PRIMARY: str = "#EBF1FA"  # Soft white text
+TEXT_SECONDARY: str = "#A1AFC2"  # High-contrast dimmed text
+TEXT_DIM: str = "#8494AB"  # Very dim text for decorative elements
 FONT_MONO: str = "Consolas"  # Numeric readouts
 FONT_UI: str = "Segoe UI"  # Labels / body
 
@@ -57,12 +57,24 @@ QMainWindow, QWidget#CentralWidget {{
     background-color: {CONTENT_BG};
     color: {TEXT_PRIMARY};
     font-family: "{FONT_UI}", sans-serif;
+    font-size: 12px;
 }}
 
 QWidget {{
     color: {TEXT_PRIMARY};
     font-family: "{FONT_UI}", sans-serif;
+    font-size: 12px;
 }}
+
+QToolTip {{
+    background: {PANEL_BG};
+    color: {TEXT_PRIMARY};
+    border: 1px solid {PANEL_BORDER_LIGHT};
+    padding: 8px;
+}}
+
+QScrollArea {{ border: none; background: transparent; }}
+QScrollArea > QWidget > QWidget {{ background: transparent; }}
 
 QStackedWidget {{
     background-color: {CONTENT_BG};
@@ -77,8 +89,12 @@ QLineEdit {{
     color: {TEXT_PRIMARY};
     border: 1px solid {PANEL_BORDER};
     border-radius: 8px;
-    padding: 6px 10px;
+    padding: 7px 10px;
     font-size: 13px;
+}}
+
+QLineEdit:disabled {{
+    color: {TEXT_DIM};
 }}
 
 QLineEdit:focus {{
@@ -198,8 +214,11 @@ def btn_style(
         QPushButton:hover {{
             background-color: {hover};
         }}
+        QPushButton:focus {{
+            border: 1px solid {ACCENT};
+        }}
         QPushButton:pressed {{
-            background-color: {bg};
+            background-color: {hover};
         }}
         QPushButton:disabled {{
             background-color: {PANEL_BG};
@@ -213,8 +232,8 @@ def video_container_style(border_color: str = ACCENT_DIM) -> str:
     """Return QSS for the camera video container with refined borders."""
     return f"""
         QFrame {{
-            background-color: #000000;
-            border: 2px solid {border_color};
+            background-color: #0A1019;
+            border: 1px solid {PANEL_BORDER};
             border-radius: 12px;
         }}
     """

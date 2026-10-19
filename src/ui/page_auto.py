@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
 from src.plc.plc_controller import ADDR
 from src.robot.sorting_controller import RobotState, SortResult
 from src.ui.base_page import BasePage
+from src.ui.help_text import SECTION_HELP, set_help
+from src.ui.visuals import line_icon
 from src.ui.theme import (
     ACCENT,
     ACCENT_DIM,
@@ -59,8 +61,8 @@ class PageAuto(BasePage):
     ------
     ┌─────────────────────────────────────────────────────────────────┐
     │  Column 0          │  Column 1           │  Column 2           │
-    │  Control Panel     │  Status Panel       │  Camera Feed        │
-    │  (START/PAUSE)     │  (Joint Angles)     │  (YOLO Detection)   │
+    │  Control Panel     │  Camera Feed        │  Status Panel       │
+    │  (START/PAUSE)      │  (QR / YOLO)        │  (Joint Targets)    │
     └─────────────────────────────────────────────────────────────────┘
     """
 
@@ -86,7 +88,7 @@ class PageAuto(BasePage):
 
     def _build_ui(self) -> None:
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(16, 12, 16, 12)
+        main_layout.setContentsMargins(20, 14, 20, 10)
         main_layout.setSpacing(12)
 
         # 3-column container
@@ -98,18 +100,16 @@ class PageAuto(BasePage):
         # Column 0: Control Panel
         self._build_control_panel(columns_widget)
 
-        # Column 1: Status Panel
+        # Camera is the primary workspace; status stays in the right rail.
+        self.build_camera_column(columns_widget, column=1, title_color=ACCENT)
         self._build_status_panel(columns_widget)
 
-        # Column 2: Camera Panel
-        self.build_camera_column(columns_widget, column=2, title_color=ACCENT)
-
-        # Set stretch factors: Col 0: 2, Col 1: 2, Col 2: 3
+        # Give the camera twice the width of either side panel.
         col_layout.setStretch(0, 2)
-        col_layout.setStretch(1, 2)
-        col_layout.setStretch(2, 3)
+        col_layout.setStretch(1, 4)
+        col_layout.setStretch(2, 2)
 
-        main_layout.addWidget(columns_widget, 1)
+        self.add_workspace(main_layout, columns_widget, 'Automation overview', 'Monitor the camera, control the sequence and follow each destination.', 'AUTOMATIC')
 
         # Bottom status bar
         self.lbl_err_status = self.build_status_bar()
@@ -117,7 +117,7 @@ class PageAuto(BasePage):
     def _build_control_panel(self, parent: QWidget) -> None:
         """Build the control panel with START/PAUSE buttons."""
         frame = self._create_card(parent)
-        frame.setMinimumWidth(260)
+        frame.setMinimumWidth(250)
         frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(8, 8, 8, 12)
@@ -125,34 +125,36 @@ class PageAuto(BasePage):
 
         self.build_section_header(frame, "⚡", "CONTROL PANEL", ACCENT)
 
-        layout.addStretch(1)
-
         btn_frame = QWidget(frame)
         btn_frame.setStyleSheet("background: transparent; border: none;")
         btn_layout = QVBoxLayout(btn_frame)
-        btn_layout.setContentsMargins(15, 12, 15, 20)
-        btn_layout.setSpacing(20)
+        btn_layout.setContentsMargins(12, 12, 12, 12)
+        btn_layout.setSpacing(12)
 
         # START button
-        self.btn_start = QPushButton("▶   START AUTO", btn_frame)
-        self.btn_start.setFixedHeight(54)
+        self.btn_start = QPushButton("Start sequence", btn_frame)
+        set_help(self.btn_start, "Bắt đầu tự động", "Gửi lệnh START AUTO đến PLC. Chỉ khả dụng khi kết nối và cấu hình hợp lệ, không có lỗi hoặc Stop, và bộ điều khiển đang rảnh. Trong Vision, Capture & classify là thao tác nhận diện riêng.")
+        self.btn_start.setIcon(line_icon("play", "#10231F"))
+        self.btn_start.setFixedHeight(48)
         self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_start.setStyleSheet(
-            btn_style(SUCCESS, SUCCESS_HOVER, radius=12, font_size=14)
+            btn_style(ACCENT, "#6BE3CB", text="#10231F", radius=8, font_size=13)
         )
         self.btn_start.clicked.connect(
-            lambda: self.controller.plc.send_pulse(*ADDR.START_AUTO)
+            lambda: self.controller.start_auto()
             if self.controller
             else None
         )
         btn_layout.addWidget(self.btn_start)
 
         # PAUSE button
-        self.btn_pause = QPushButton("⏸   PAUSE", btn_frame)
-        self.btn_pause.setFixedHeight(54)
+        self.btn_pause = QPushButton("Pause sequence", btn_frame)
+        set_help(self.btn_pause, "Tạm dừng chu trình", "Gửi xung PAUSE đến PLC. Cách dừng và tiếp tục chu trình phụ thuộc chương trình PLC; theo dõi trạng thái sau khi nhấn.")
+        self.btn_pause.setIcon(line_icon("pause", TEXT_PRIMARY))
+        self.btn_pause.setFixedHeight(44)
         self.btn_pause.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_pause.setStyleSheet(
-            btn_style(WARNING, "#D97706", radius=12, font_size=14)
+            btn_style(PANEL_BG, "#2B3B51", radius=8, font_size=13, border=f"1px solid {PANEL_BORDER}")
         )
         self.btn_pause.clicked.connect(
             lambda: self.controller.plc.send_pulse(*ADDR.PAUSE)
@@ -168,6 +170,7 @@ class PageAuto(BasePage):
         sc_layout.setContentsMargins(12, 16, 12, 16)
 
         self.lbl_operation = QLabel("● IDLE", status_card)
+        set_help(self.lbl_operation, "Trạng thái chu trình", "Trạng thái bộ điều khiển trên PC: IDLE là đang rảnh, SYSTEM ERROR là đang có lỗi; các trạng thái khác cho biết bước gắp/thả hiện tại. PLC OFFLINE nghĩa là trạng thái không khả dụng.")
         self.lbl_operation.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; "
             f"border: none; background: transparent;"
@@ -175,7 +178,8 @@ class PageAuto(BasePage):
         sc_layout.addWidget(self.lbl_operation)
         
         # QR Status label
-        self.lbl_qr_status = QLabel("QR: Băng chuyền đang chạy...", status_card)
+        self.lbl_qr_status = QLabel("Awaiting QR code", status_card)
+        set_help(self.lbl_qr_status, "Thông báo QR và cấu hình", "Hiển thị kết quả đọc mã QR hoặc lý do cấu hình chưa cho phép chạy. Đặt mã rõ nét trong ảnh camera và chờ ứng dụng xác nhận; xem Activity log để biết thêm chi tiết.")
         self.lbl_qr_status.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; "
             f"border: none; background: transparent; margin-top: 4px;"
@@ -186,8 +190,10 @@ class PageAuto(BasePage):
         btn_layout.addWidget(status_card)
 
         # Capture & Classify button
-        self.btn_capture = QPushButton("📸   CHỤP & PHÂN LOẠI", btn_frame)
-        self.btn_capture.setFixedHeight(54)
+        self.btn_capture = QPushButton("Capture && classify", btn_frame)
+        set_help(self.btn_capture, "Chụp và phân loại", "Trong chế độ Vision, yêu cầu nhận diện vật trong ROI của ảnh camera. Khi có kết quả hợp lệ và bộ điều khiển sẵn sàng, ứng dụng có thể khởi chạy chu trình gắp/thả.")
+        self.btn_capture.setIcon(line_icon("camera"))
+        self.btn_capture.setFixedHeight(44)
         self.btn_capture.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_capture.setStyleSheet(
             btn_style(INFO, "#2563EB", radius=12, font_size=13)
@@ -207,7 +213,8 @@ class PageAuto(BasePage):
             self.btn_capture.hide()
 
         # Reset counters button
-        btn_reset = QPushButton("🔄   RESET COUNTERS", btn_frame)
+        btn_reset = QPushButton("Reset counters", btn_frame)
+        set_help(btn_reset, "Đặt lại bộ đếm", "Đưa các bộ đếm GOOD, BAD, QR WRITTEN và INVALID QR về 0. Thao tác này không xóa lỗi và không gửi lệnh dừng robot.")
         btn_reset.setFixedHeight(44)
         btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_reset.setStyleSheet(
@@ -232,7 +239,7 @@ class PageAuto(BasePage):
     def _build_status_panel(self, parent: QWidget) -> None:
         """Build the joint status panel."""
         frame = self._create_card(parent)
-        frame.setMinimumWidth(260)
+        frame.setMinimumWidth(250)
         frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(8, 8, 8, 12)
@@ -240,19 +247,21 @@ class PageAuto(BasePage):
 
         self.build_section_header(frame, "⚙", "JOINT STATUS", ACCENT)
 
-        layout.addStretch(1)
-
         data_frame = QWidget(frame)
         data_frame.setStyleSheet("background: transparent; border: none;")
         data_layout = QVBoxLayout(data_frame)
         data_layout.setContentsMargins(12, 6, 12, 12)
         data_layout.setSpacing(4)
 
+        self.lbl_joint_source = QLabel("PLC TARGETS (deg)", data_frame)
+        set_help(self.lbl_joint_source, "Nguồn góc mục tiêu", SECTION_HELP["JOINT STATUS"])
+        self.lbl_joint_source.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px;")
+        data_layout.addWidget(self.lbl_joint_source)
         # Joint values
-        self.lbl_j1 = self.create_data_row(data_frame, "J1 (Xoay)", "0.00 °", ACCENT)
-        self.lbl_j2 = self.create_data_row(data_frame, "J2 (Vai)", "0.00 °", ACCENT)
-        self.lbl_j3 = self.create_data_row(data_frame, "J3 (Khuỷu)", "0.00 °", ACCENT)
-        self.lbl_j4 = self.create_data_row(data_frame, "J4 (Cổ tay)", "0.00 °", ACCENT)
+        self.lbl_j1 = self.create_data_row(data_frame, "J1  Base", "0.00 °", ACCENT)
+        self.lbl_j2 = self.create_data_row(data_frame, "J2  Shoulder", "0.00 °", ACCENT)
+        self.lbl_j3 = self.create_data_row(data_frame, "J3  Elbow", "0.00 °", ACCENT)
+        self.lbl_j4 = self.create_data_row(data_frame, "J4  Wrist", "0.00 °", ACCENT)
 
         # Pick height readout
         pick_z = (
@@ -271,6 +280,7 @@ class PageAuto(BasePage):
         gf_layout.setContentsMargins(12, 8, 12, 8)
 
         self.lbl_gripper = QLabel("GRIPPER: OPEN", grip_frame)
+        set_help(self.lbl_gripper, "Trạng thái kẹp", "OPEN/CLOSED thể hiện trạng thái lệnh kẹp từ PLC hoặc bước chu trình trên PC. UNKNOWN khi mất kết nối; FAULT khi bộ điều khiển báo lỗi. Trạng thái này không xác nhận vật đã được giữ chắc.")
         self.lbl_gripper.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 12px; font-weight: bold; "
             f"border: none; background: transparent;"
@@ -284,7 +294,8 @@ class PageAuto(BasePage):
         cf_layout = QVBoxLayout(classify_frame)
         cf_layout.setContentsMargins(12, 10, 12, 10)
 
-        self.lbl_classification = QLabel("⏳ CHỜ PHÂN LOẠI", classify_frame)
+        self.lbl_classification = QLabel("Awaiting classification", classify_frame)
+        set_help(self.lbl_classification, "Kết quả phân loại", "GOOD/BAD là kết quả phân loại của lượt Vision hiện tại. PLC QR cho biết đang dùng mã QR để gửi mục tiêu cho PLC.")
         self.lbl_classification.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; "
             f"border: none; background: transparent;"
@@ -310,7 +321,7 @@ class PageAuto(BasePage):
         if self.controller and hasattr(self.controller, "cfg"):
             mode = self.controller.cfg.app.sorting_mode
 
-        self.lbl_g_title = lbl_g_title = QLabel("✅ TỐT" if mode == "vision" else "📦 TỔNG SỐ QR", good_card)
+        self.lbl_g_title = lbl_g_title = QLabel("GOOD" if mode == "vision" else "QR WRITTEN", good_card)
         lbl_g_title.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; "
             f"border: none; background: transparent;"
@@ -334,7 +345,7 @@ class PageAuto(BasePage):
         bad_layout.setContentsMargins(10, 8, 10, 8)
         bad_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.lbl_b_title = lbl_b_title = QLabel("❌ XẤU" if mode == "vision" else "⚠ QR LỖI", bad_card)
+        self.lbl_b_title = lbl_b_title = QLabel("BAD" if mode == "vision" else "INVALID QR", bad_card)
         lbl_b_title.setStyleSheet(
             f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: bold; "
             f"border: none; background: transparent;"
@@ -352,6 +363,8 @@ class PageAuto(BasePage):
         stats_layout.addWidget(bad_card)
 
         data_layout.addWidget(stats_widget)
+        for widget in (self.lbl_g_title, self.lbl_good, self.lbl_b_title, self.lbl_bad):
+            set_help(widget, "Bộ đếm kết quả", "Vision: GOOD/BAD đếm các chu trình phân loại đã hoàn thành. QR: QR WRITTEN đếm lần ghi mục tiêu thành công, INVALID QR đếm mã bị từ chối. Số QR WRITTEN không xác nhận robot đã hoàn tất gắp/thả. Reset counters đưa các bộ đếm về 0.")
 
         layout.addWidget(data_frame)
         layout.addStretch(1)
@@ -389,12 +402,22 @@ class PageAuto(BasePage):
 
     def update_gui_data(self, data: dict[str, Any]) -> None:
         """Refresh joint-angle targets and error status from *data*."""
-        self._target = [
-            float(data.get("j1_target", 0.0)),
-            float(data.get("j2_target", 0.0)),
-            float(data.get("j3_target", 0.0)),
-            float(data.get("j4_target", 0.0)),
-        ]
+        if self.controller:
+            self.lbl_pick_z.setText(f"{self.controller.cfg.sort_positions.pick_z_down:.1f} mm")
+        self._status_available = bool(data) and data.get("connected") is not False
+        if not self._status_available:
+            self.lbl_operation.setText("● PLC OFFLINE")
+            self.lbl_operation.setStyleSheet(f"color: {DANGER}; font-weight: bold; border: none;")
+            self.lbl_gripper.setText("GRIPPER: UNKNOWN")
+            self._refresh_error_status(data)
+            return
+        if self.controller and self.controller.cfg.app.sorting_mode == "vision":
+            self.lbl_joint_source.setText("PC COMMAND TARGETS (deg)")
+            # PC command mirror, not feedback or the shared XYZ DB view.
+            self._target = list(self.controller.sorter.current_joints)
+        else:
+            self.lbl_joint_source.setText("PLC TARGETS (deg)")
+            self._target = [float(data.get(f"j{i}_target", 0.0)) for i in range(1, 5)]
 
         if not self.controller or not hasattr(self.controller, "sorter"):
             return
@@ -415,7 +438,7 @@ class PageAuto(BasePage):
             self.lbl_operation.setStyleSheet(
                 f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
             )
-            self.lbl_gripper.setText("GRIPPER: OPEN")
+            self.lbl_gripper.setText("GRIPPER: CLOSED" if data.get("grip", False) else "GRIPPER: OPEN")
             self.lbl_gripper.setStyleSheet(
                 f"color: {TEXT_SECONDARY}; font-size: 12px; font-weight: bold; border: none; background: transparent;"
             )
@@ -450,24 +473,24 @@ class PageAuto(BasePage):
             mode = self.controller.cfg.app.sorting_mode
 
         if mode == "qr":
-            self.lbl_classification.setText("⚙ MÔ HÌNH: PLC QR")
+            self.lbl_classification.setText("MODE  /  PLC QR")
             self.lbl_classification.setStyleSheet(
                 f"color: {INFO}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
             )
         else:
             if not sorter.is_idle() and sorter.last_sort_result is not None:
                 if sorter.last_sort_result == SortResult.GOOD:
-                    self.lbl_classification.setText("✅ HÀNG TỐT")
+                    self.lbl_classification.setText("GOOD  /  Accepted")
                     self.lbl_classification.setStyleSheet(
                         f"color: {SUCCESS}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
                     )
                 else:
-                    self.lbl_classification.setText("❌ HÀNG XẤU")
+                    self.lbl_classification.setText("BAD  /  Rejected")
                     self.lbl_classification.setStyleSheet(
                         f"color: {DANGER}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
                     )
             else:
-                self.lbl_classification.setText("⏳ CHỜ PHÂN LOẠI")
+                self.lbl_classification.setText("Awaiting classification")
                 self.lbl_classification.setStyleSheet(
                     f"color: {TEXT_SECONDARY}; font-size: 13px; font-weight: bold; border: none; background: transparent;"
                 )
@@ -476,6 +499,11 @@ class PageAuto(BasePage):
 
     def _interpolate_gui_numbers(self) -> None:
         """Smoothly step displayed joint values towards their targets."""
+        if getattr(self, "_status_available", True) is False:
+            for label in (self.lbl_j1, self.lbl_j2, self.lbl_j3, self.lbl_j4):
+                label.setText("--- °")
+            self._last_rendered = ["", "", "", ""]
+            return
         step_max = 5.0  # Max degrees per frame
 
         def move_towards(current: float, target: float, max_step: float) -> float:

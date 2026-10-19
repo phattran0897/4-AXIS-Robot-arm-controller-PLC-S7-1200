@@ -20,15 +20,23 @@ JOINT_LIMITS: dict[str, tuple[float, float]] = {
     "j4": (-180.0, 180.0),
 }
 
-_limits_lock = threading.Lock()
+_limits_lock = threading.RLock()
 
 
 def configure_joint_limits(limits: Mapping[str, tuple[float, float]]) -> None:
     """Update joint limits atomically from config."""
     with _limits_lock:
+        updated = {}
         for joint, pair in limits.items():
-            if joint in JOINT_LIMITS:
-                JOINT_LIMITS[joint] = (float(pair[0]), float(pair[1]))
+            if joint not in JOINT_LIMITS:
+                raise ValueError(f"Unknown joint limit: {joint}.")
+            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                raise ValueError(f"Joint {joint} limits must be a (minimum, maximum) pair.")
+            low, high = float(pair[0]), float(pair[1])
+            if not math.isfinite(low) or not math.isfinite(high) or low >= high:
+                raise ValueError(f"Joint {joint} limits must be finite and strictly ordered.")
+            updated[joint] = (low, high)
+        JOINT_LIMITS.update(updated)
 
 
 def validate_joint_angles(
@@ -48,12 +56,16 @@ def validate_joint_angles(
     """
     from src.kinematics.kinematics import WorkspaceError
 
+    if not math.isfinite(tol) or tol < 0:
+        raise ValueError("Joint-limit tolerance must be finite and non-negative.")
+    with _limits_lock:
+        limits = JOINT_LIMITS.copy()
     angles = {"j1": j1, "j2": j2, "j3": j3, "j4": j4}
     for name, val in angles.items():
         if not math.isfinite(val):
             raise WorkspaceError(f"Joint {name} must be finite.")
-        if name in JOINT_LIMITS:
-            lo, hi = JOINT_LIMITS[name]
+        if name in limits:
+            lo, hi = limits[name]
             if val < (lo - tol) or val > (hi + tol):
                 raise WorkspaceError(
                     f"Joint limit exceeded: {name}={val:.2f}°, limit=[{lo:.1f}, {hi:.1f}]"

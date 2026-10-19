@@ -162,6 +162,8 @@ def test_pc_motion_rejects_overlapping_status_bytes(plc):
         controller.validate_motion_layout()
     controller._cfg.offsets.motion_done_byte = 70
     controller._cfg.offsets.error_flag_byte = 70
+    for index in range(1, 5):
+        setattr(controller._cfg.offsets, f"j{index}_target", 84 + 4 * index)
     controller.validate_motion_layout()
 
 
@@ -307,7 +309,8 @@ def test_live_preview_reads_updated_roi_each_frame():
     trigger = MagicMock()
     trigger.is_set.return_value = False
     app = SimpleNamespace(cfg=config, detector=detector, _stop_event=stop,
-                          _manual_classify_trigger=trigger, _frame_pending=True)
+                          _manual_classify_trigger=trigger, _frame_pending=True,
+                          _apply_camera_request=MagicMock())
     with patch("main.cv2.rectangle") as rectangle, patch("main.cv2.putText"), \
          patch("main.time.monotonic", side_effect=[1.0, 2.0]):
         main.RobotApp._yolo_processing_loop(app)

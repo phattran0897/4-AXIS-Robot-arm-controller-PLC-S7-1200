@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QStackedWidget,
     QTextEdit,
     QVBoxLayout,
@@ -44,6 +46,7 @@ from src.plc.plc_controller import ADDR, PLCController
 from src.ai.qr_reader import QRReader
 from src.robot.sorting_controller import SortResult, SortingController
 from src.ui.header import VAAFooter, VAAHeader, apply_app_icon
+from src.ui.help_text import LOG_HELP, set_help, set_help_notice
 from src.ui.page_auto import PageAuto
 from src.ui.page_manual import PageManual
 from src.ui.page_settings import PageSettings
@@ -54,13 +57,16 @@ from src.ui.theme import (
     GLOBAL_QSS,
     PANEL_BORDER,
     TEXT_DIM,
+    TEXT_SECONDARY,
+    btn_style,
     card_style,
 )
 
 # ---------------------------------------------------------------------------
 # Logging (console + rotating file under ./logs)
 # ---------------------------------------------------------------------------
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+_RUNTIME_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+LOG_DIR = str(_RUNTIME_DIR / "logs")
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s – %(message)s"
 
 
@@ -70,23 +76,36 @@ def _setup_logging() -> logging.Logger:
     if robot_log.handlers:  # Already configured
         return robot_log
     robot_log.setLevel(logging.INFO)
+    robot_log.propagate = False
 
     console = logging.StreamHandler()
     console.setFormatter(logging.Formatter(_LOG_FORMAT))
     robot_log.addHandler(console)
 
-    try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        log_file = RotatingFileHandler(
-            os.path.join(LOG_DIR, "robot_app.log"),
-            maxBytes=20_000_000,  # 20 MB per file
-            backupCount=5,
-            encoding="utf-8",
-        )
-        log_file.setFormatter(logging.Formatter(_LOG_FORMAT))
-        robot_log.addHandler(log_file)
-    except OSError as exc:
-        robot_log.warning("File logging disabled (cannot write %s): %s", LOG_DIR, exc)
+    directories = [Path(LOG_DIR), Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "RobotController" / "logs"]
+    for directory in directories:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            log_file = RotatingFileHandler(
+                directory / "robot_app.log",
+                maxBytes=20_000_000,
+                backupCount=5,
+                encoding="utf-8",
+            )
+            log_file.setFormatter(logging.Formatter(_LOG_FORMAT))
+            robot_log.addHandler(log_file)
+            break
+        except OSError as exc:
+            robot_log.warning("Cannot write logs to %s: %s", directory, exc)
+
+    # Capture PLC, camera, kinematics and sorter diagnostics in the same file.
+    # Keep unrelated library/root logging under the embedding application's control.
+    source_log = logging.getLogger("src")
+    source_log.setLevel(logging.INFO)
+    source_log.propagate = False
+    for handler in robot_log.handlers:
+        if handler not in source_log.handlers:
+            source_log.addHandler(handler)
 
     return robot_log
 
@@ -97,7 +116,6 @@ log = _setup_logging()
 # Constants
 # ---------------------------------------------------------------------------
 _THREAD_JOIN_TIMEOUT: float = 5.0
-_SORT_JOIN_TIMEOUT: float = 10.0
 _CAMERA_SWITCH_DEBOUNCE: float = 0.5  # seconds
 
 
@@ -118,6 +136,8 @@ class RobotApp(QMainWindow):
     def __init__(self, cfg: RobotConfig) -> None:
         super().__init__()
         self.cfg: RobotConfig = cfg
+        self._closing = False
+        self._vision_error = ""
 
         # ── Kinematics: make config.yaml the single source of truth ────────
         kin = cfg.kinematics
@@ -149,7 +169,6 @@ class RobotApp(QMainWindow):
         apply_app_icon(self)
 
         # ── Hardware controllers ─────────────────────────────────────────────
-        self.plc: PLCController = PLCController(cfg.plc)
         self.detector: YOLODetector = YOLODetector(
             model_path=cfg.yolo.model_path,
             thresh=cfg.yolo.thresh,
@@ -161,73 +180,94 @@ class RobotApp(QMainWindow):
             camera_read_timeout=cfg.camera.read_timeout,
             calibration_path=cfg.yolo.calibration_path,
             class_quality=cfg.yolo.class_quality,
+            lazy_model=cfg.app.sorting_mode == "qr",
         )
-        self.sorter: SortingController = SortingController(
-            plc=self.plc,
-            positions=cfg.sort_positions,
-            kinematics=cfg.kinematics,
-            plc_commands=cfg.plc.commands,
-        )
-        self.qr_reader = QRReader(debounce_frames=cfg.app.qr_debounce_frames,
-                                  clear_frames=cfg.app.qr_clear_frames,
-                                  miss_tolerance=cfg.app.qr_miss_tolerance)
-        self._sort_thread: threading.Thread | None = None
-        self._sort_start_lock = threading.Lock()
+        try:
+            self.plc: PLCController = PLCController(cfg.plc)
+            self.sorter: SortingController = SortingController(
+                plc=self.plc,
+                positions=cfg.sort_positions,
+                kinematics=cfg.kinematics,
+                plc_commands=cfg.plc.commands,
+            )
+            self.qr_reader = QRReader(debounce_frames=cfg.app.qr_debounce_frames,
+                                      clear_frames=cfg.app.qr_clear_frames,
+                                      miss_tolerance=cfg.app.qr_miss_tolerance)
+            self._sort_thread: threading.Thread | None = None
+            self._sort_start_lock = threading.Lock()
+            self._camera_request_lock = threading.Lock()
+            self._requested_camera_index: int | None = None
+            self._latest_plc_data: dict[str, Any] = {"connected": False}
 
-        # Backwards-compatible alias (older code accessed controller._sorter)
-        self._sorter = self.sorter
+            # Backwards-compatible alias (older code accessed controller._sorter)
+            self._sorter = self.sorter
 
-        # ── Thread synchronisation ───────────────────────────────────────────
-        self._stop_event: threading.Event = threading.Event()
+            # ── Thread synchronisation ───────────────────────────────────────────
+            self._stop_event: threading.Event = threading.Event()
 
-        # ── Camera switch debounce (QTimer on Qt loop) ────────────────────────
-        self._camera_timer: QTimer = QTimer(self)
-        self._camera_timer.setSingleShot(True)
-        self._pending_camera_choice: str = ""
-        self._camera_timer.timeout.connect(self._execute_pending_camera_switch)
+            # ── Camera switch debounce (QTimer on Qt loop) ────────────────────────
+            self._camera_timer: QTimer = QTimer(self)
+            self._camera_timer.setSingleShot(True)
+            self._pending_camera_choice: str = ""
+            self._camera_timer.timeout.connect(self._execute_pending_camera_switch)
 
-        # ── Manual Capture Trigger (AI vision loop) ──────────────────────────
-        self._manual_classify_trigger: threading.Event = threading.Event()
+            # ── Manual Capture Trigger (AI vision loop) ──────────────────────────
+            self._manual_classify_trigger: threading.Event = threading.Event()
+            self._classification_running = threading.Event()
 
-        # ── Post-sort cooldown (prevents rapid re-detection) ─────────────────
-        self._sort_cooldown_duration: float = cfg.app.move_cooldown
-        self._sort_cooldown_end: float = 0.0
+            # ── Post-sort cooldown (prevents rapid re-detection) ─────────────────
+            self._sort_cooldown_duration: float = cfg.app.move_cooldown
+            self._sort_cooldown_end: float = 0.0
 
-        # ── Signal / Slot connections ────────────────────────────────────────
-        self.frame_ready.connect(
-            self._on_frame_ready, Qt.ConnectionType.QueuedConnection
-        )
-        self.plc_data_ready.connect(
-            self._dispatch_plc_data, Qt.ConnectionType.QueuedConnection
-        )
-        self.tx_logged.connect(self._on_tx_logged, Qt.ConnectionType.QueuedConnection)
-        self.show_error_dialog.connect(
-            self._show_hardware_error_dialog, Qt.ConnectionType.QueuedConnection
-        )
+            # ── Signal / Slot connections ────────────────────────────────────────
+            self.frame_ready.connect(
+                self._on_frame_ready, Qt.ConnectionType.QueuedConnection
+            )
+            self.plc_data_ready.connect(
+                self._dispatch_plc_data, Qt.ConnectionType.QueuedConnection
+            )
+            self.tx_logged.connect(self._on_tx_logged, Qt.ConnectionType.QueuedConnection)
+            self.show_error_dialog.connect(
+                self._show_hardware_error_dialog, Qt.ConnectionType.QueuedConnection
+            )
 
-        # ── GUI layout ───────────────────────────────────────────────────────
-        self._build_central_ui()
+            # ── GUI layout ───────────────────────────────────────────────────────
+            self._build_central_ui()
 
-        # Wire up callback to PLCController
-        self.plc.tx_callback = self.log_tx
+            self.refresh_sorting_controls()
+            if self._vision_error:
+                message = self._vision_error
+                QTimer.singleShot(0, lambda: self.show_error_dialog.emit(message))
 
-        # ── Background threads ───────────────────────────────────────────────
-        self._plc_thread: threading.Thread = threading.Thread(
-            target=self._cyclic_update,
-            name="PLCPollThread",
-            daemon=True,
-        )
-        self._ai_thread: threading.Thread = threading.Thread(
-            target=self._yolo_processing_loop,
-            name="AIVisionThread",
-            daemon=True,
-        )
-        self._frame_pending = False
-        self._plc_thread.start()
-        self._ai_thread.start()
+            # Wire up callback to PLCController
+            self.plc.tx_callback = self.log_tx
+
+            # ── Background threads ───────────────────────────────────────────────
+            self._plc_thread: threading.Thread = threading.Thread(
+                target=self._cyclic_update,
+                name="PLCPollThread",
+                daemon=True,
+            )
+            self._ai_thread: threading.Thread = threading.Thread(
+                target=self._yolo_processing_loop,
+                name="AIVisionThread",
+                daemon=True,
+            )
+            self._frame_pending = False
+            self._plc_thread.start()
+            self._ai_thread.start()
 
 
-        log.info("RobotApp initialised – all threads started.")
+            log.info("RobotApp initialised – all threads started.")
+        except Exception:
+            self._closing = True
+            if hasattr(self, "_stop_event"):
+                self._stop_event.set()
+            self.detector.stop()
+            if hasattr(self, "plc"):
+                self.plc.disconnect()
+            raise
+
 
     # ------------------------------------------------------------------
     # GUI construction
@@ -296,7 +336,7 @@ class RobotApp(QMainWindow):
         tr_layout.addWidget(accent_bar)
 
         lbl_console_title = QLabel(
-            "PLC TRANSMISSION TELEMETRY", title_row
+            "ACTIVITY LOG", title_row
         )
         lbl_console_title.setStyleSheet(
             f"color: {ACCENT}; font-size: 11px; font-weight: bold; "
@@ -305,24 +345,37 @@ class RobotApp(QMainWindow):
         tr_layout.addWidget(lbl_console_title)
         tr_layout.addStretch()
 
-        lbl_tx_badge = QLabel("● LIVE", title_row)
+        lbl_tx_badge = QLabel("PLC COMMANDS & EVENTS", title_row)
         lbl_tx_badge.setStyleSheet(
             f"color: {ACCENT_DIM}; font-size: 10px; font-weight: bold; "
             f"border: none; background: transparent;"
         )
         tr_layout.addWidget(lbl_tx_badge)
+        log_toggle = QPushButton("Show log", title_row)
+        log_toggle.setCheckable(True)
+        log_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        log_toggle.setStyleSheet(btn_style(bg="transparent", hover="#243349", text=TEXT_SECONDARY,
+                                          font_size=11, padding="4px 12px", border=f"1px solid {PANEL_BORDER}"))
+        tr_layout.addWidget(log_toggle)
         tx_layout.addWidget(title_row)
 
         # Scrolling text log
         self.tx_textbox = QTextEdit(self.tx_console_frame)
         self.tx_textbox.setFixedHeight(80)
         self.tx_textbox.setReadOnly(True)
+        for widget in (lbl_console_title, lbl_tx_badge, log_toggle, self.tx_textbox):
+            set_help(widget, "Nhật ký hoạt động", LOG_HELP)
+        self.tx_textbox.setPlaceholderText("PLC commands and application events appear here.")
+        self.tx_textbox.document().setMaximumBlockCount(100)
         self.tx_textbox.setFont(QFont("Consolas", 10))
         self.tx_textbox.setStyleSheet(
             f"background-color: #020617; color: #38BDF8; "
             f"border: 1px solid {PANEL_BORDER}; border-radius: 8px; padding: 6px;"
         )
         tx_layout.addWidget(self.tx_textbox)
+        self.tx_textbox.hide()
+        log_toggle.toggled.connect(self.tx_textbox.setVisible)
+        log_toggle.toggled.connect(lambda expanded: log_toggle.setText("Hide log" if expanded else "Show log"))
 
         # Outer wrapper with padding
         tx_wrapper = QWidget(central_widget)
@@ -353,6 +406,15 @@ class RobotApp(QMainWindow):
         if page_name not in self.frames:
             log.warning("Unknown page requested: %s", page_name)
             return
+        if self._closing:
+            return
+        if page_name == "PageManual" and (self._classification_running.is_set() or
+                (self._sort_thread is not None and self._sort_thread.is_alive())):
+            self.log_tx("Cannot switch to Manual while a sort cycle is running; use STOP first.")
+            return
+        if getattr(self, "_current_page", None) == "PageManual" and page_name != "PageManual":
+            if self.page_manual.release_jog() is False:
+                return
         self._current_page = page_name
         self.stacked_widget.setCurrentWidget(self.frames[page_name])
         self.header.update_active_tab(page_name)
@@ -366,6 +428,63 @@ class RobotApp(QMainWindow):
     # Camera switching (debounced via QTimer)
     # ------------------------------------------------------------------
 
+    def validate_vision_configuration(self, config=None) -> None:
+        config = config or self.cfg
+        if config.app.sorting_mode == "vision":
+            self.plc.validate_motion_layout()
+
+    def refresh_sorting_controls(self) -> None:
+        self._vision_error = ""
+        try:
+            self.validate_vision_configuration()
+        except ValueError as error:
+            self._vision_error = str(error)
+        enabled = not self._vision_error and not self._closing
+        if hasattr(self, "_latest_plc_data"):
+            enabled = enabled and self._latest_plc_data.get("connected", False)
+            enabled = enabled and not self._latest_plc_data.get("error_flag", False)
+            enabled = enabled and not self._latest_plc_data.get("stop_robot", False)
+        enabled = enabled and self.sorter.is_idle()
+        self.page_auto.btn_capture.setVisible(self.cfg.app.sorting_mode == "vision")
+        self.page_auto.btn_capture.setEnabled(enabled)
+        self.page_auto.btn_start.setEnabled(enabled)
+        notice = self._vision_error
+        if not notice and not enabled:
+            status = getattr(self, "_latest_plc_data", {})
+            if self._closing:
+                notice = "Ứng dụng đang đóng."
+            elif status.get("connected") is False:
+                notice = "PLC đang ngoại tuyến. Kiểm tra kết nối và chờ trạng thái được cập nhật."
+            elif status.get("error_flag"):
+                notice = "PLC đang báo lỗi. Xử lý nguyên nhân rồi dùng Clear error."
+            elif status.get("stop_robot"):
+                notice = "Lệnh Stop đang được giữ. Kiểm tra hệ thống trước khi dùng Clear error."
+            else:
+                notice = "Bộ điều khiển đang bận hoặc cần xóa lỗi. Xem trạng thái chu trình và Activity log."
+        for button in (self.page_auto.btn_capture, self.page_auto.btn_start):
+            set_help_notice(button, notice)
+        if self._vision_error:
+            self.page_auto.update_qr_status(self._vision_error, "#EF4444")
+
+    def start_auto(self) -> None:
+        if self._closing:
+            return
+        if self._classification_running.is_set() or not self.sorter.is_idle() or (self._sort_thread is not None and self._sort_thread.is_alive()):
+            self.log_tx("START AUTO ignored: a cycle is running or the controller needs a reset.")
+            return
+        try:
+            self.validate_vision_configuration()
+        except ValueError as error:
+            self.show_error_dialog.emit(str(error))
+            return
+        if self.plc.send_pulse(*ADDR.START_AUTO) is False:
+            self.log_tx("START AUTO failed; PLC disconnected or STOP is latched.")
+
+    def stop_robot(self) -> None:
+        self._manual_classify_trigger.clear()
+        if self.sorter.request_stop() is False:
+            self.log_tx("STOP requested but PLC write failed; machine stop is unconfirmed.")
+
     def change_camera_source(self, choice_str: str) -> None:
         """Debounce camera switch request on the Qt event loop."""
         self._pending_camera_choice = choice_str
@@ -376,14 +495,26 @@ class RobotApp(QMainWindow):
             self._do_change_camera(self._pending_camera_choice)
 
     def _do_change_camera(self, choice_str: str) -> None:
-        """Actually perform the camera switch."""
+        """Queue camera I/O for the AI worker, keeping the Qt thread responsive."""
         match = re.search(r"\d+", choice_str)
         if not match:
             log.error("Cannot parse camera index from '%s'.", choice_str)
             return
         idx: int = int(match.group())
+        with self._camera_request_lock:
+            self._requested_camera_index = idx
+
+    def _apply_camera_request(self) -> None:
+        with self._camera_request_lock:
+            idx = self._requested_camera_index
+            self._requested_camera_index = None
+        if idx is None or self._stop_event.is_set():
+            return
+        self._manual_classify_trigger.clear()
         success: bool = self.detector.switch_camera(idx)
         if success:
+            self.qr_reader.reset()
+            self.sorter.process_qr_target("CLEAR")
             log.info("Camera switched to index %d.", idx)
         else:
             self.show_error_dialog.emit(
@@ -393,10 +524,20 @@ class RobotApp(QMainWindow):
 
     def _show_hardware_error_dialog(self, message: str) -> None:
         """Show hardware error box on main thread."""
+        if self._closing:
+            return
         QMessageBox.critical(self, "Hardware Error", message)
 
     def trigger_manual_classification(self) -> None:
         """Trigger a manual capture and classification cycle."""
+        if self._closing or self.cfg.app.sorting_mode != "vision":
+            return
+        if self._classification_running.is_set() or not self.sorter.is_idle() or (self._sort_thread is not None and self._sort_thread.is_alive()):
+            self.log_tx("Capture ignored: wait for the current cycle or clear the fault.")
+            return
+        if time.monotonic() < self._sort_cooldown_end:
+            self.log_tx("Capture ignored: post-sort cooldown is active.")
+            return
         self._manual_classify_trigger.set()
         log.info("Manual classification triggered via GUI.")
 
@@ -423,6 +564,7 @@ class RobotApp(QMainWindow):
             frame_interval: float = 1.0 / max(cam_cfg.fps, 1)
 
             while not self._stop_event.is_set():
+                self._apply_camera_request()
                 frame = self.detector.read_frame()
 
                 if frame is not None:
@@ -459,8 +601,13 @@ class RobotApp(QMainWindow):
                         else:
                             # PC-Master YOLO Vision Mode
                             if self._manual_classify_trigger.is_set():
-                                self._manual_classify_trigger.clear()
-                                self._handle_manual_classification(frame)
+                                with self._sort_start_lock:
+                                    self._manual_classify_trigger.clear()
+                                    self._classification_running.set()
+                                try:
+                                    self._handle_manual_classification(frame)
+                                finally:
+                                    self._classification_running.clear()
                                 force_preview = True
 
                         now = time.monotonic()
@@ -495,7 +642,6 @@ class RobotApp(QMainWindow):
                                 )
 
                             if not self._frame_pending:
-                                self._frame_pending = True
                                 h, w, ch = display_frame.shape
                                 bytes_per_line = ch * w
                                 qimg = QImage(
@@ -505,6 +651,7 @@ class RobotApp(QMainWindow):
                                     bytes_per_line,
                                     QImage.Format.Format_BGR888,
                                 ).copy()  # Deep copy is essential because display_frame is temporary
+                                self._frame_pending = True
                                 self.frame_ready.emit(qimg)
 
                     except Exception as frame_exc:
@@ -513,6 +660,7 @@ class RobotApp(QMainWindow):
                             frame_exc,
                             exc_info=True,
                         )
+                        self.log_tx(f"Camera processing failed: {frame_exc}")
 
                 self._stop_event.wait(frame_interval)
         except Exception as thread_exc:
@@ -546,7 +694,10 @@ class RobotApp(QMainWindow):
             blurred = cv2.GaussianBlur(roi_crop, (0, 0), 2.0)
             roi_crop = cv2.addWeighted(roi_crop, 1.5, blurred, -0.5, 0)
 
-        result = self.detector.annotate_frame(roi_crop)
+        geometry = {}
+        if self.cfg.yolo.coordinate_origin == "frame":
+            geometry = {"pixel_offset": (cx, cy), "pixel_origin": (fw / 2.0, fh / 2.0)}
+        result = self.detector.annotate_frame(roi_crop, **geometry)
 
         if not result.has_defect:
             log.info("Manual Capture: no object detected above threshold – skipped.")
@@ -570,6 +721,13 @@ class RobotApp(QMainWindow):
 
     def _start_sort_cycle(self, rx: float, ry: float, result: SortResult) -> bool:
         """Launch the sorting cycle on a worker thread."""
+        if self._closing or self._stop_event.is_set():
+            return False
+        try:
+            self.validate_vision_configuration()
+        except ValueError as error:
+            self.show_error_dialog.emit(str(error))
+            return False
         remaining = self._sort_cooldown_end - time.monotonic()
         if remaining > 0:
             log.info("Sort suppressed – cooldown active for another %.1fs.", remaining)
@@ -577,6 +735,10 @@ class RobotApp(QMainWindow):
             return False
 
         with self._sort_start_lock:
+            # Recheck under the lock: Settings or closeEvent may have run
+            # while inference was finishing.
+            if self._closing or self._stop_event.is_set() or self.cfg.app.sorting_mode != "vision":
+                return False
             if not self.sorter.is_idle():
                 self.log_tx("Sort suppressed: controller is not IDLE; clear the fault first.")
                 return False
@@ -619,12 +781,29 @@ class RobotApp(QMainWindow):
             log.info("Post-sort cooldown activated (%.1fs).", self._sort_cooldown_duration)
 
     def clear_all_errors(self) -> None:
-        """Clear errors on PLC and reset sorting controller state."""
-        if self._sort_thread is not None and self._sort_thread.is_alive():
-            self.log_tx("Cannot clear errors while a sort cycle is running.")
-            return
-        self.plc.send_command(self.cfg.plc.commands.idle)
-        self.sorter.clear_error()
+        """Acknowledge a PLC fault explicitly; reset local state only when healthy."""
+        with self._sort_start_lock:
+            if self._sort_thread is not None and self._sort_thread.is_alive():
+                self.log_tx("Cannot clear errors while a sort cycle is running.")
+                return
+            status = self.plc.read_status()
+            if not status:
+                self.log_tx("Cannot reset: PLC status unavailable.")
+                return
+            if status.get("error_flag", False):
+                if self.plc.acknowledge_error():
+                    self.log_tx("PLC error acknowledgement sent; wait for the fault to clear, then reset again.")
+                else:
+                    self.log_tx("PLC fault still active. Acknowledge it at the PLC or configure its error_ack bit.")
+                return
+            if not status.get("motion_done", False):
+                self.log_tx("Cannot reset: PLC has not confirmed motion stopped/completed.")
+                return
+            if self.plc.resume_commands() is False:
+                self.log_tx("Cannot reset: failed to release software STOP.")
+                return
+            self.sorter.clear_error()
+            self.log_tx("PLC status healthy; local error cleared and commands enabled.")
 
     # ------------------------------------------------------------------
     # Main thread slots
@@ -644,14 +823,13 @@ class RobotApp(QMainWindow):
     def _on_tx_logged(self, message: str) -> None:
         """Append a timestamped message to the transmission telemetry log."""
         timestamp = time.strftime("%H:%M:%S")
-        self.tx_textbox.append(f"[{timestamp}] {message}")
-        doc = self.tx_textbox.document()
-        if doc.blockCount() > 100:
-            cursor = self.tx_textbox.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.Start)
-            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
-            cursor.removeSelectedText()
-            cursor.deleteChar()
+        cursor = self.tx_textbox.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not self.tx_textbox.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertText(f"[{timestamp}] {message}")
+        self.tx_textbox.setTextCursor(cursor)
+        self.tx_textbox.ensureCursorVisible()
 
     # ------------------------------------------------------------------
     # Background thread: PLC cyclic poll with exponential backoff
@@ -659,19 +837,28 @@ class RobotApp(QMainWindow):
 
     def _cyclic_update(self) -> None:
         """Poll PLC and emit status data via Qt Signal."""
-        interval: float = self.cfg.app.plc_poll_interval
-        retry_delay: float = interval
+        retry_delay: float = self.cfg.app.plc_poll_interval
         max_retry_delay: float = 30.0
         consecutive_failures: int = 0
 
         while not self._stop_event.is_set():
-            if self.plc.is_connected():
-                data: dict[str, Any] = self.plc.read_status()
-                if data:
-                    self.plc_data_ready.emit(data)
+            interval = self.cfg.app.plc_poll_interval
+            data: dict[str, Any] = {}
+            try:
+                if not self.plc.is_connected():
+                    self.plc.connect()
+                if not self._stop_event.is_set() and self.plc.is_connected():
+                    data = self.plc.read_status()
+            except Exception:
+                log.exception("PLC polling failed; reconnect will be retried.")
+            if data:
+                self.plc_data_ready.emit({**data, "connected": True})
                 retry_delay = interval
                 consecutive_failures = 0
             else:
+                # Explicitly invalidate old feedback on every failed read. The
+                # GUI must not show CONNECTED/READY based on a stale snapshot.
+                self.plc_data_ready.emit({"connected": False})
                 consecutive_failures += 1
                 if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
                     log.warning(
@@ -680,10 +867,6 @@ class RobotApp(QMainWindow):
                         consecutive_failures,
                         retry_delay,
                     )
-                try:
-                    self.plc.connect()
-                except Exception as exc:
-                    log.error("PLC connection failed: %s", exc)
                 retry_delay = min(retry_delay * 2, max_retry_delay)
 
             self._stop_event.wait(retry_delay)
@@ -692,20 +875,23 @@ class RobotApp(QMainWindow):
 
     def _dispatch_plc_data(self, data: dict[str, Any]) -> None:
         """Forward PLC data to every registered page (runs on main thread)."""
+        if self._closing:
+            return
+        camera_active = bool(self.detector.is_camera_active()) if hasattr(self.detector, "is_camera_active") else False
+        data = {**data, "camera_active": camera_active}
+        self._latest_plc_data = data
         for frame in self.frames.values():
             try:
                 frame.update_gui_data(data)
             except Exception as exc:
                 log.debug("update_gui_data error on %s: %s", type(frame).__name__, exc)
 
-        plc_connected = self.plc.is_connected()
-        camera_active = (
-            self.detector.is_camera_active()
-            if hasattr(self.detector, "is_camera_active")
-            else False
-        )
-        system_ok = not data.get("error_flag", False)
+        plc_connected = data.get("connected", False)
+        system_ok = bool(plc_connected and not data.get("error_flag", False)
+                         and not data.get("stop_robot", False)
+                         and self.sorter.state.name != "ERROR" and not self._vision_error)
         self.footer.update_status(plc_connected, camera_active, system_ok)
+        self.refresh_sorting_controls()
 
     # ------------------------------------------------------------------
     # Compatibility methods
@@ -732,25 +918,29 @@ class RobotApp(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         """Graceful shutdown on window close."""
         log.info("Shutdown initiated via closeEvent...")
-        self._stop_event.set()
+        with self._sort_start_lock:
+            self._closing = True
+            self._stop_event.set()
+            self._manual_classify_trigger.clear()
+            if hasattr(self, "_camera_timer"):
+                self._camera_timer.stop()
+            try:
+                if self.sorter.request_stop() is False:
+                    log.error("Shutdown STOP could not be written; physical stop is unconfirmed.")
+            except Exception:
+                log.exception("Shutdown STOP failed; physical stop is unconfirmed.")
 
-        if hasattr(self, "_camera_timer") and self._camera_timer.isActive():
-            self._camera_timer.stop()
-
-        if self._sort_thread is not None and self._sort_thread.is_alive():
-            log.info("Waiting for active sorting thread to complete...")
-            self._sort_thread.join(timeout=_SORT_JOIN_TIMEOUT)
-
+        # Stop producers before disconnecting so they cannot reconnect or issue
+        # another destination after STOP. Cancellation wakes every sort delay.
+        for thread in (self._sort_thread, self._plc_thread, self._ai_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=_THREAD_JOIN_TIMEOUT)
+                if thread.is_alive():
+                    log.error("Thread %s did not stop before shutdown timeout.", thread.name)
         self.detector.stop()
         self.plc.disconnect()
 
-        for thread in (self._plc_thread, self._ai_thread):
-            if thread.is_alive():
-                thread.join(timeout=_THREAD_JOIN_TIMEOUT)
-                if thread.is_alive():
-                    log.warning("Thread '%s' did not exit within timeout.", thread.name)
-
-        log.info("All threads stopped. Window closing.")
+        log.info("Shutdown cleanup finished. Window closing.")
         event.accept()
 
 
@@ -758,11 +948,20 @@ class RobotApp(QMainWindow):
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main() -> int:
+    """Launch with a visible configuration/startup error in windowed builds."""
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyleSheet(GLOBAL_QSS)
-
-    config: RobotConfig = load_config()
-    main_window = RobotApp(cfg=config)
+    try:
+        config: RobotConfig = load_config()
+        main_window = RobotApp(cfg=config)
+    except Exception as error:
+        log.exception("Application startup failed.")
+        QMessageBox.critical(None, "Startup Error", f"Cannot start Robot Controller.\n\n{error}\n\nCheck config.yaml and the application log.")
+        return 1
     main_window.show()
-    sys.exit(app.exec())
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

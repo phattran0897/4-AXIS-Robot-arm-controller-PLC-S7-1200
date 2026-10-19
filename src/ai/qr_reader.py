@@ -24,12 +24,16 @@ class QRReader:
         self._last_raw_value: str | None = None
         self._consecutive_count: int = 0
         self._none_count: int = 0
+        self._clear_count = 0
+        self._cleared = False
 
     def reset(self) -> None:
         """Forget the current item when changing camera or sorting mode."""
         self._last_raw_value = None
         self._consecutive_count = 0
         self._none_count = 0
+        self._clear_count = 0
+        self._cleared = False
 
     def decode_qr(self, frame: np.ndarray) -> tuple[Literal["value", "clear", "none"], str | None]:
         """
@@ -51,6 +55,8 @@ class QRReader:
 
         if value:
             self._none_count = 0
+            self._clear_count = 0
+            self._cleared = False
             if value == self._last_raw_value:
                 self._consecutive_count += 1
             else:
@@ -66,8 +72,11 @@ class QRReader:
                 self._last_raw_value = None
                 self._consecutive_count = 0
                 
-            if self._none_count >= self.clear_frames:
-                self._none_count = 0
+            # An undecodable but visible QR outline is not an empty belt.
+            visible = points is not None and np.asarray(points).size > 0
+            self._clear_count = 0 if visible else min(self.clear_frames, self._clear_count + 1)
+            if self._clear_count >= self.clear_frames and not self._cleared:
+                self._cleared = True
                 return "clear", None
             
         return "none", None

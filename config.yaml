@@ -34,6 +34,9 @@ plc:
     j4_target: -1  # Not mapped in PLC Image, set to -1 to ignore
     # WARNING: byte 20 overlaps theta_j1 REAL (18..21). Match dedicated
     # status bytes to the real TIA DB before enabling PC-Master motion.
+    # Optional TIA fault acknowledgement bit; -1 means acknowledge at the PLC.
+    error_ack_byte: -1
+    error_ack_bit: 0
     motion_done_byte: 20
     motion_done_bit: 0
     error_flag_byte: 20
@@ -67,6 +70,9 @@ yolo:
   px2mm: 0.5 
 
   # Robot home position in mm (centre of workspace)
+  # roi: home_x/y describe the ROI centre (legacy calibration).
+  # frame: home_x/y describe the full camera frame centre.
+  coordinate_origin: "roi"
   home_x: 200.0
   home_y: 0.0
 

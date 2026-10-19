@@ -13,7 +13,7 @@ Usage
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from typing import Any
 
 import yaml
@@ -26,12 +26,7 @@ import yaml
 
 class ConfigValidationError(ValueError):
     """
-    Raised by :func:`load_config` when a required key is absent from the
-    YAML file (or from its expected sub-section).
-
-    Unlike a plain :exc:`ValueError` this signals to the caller (e.g.
-    ``main.py``) that the problem is a missing *configuration key* rather
-    than an invalid value, so a more actionable error message can be shown.
+    Raised when configuration keys, types, or YAML structure are invalid.
     """
 
 
@@ -60,6 +55,8 @@ class PLCOffsets:
     theta_j2_ht: int = 54
     theta_j3_ht: int = 58
     theta_j1_ht: int = 62
+    error_ack_byte: int = -1
+    error_ack_bit: int = 0
     motion_done_byte: int = 20
     motion_done_bit: int = 0
     error_flag_byte: int = 20
@@ -104,6 +101,7 @@ class YOLOConfig:
     roi_width: int = 240
     roi_height: int = 240
     # Optional camera calibration file path (OpenCV YAML/JSON)
+    coordinate_origin: str = "roi"
     calibration_path: str = ""
     class_quality: dict[str, str] = field(default_factory=lambda: {"0": "BAD", "1": "GOOD"})
 
@@ -234,6 +232,69 @@ def _nested_get(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
     return cursor
 
 
+class _ConfigLoader(yaml.SafeLoader):
+    """Safe YAML loader that also rejects ambiguous duplicate settings."""
+
+    def construct_mapping(self, node, deep=False):
+        self.flatten_mapping(node)
+        seen = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                if key in seen:
+                    raise ConfigValidationError(f"Duplicate config key {key!r} at line {key_node.start_mark.line + 1}.")
+                seen.add(key)
+            except TypeError as exc:
+                raise ConfigValidationError("Configuration keys must be scalar values.") from exc
+        return super().construct_mapping(node, deep=deep)
+
+
+def _validate_raw_types(raw: Any) -> dict[str, Any]:
+    """Validate before casts can silently truncate numbers or invert booleans."""
+    def visit(node, template, path):
+        if not isinstance(node, dict):
+            raise ConfigValidationError(f"{path or 'Configuration root'} must be a mapping.")
+        for item in fields(template):
+            if item.name not in node:
+                continue
+            value = node[item.name]
+            default = getattr(template, item.name)
+            label = f"{path}.{item.name}" if path else item.name
+            if is_dataclass(default):
+                if value is None:  # Retain empty optional-section defaults.
+                    node[item.name] = {}
+                    value = node[item.name]
+                visit(value, default, label)
+            elif label == "sort_positions.pick":
+                if value is not None:
+                    visit(value, JointPosition(), label)
+            elif label == "sort_positions.locations":
+                if not isinstance(value, dict):
+                    raise ConfigValidationError(f"{label} must be a mapping.")
+                for key, position in value.items():
+                    if not isinstance(key, str) or not key.strip():
+                        raise ConfigValidationError(f"{label} keys must be non-empty strings.")
+                    visit(position, JointPosition(), f"{label}.{key}")
+            elif label == "yolo.class_quality":
+                if not isinstance(value, dict) or any(type(key) not in (str, int) for key in value):
+                    raise ConfigValidationError(f"{label} must map class names or integer IDs to GOOD or BAD.")
+                if len({str(key) for key in value}) != len(value):
+                    raise ConfigValidationError(f"{label} contains duplicate class IDs after string conversion.")
+            elif isinstance(default, bool):
+                if type(value) is not bool:
+                    raise ConfigValidationError(f"{label} must be a YAML boolean (true/false).")
+            elif isinstance(default, int):
+                if type(value) is not int:
+                    raise ConfigValidationError(f"{label} must be an integer.")
+            elif isinstance(default, float):
+                if type(value) not in (int, float):
+                    raise ConfigValidationError(f"{label} must be a number.")
+            elif isinstance(default, str) and not isinstance(value, str):
+                raise ConfigValidationError(f"{label} must be a string.")
+    visit(raw, RobotConfig(), "")
+    return raw
+
+
 def compute_db_read_size(offsets: PLCOffsets) -> int:
     """
     Compute the minimum DB read size covering all offsets.
@@ -249,11 +310,43 @@ def compute_db_read_size(offsets: PLCOffsets) -> int:
                    "theta_j3_ht", "theta_j1_ht")
     ends = [getattr(offsets, name) + 4 for name in real_fields if getattr(offsets, name) >= 0]
     ends += [offsets.cmd_word + 2, offsets.status + 2,
-             offsets.motion_done_byte + 1, offsets.error_flag_byte + 1,
+             offsets.error_ack_byte + 1, offsets.motion_done_byte + 1, offsets.error_flag_byte + 1,
              offsets.phan_loai_hang_byte + 1, offsets.hang_tot_byte + 1,
              offsets.hang_xau_byte + 1, 17]
     return ((max(ends) + 3) // 4) * 4
 
+
+
+def validate_motion_layout(offsets: PLCOffsets) -> None:
+    """Reject conflicting bytes before permitting PC-supervised motion."""
+    feedback = ("theta_j1", "theta_j2", "theta_j3", "py_j2_ht", "pz_j3_ht",
+                "px_j1_ht", "px_j1", "py_j2", "pz_j3", "theta_j2_ht",
+                "theta_j3_ht", "theta_j1_ht")
+    targets = tuple(f"j{i}_target" for i in range(1, 5))
+    for flag in ("motion_done_byte", "error_flag_byte", "error_ack_byte"):
+        byte = getattr(offsets, flag)
+        if byte < 0:
+            continue
+        for name in feedback + targets:
+            start = getattr(offsets, name)
+            if start >= 0 and start <= byte < start + 4:
+                raise ValueError(f"PLC {flag} at byte {byte} overlaps REAL {name} [{start}..{start+3}]. Match the TIA DB before enabling Vision.")
+    flags = [(offsets.motion_done_byte, offsets.motion_done_bit),
+             (offsets.error_flag_byte, offsets.error_flag_bit)]
+    if flags[0] == flags[1]:
+        raise ValueError("motion_done and error_flag must use distinct bits.")
+    if offsets.error_ack_byte >= 0 and (offsets.error_ack_byte, offsets.error_ack_bit) in flags:
+        raise ValueError("error_ack must not share a PLC-owned status bit.")
+    for name in targets:
+        start = getattr(offsets, name)
+        if start < 0:
+            continue
+        for view in feedback:
+            other = getattr(offsets, view)
+            if start < other + 4 and other < start + 4:
+                raise ValueError(f"PLC target {name} [{start}..{start+3}] overlaps {view} [{other}..{other+3}]; separate joint targets from FK/IK views in TIA and config.")
+        if any(start <= byte < start + 4 for byte in (0, 14, 16, 80, offsets.phan_loai_hang_byte, offsets.hang_tot_byte, offsets.hang_xau_byte)):
+            raise ValueError(f"PLC target {name} overlaps a fixed command byte.")
 
 
 def load_config(path: str | None = None) -> RobotConfig:
@@ -279,11 +372,11 @@ def load_config(path: str | None = None) -> RobotConfig:
     if not os.path.isfile(resolved):
         raise FileNotFoundError(
             f"Configuration file not found: {resolved}\n"
-            "Copy config.yaml.example → config.yaml and edit as required."
+            "Restore config.yaml from the project or distribution and edit as required."
         )
 
     with open(resolved, encoding="utf-8") as fh:
-        raw: dict[str, Any] = yaml.safe_load(fh) or {}
+        raw = _validate_raw_types(yaml.load(fh, Loader=_ConfigLoader))
 
     # Helper: raise ConfigValidationError on missing required keys.
     def _require(section_data: dict[str, Any], section: str, *keys: str) -> None:
@@ -323,6 +416,8 @@ def load_config(path: str | None = None) -> RobotConfig:
         theta_j2_ht=off_raw.get("theta_j2_ht", 54),
         theta_j3_ht=off_raw.get("theta_j3_ht", 58),
         theta_j1_ht=off_raw.get("theta_j1_ht", 62),
+        error_ack_byte=off_raw.get("error_ack_byte", -1),
+        error_ack_bit=off_raw.get("error_ack_bit", 0),
         motion_done_byte=off_raw.get("motion_done_byte", 20),
         motion_done_bit=off_raw.get("motion_done_bit", 0),
         error_flag_byte=off_raw.get("error_flag_byte", 20),
@@ -362,6 +457,7 @@ def load_config(path: str | None = None) -> RobotConfig:
         roi_y=int(yolo_raw.get("roi_y", 80)),
         roi_width=int(yolo_raw.get("roi_width", 240)),
         roi_height=int(yolo_raw.get("roi_height", 240)),
+        coordinate_origin=yolo_raw.get("coordinate_origin", "roi"),
         calibration_path=str(yolo_raw.get("calibration_path", "")),
         class_quality={str(k): v for k, v in yolo_raw.get("class_quality", {"0": "BAD", "1": "GOOD"}).items()},
     )
@@ -497,7 +593,7 @@ def load_config(path: str | None = None) -> RobotConfig:
 def validate_config(config: RobotConfig) -> None:
     """Validate loaded files and live settings before applying them."""
     import math
-    from dataclasses import fields, is_dataclass
+    _validate_raw_types(asdict(config))
 
     def check_finite(value):
         if is_dataclass(value):
@@ -512,6 +608,12 @@ def validate_config(config: RobotConfig) -> None:
     yolo_cfg, cam_cfg = config.yolo, config.camera
     app_cfg, kin_cfg = config.app, config.kinematics
     sort_cfg, offsets = config.sort_positions, config.plc.offsets
+    if not config.plc.ip.strip():
+        raise ValueError("plc.ip must not be empty.")
+    if config.plc.db_number < 1 or config.plc.rack < 0 or config.plc.slot < 0:
+        raise ValueError("PLC db_number must be positive; rack and slot must be non-negative.")
+    if cam_cfg.default_index < 0:
+        raise ValueError("camera.default_index must be non-negative.")
     if app_cfg.move_cooldown < 0:
         raise ValueError("app.move_cooldown must be non-negative.")
     if any(type(getattr(app_cfg, name)) is not int for name in ("qr_debounce_frames", "qr_clear_frames", "qr_miss_tolerance")):
@@ -521,6 +623,22 @@ def validate_config(config: RobotConfig) -> None:
     commands = [getattr(config.plc.commands, name) for name in config.plc.commands.__dataclass_fields__]
     if any(type(value) is not int for value in commands) or len(set(commands)) != len(commands):
         raise ValueError("PLC command values must be distinct integers.")
+    if offsets.error_ack_byte >= 0:
+        ack = (offsets.error_ack_byte, offsets.error_ack_bit)
+        reserved = {(0, i) for i in range(3)} | {(14, i) for i in range(2)} | {(16, i) for i in range(7)} | {(80, i) for i in range(6)}
+        reserved |= {(offsets.motion_done_byte, offsets.motion_done_bit), (offsets.error_flag_byte, offsets.error_flag_bit),
+                     (offsets.phan_loai_hang_byte, offsets.phan_loai_hang_bit), (offsets.hang_tot_byte, offsets.hang_tot_bit),
+                     (offsets.hang_xau_byte, offsets.hang_xau_bit)}
+        if ack in reserved:
+            raise ValueError("error_ack must use a dedicated command bit.")
+        real_names = ("j1_target", "j2_target", "j3_target", "j4_target", "theta_j1", "theta_j2", "theta_j3",
+                      "py_j2_ht", "pz_j3_ht", "px_j1_ht", "px_j1", "py_j2", "pz_j3", "theta_j2_ht", "theta_j3_ht", "theta_j1_ht")
+        if any(getattr(offsets, name) >= 0 and getattr(offsets, name) <= ack[0] < getattr(offsets, name) + 4 for name in real_names):
+            raise ValueError("error_ack must not overlap a REAL field.")
+    if yolo_cfg.coordinate_origin not in ("roi", "frame"):
+        raise ValueError("yolo.coordinate_origin must be roi or frame.")
+    if not 0 <= offsets.error_ack_bit <= 7:
+        raise ValueError("plc.offsets.error_ack_bit must be in 0..7.")
     if app_cfg.sorting_mode not in ("qr", "vision"):
         raise ValueError("app.sorting_mode must be qr or vision.")
     if not yolo_cfg.class_quality or any(v not in ("GOOD", "BAD") for v in yolo_cfg.class_quality.values()):
@@ -531,7 +649,9 @@ def validate_config(config: RobotConfig) -> None:
         value = getattr(offsets, name)
         if type(value) is not int:
             raise ValueError(f"plc.offsets.{name} must be an integer.")
-        if name != "j4_target" and value < 0:
+        if name in ("j4_target", "error_ack_byte") and value < -1:
+            raise ValueError(f"plc.offsets.{name} must be >= -1.")
+        if name not in ("j4_target", "error_ack_byte") and value < 0:
             raise ValueError(f"plc.offsets.{name} must be non-negative.")
     spans = sorted((getattr(offsets, f"j{i}_target"), i) for i in range(1, 5) if getattr(offsets, f"j{i}_target") >= 0)
     if any(right[0] < left[0] + 4 for left, right in zip(spans, spans[1:])):
@@ -544,12 +664,11 @@ def validate_config(config: RobotConfig) -> None:
         raise ValueError(
             f"app.plc_poll_interval must be positive (got {app_cfg.plc_poll_interval})."
         )
-    for link_name in ("a1", "a2", "a3", "a4"):
-        if getattr(kin_cfg, link_name) < 0.0:
-            raise ValueError(
-                f"kinematics.{link_name} must be non-negative "
-                f"(got {getattr(kin_cfg, link_name)})."
-            )
+    if kin_cfg.a1 < 0:
+        raise ValueError("kinematics.a1 must be non-negative.")
+    for link_name in ("a2", "a3", "a4"):
+        if getattr(kin_cfg, link_name) <= 0.0:
+            raise ValueError(f"kinematics.{link_name} must be positive.")
     if kin_cfg.d1 <= 0.0:
         raise ValueError(f"kinematics.d1 must be positive (got {kin_cfg.d1}).")
 
@@ -636,79 +755,96 @@ def validate_config(config: RobotConfig) -> None:
             raise ValueError("sorting_mode is 'qr' but sort_positions.pick is missing.")
         if not sort_cfg.locations:
             raise ValueError("sorting_mode is 'qr' but sort_positions.locations is empty.")
+    positions = dict(sort_cfg.locations)
+    if sort_cfg.pick is not None:
+        positions["pick"] = sort_cfg.pick
+    for label, position in positions.items():
+        for axis in ("j1", "j2", "j3", "j4"):
+            angle = getattr(position, axis)
+            if not getattr(kin_cfg, f"{axis}_min") <= angle <= getattr(kin_cfg, f"{axis}_max"):
+                raise ValueError(f"sort_positions.{label}.{axis} exceeds the configured joint limits.")
 
 
 
 def save_config(config: RobotConfig, path: str = _DEFAULT_CONFIG_PATH) -> None:
+    """Atomically persist every setting, retaining existing comments and extra keys.
+
+    YAML node positions identify values, so quoted comments, arbitrary indentation,
+    and missing optional sections are handled without regex guesses. The generated
+    file must load back to the requested configuration before replacing the original.
     """
-    Save the runtime configuration back to YAML.
-    Uses regex replacements to preserve comments and file structure.
-    """
-    import re
     import tempfile
     validate_config(config)
+    with open(path, "r", encoding="utf-8") as source_file:
+        source = source_file.read()
+    # Validate the existing document before editing ambiguous or malformed YAML.
+    original = _validate_raw_types(yaml.load(source, Loader=_ConfigLoader))
+    root = yaml.compose(source, Loader=yaml.SafeLoader)
+    changes: list[tuple[int, int, str]] = []
 
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    def inline(value):
+        return yaml.safe_dump(value, default_flow_style=True, sort_keys=False,
+                              allow_unicode=True, width=100000).removesuffix("...\n").rstrip()
 
-    updates = {
-        ("yolo", "thresh"): config.yolo.thresh,
-        ("yolo", "px2mm"): config.yolo.px2mm,
-        ("yolo", "roi_x"): config.yolo.roi_x,
-        ("yolo", "roi_y"): config.yolo.roi_y,
-        ("yolo", "roi_width"): config.yolo.roi_width,
-        ("yolo", "roi_height"): config.yolo.roi_height,
-        ("app", "move_cooldown"): config.app.move_cooldown,
-        ("app", "plc_poll_interval"): config.app.plc_poll_interval,
-        ("app", "sorting_mode"): f'"{config.app.sorting_mode}"',
-        ("sort_positions", "pick_z_down"): config.sort_positions.pick_z_down,
-        ("sort_positions", "pick_z_up"): config.sort_positions.pick_z_up,
-        ("place_good", "z_down"): config.sort_positions.place_good.z_down,
-        ("place_good", "z_up"): config.sort_positions.place_good.z_up,
-        ("place_bad", "z_down"): config.sort_positions.place_bad.z_down,
-        ("place_bad", "z_up"): config.sort_positions.place_bad.z_up,
-    }
+    def replace(node, value):
+        text = inline(value)
+        if isinstance(node, yaml.MappingNode) and not node.flow_style:
+            # A block mapping's end includes the indentation of the following key.
+            text += "\n" + " " * node.end_mark.column
+        changes.append((node.start_mark.index, node.end_mark.index, text))
 
-    current_section = None
-    current_subsection = None
-
-    for i, line in enumerate(lines):
-        sec_match = re.match(r"^([a-zA-Z0-9_]+):", line)
-        if sec_match:
-            current_section = sec_match.group(1)
-            current_subsection = None
-            continue
-
-        subsec_match = re.match(r"^ {2}([a-zA-Z0-9_]+):\s*(?:#.*)?$", line)
-        if subsec_match and current_section == "sort_positions":
-            current_subsection = subsec_match.group(1)
-            continue
-
-        kv_match = re.match(r"^(\s+)([a-zA-Z0-9_]+):\s*([^#\n\r]+)(.*)$", line)
-        if kv_match:
-            indent = kv_match.group(1)
-            key = kv_match.group(2)
-            tail = kv_match.group(4)
-
-            if current_section == "sort_positions" and len(indent) == 2:
-                current_subsection = None
-            lookup = None
-            if current_section == "sort_positions" and current_subsection in ("place_good", "place_bad"):
-                lookup = (current_subsection, key)
+    def update(node, desired, current, path_parts=()):
+        if not isinstance(desired, dict) or not isinstance(node, yaml.MappingNode):
+            if desired != current:
+                replace(node, desired)
+            return
+        dynamic = path_parts in (("yolo", "class_quality"), ("sort_positions", "locations"))
+        # Changed key sets need replacement so deleted QR locations/classes cannot
+        # survive a save. Flow mappings also require their own comma syntax.
+        if node.flow_style or (dynamic and set(desired) != set(current)):
+            if desired != current:
+                replace(node, desired)
+            return
+        existing = {}
+        for key_node, value_node in node.value:
+            key = yaml.safe_load(key_node.value)
+            if key_node.tag == "tag:yaml.org,2002:str":
+                key = key_node.value
+            existing[key] = value_node
+        missing = {key: value for key, value in desired.items() if key not in existing}
+        for key, value in desired.items():
+            if key in existing:
+                update(existing[key], value, current.get(key), path_parts + (key,))
+        if missing:
+            # Insert after the final existing value, before trailing section comments.
+            last = node.value[-1][1]
+            end = last.end_mark.index
+            if isinstance(last, yaml.MappingNode) and not last.flow_style:
+                insertion = source.rfind("\n", 0, end) + 1
             else:
-                lookup = (current_section, key)
+                newline = source.find("\n", end)
+                insertion = len(source) if newline < 0 else newline + 1
+            indent = node.value[0][0].start_mark.column
+            dumped = yaml.safe_dump(missing, sort_keys=False, allow_unicode=True)
+            block = "".join(" " * indent + line if line.strip() else line
+                            for line in dumped.splitlines(keepends=True))
+            if insertion and source[insertion - 1] != "\n":
+                block = "\n" + block
+            changes.append((insertion, insertion, block))
 
-            if lookup in updates:
-                new_val = updates[lookup]
-                new_val_str = "true" if new_val is True else "false" if new_val is False else str(new_val)
-                lines[i] = f"{indent}{key}: {new_val_str} {tail}\n".replace("  \n", "\n")
-
+    update(root, asdict(config), original)
+    # Apply edits backwards so original character offsets remain valid.
+    for start, end, replacement in sorted(changes, reverse=True):
+        source = source[:start] + replacement + source[end:]
     temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(os.path.abspath(path)), suffix=".yaml", delete=False) as f:
-            temp_path = f.name
-            f.writelines(lines)
-        load_config(temp_path)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(os.path.abspath(path)), suffix=".yaml", delete=False) as target:
+            temp_path = target.name
+            target.write(source)
+            target.flush()
+            os.fsync(target.fileno())
+        if load_config(temp_path) != config:
+            raise ConfigValidationError("Saved configuration did not match the requested values; original file retained.")
         os.replace(temp_path, path)
     finally:
         if temp_path and os.path.exists(temp_path):

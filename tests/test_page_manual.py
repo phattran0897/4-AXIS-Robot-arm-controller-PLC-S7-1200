@@ -104,22 +104,21 @@ class TestJogToggle(unittest.TestCase):
 
     # ── TC-03 ─────────────────────────────────────────────────────────────
     def test_jog_toggle_all_addresses(self):
-        """All 6 JOG addresses (80.0-80.5) must toggle independently."""
+        """Every axis can jog, but its opposite directions cannot both remain ON."""
         addrs = [(80, i) for i in range(6)]
         for addr in addrs:
             self.page._toggle_jog(addr, f"btn_{addr[1]}")
 
-        # All should be ON
-        for addr in addrs:
-            self.assertTrue(self.page._jog_states[addr])
+        for bit in (0, 2, 4):
+            self.assertFalse(self.page._jog_states[(80, bit)])
+            self.assertTrue(self.page._jog_states[(80, bit + 1)])
 
-        # Toggle only the first one off
+        # Reversing J1 releases its old direction without affecting J2/J3.
         self.page._toggle_jog(addrs[0], "btn_0")
-        self.assertFalse(self.page._jog_states[addrs[0]])
-
-        # Others still ON
-        for addr in addrs[1:]:
-            self.assertTrue(self.page._jog_states[addr])
+        self.assertTrue(self.page._jog_states[(80, 0)])
+        self.assertFalse(self.page._jog_states[(80, 1)])
+        self.assertTrue(self.page._jog_states[(80, 3)])
+        self.assertTrue(self.page._jog_states[(80, 5)])
 
     # ── TC-04 ─────────────────────────────────────────────────────────────
     def test_jog_button_text_on(self):

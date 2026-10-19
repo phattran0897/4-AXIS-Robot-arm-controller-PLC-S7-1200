@@ -21,7 +21,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ui.theme import DANGER, SUCCESS, TEXT_SECONDARY, btn_style
+from src.ui.theme import ACCENT, HEADER_BG, PANEL_BORDER, ROW_BG, SUCCESS, TEXT_DIM, TEXT_PRIMARY, TEXT_SECONDARY, WARNING, btn_style
+from src.ui.visuals import line_icon
+from src.ui.help_text import SECTION_HELP, STATUS_HELP, set_help
 
 if TYPE_CHECKING:
     from main import RobotApp
@@ -38,7 +40,9 @@ VAA_TEXT_DIM: str = "#94A3B8"  # Dimmed text
 
 def get_logo_path() -> str:
     """Filesystem path of the brand logo asset (project-relative)."""
-    return os.path.join(os.path.dirname(__file__), "..", "..", "assets", "vaa_logo.png")
+    import sys
+    root = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.join(os.path.dirname(__file__), "..", "..")
+    return os.path.join(root, "assets", "vaa_logo.png")
 
 
 def apply_app_icon(window: Any, path: str | None = None) -> bool:
@@ -72,231 +76,100 @@ def apply_app_icon(window: Any, path: str | None = None) -> bool:
 
 
 class VAAHeader(QWidget):
-    """
-    Professional header with VAA branding and navigation tabs.
+    """Compact brand bar and segmented workspace navigation."""
 
-    Layout:
-    ┌─────────────────────────────────────────────────────────────────┐
-    │ [LOGO]  HỌC VIỆN HÀNG KHÔNG VIỆT NAM     [AUTO] [MANUAL]        │
-    │         4-AXIS ROBOT CONTROL SYSTEM                             │
-    └─────────────────────────────────────────────────────────────────┘
-    """
-
-    def __init__(
-        self,
-        parent: QWidget | None = None,
-        controller: "RobotApp" | None = None,
-        current_page: str = "PageAuto",
-    ) -> None:
+    def __init__(self, parent=None, controller=None, current_page="PageAuto"):
         super().__init__(parent)
         self.controller = controller
-        self.setFixedHeight(78)
-        self.setStyleSheet(f"background-color: {VAA_PRIMARY};")
+        self.setObjectName("AppHeader")
+        self.setFixedHeight(72)
+        self.setStyleSheet(f"QWidget#AppHeader {{ background: {HEADER_BG}; border-bottom: 1px solid {PANEL_BORDER}; }}")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(24, 12, 24, 12)
+        layout.setSpacing(14)
 
-        self._build_layout(current_page)
+        logo = QLabel(self)
+        logo.setFixedSize(42, 42)
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setStyleSheet("background: #E8F0F5; border-radius: 10px; padding: 5px;")
+        pixmap = QPixmap(get_logo_path())
+        if not pixmap.isNull():
+            logo.setPixmap(pixmap.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            logo.setText("VAA")
+        layout.addWidget(logo)
+        brand = QVBoxLayout()
+        brand.setSpacing(2)
+        title = QLabel("VAA  /  ROBOTICS", self)
+        title.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 15px; font-weight: 600; letter-spacing: 2px;")
+        brand.addWidget(title)
+        subtitle = QLabel("HỌC VIỆN HÀNG KHÔNG VIỆT NAM", self)
+        subtitle.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; letter-spacing: 1px;")
+        brand.addWidget(subtitle)
+        layout.addLayout(brand)
+        layout.addStretch()
 
-    def _build_layout(self, current_page: str) -> None:
-        main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(15, 8, 20, 8)
-        main_layout.setSpacing(15)
-
-        # ── Left section: Logo + Typography ──────────────────────────────────
-        left_widget = QWidget(self)
-        left_layout = QHBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(15)
-
-        # Logo image (optional asset)
-        logo_path = get_logo_path()
-        logo_loaded = False
-        if os.path.exists(logo_path):
-            pixmap = QPixmap(logo_path)
-            if not pixmap.isNull():
-                scaled = pixmap.scaledToHeight(
-                    50, Qt.TransformationMode.SmoothTransformation
-                )
-                logo_label = QLabel(left_widget)
-                logo_label.setPixmap(scaled)
-                left_layout.addWidget(logo_label)
-                logo_loaded = True
-
-        if not logo_loaded:
-            # Accent bar fallback placeholder
-            bar = QFrame(left_widget)
-            bar.setFixedSize(6, 54)
-            bar.setStyleSheet(
-                f"background-color: {VAA_ACCENT}; border-radius: 3px; border: none;"
-            )
-            left_layout.addWidget(bar)
-
-        # Text branding
-        text_widget = QWidget(left_widget)
-        text_layout = QVBoxLayout(text_widget)
-        text_layout.setContentsMargins(0, 2, 0, 2)
-        text_layout.setSpacing(2)
-
-        lbl_title = QLabel("HỌC VIỆN HÀNG KHÔNG VIỆT NAM", text_widget)
-        lbl_title.setStyleSheet(
-            f"color: {VAA_ACCENT}; font-size: 16px; font-weight: bold; border: none;"
-        )
-        text_layout.addWidget(lbl_title)
-
-        subtitle_widget = QWidget(text_widget)
-        sub_layout = QHBoxLayout(subtitle_widget)
-        sub_layout.setContentsMargins(0, 0, 0, 0)
-        sub_layout.setSpacing(4)
-
-        lbl_sub1 = QLabel("VIETNAM AVIATION ACADEMY", subtitle_widget)
-        lbl_sub1.setStyleSheet(
-            f"color: {VAA_TEXT_DIM}; font-size: 10px; font-weight: bold; border: none;"
-        )
-        sub_layout.addWidget(lbl_sub1)
-
-        lbl_pipe = QLabel(" | ", subtitle_widget)
-        lbl_pipe.setStyleSheet("color: #334155; font-size: 10px; border: none;")
-        sub_layout.addWidget(lbl_pipe)
-
-        lbl_sub2 = QLabel("4-AXIS INDUSTRIAL ROBOT CONTROL SYSTEM", subtitle_widget)
-        lbl_sub2.setStyleSheet(
-            f"color: {VAA_TEXT}; font-size: 11px; font-weight: normal; border: none;"
-        )
-        sub_layout.addWidget(lbl_sub2)
-        sub_layout.addStretch()
-
-        text_layout.addWidget(subtitle_widget)
-        left_layout.addWidget(text_widget)
-        left_layout.addStretch()
-        main_layout.addWidget(left_widget)
-
-        # ── Right section: Navigation tabs ───────────────────────────────────
-        tabs_widget = QWidget(self)
-        tabs_layout = QHBoxLayout(tabs_widget)
-        tabs_layout.setContentsMargins(0, 0, 0, 0)
-        tabs_layout.setSpacing(8)
-
-        self._btn_auto = QPushButton("AUTO MODE", tabs_widget)
-        self._btn_auto.setFixedSize(126, 38)
-        self._btn_auto.clicked.connect(
-            lambda: self.controller.show_frame("PageAuto") if self.controller else None
-        )
-        # Compatibility attribute for tests
-        setattr(self._btn_auto, "cget", lambda k: self._btn_auto.text() if k == "text" else "")
-
-        self._btn_manual = QPushButton("MANUAL MODE", tabs_widget)
-        self._btn_manual.setFixedSize(126, 38)
-        self._btn_manual.clicked.connect(
-            lambda: self.controller.show_frame("PageManual") if self.controller else None
-        )
-        setattr(self._btn_manual, "cget", lambda k: self._btn_manual.text() if k == "text" else "")
-
-        self._btn_settings = QPushButton("SETTINGS", tabs_widget)
-        self._btn_settings.setFixedSize(126, 38)
-        self._btn_settings.clicked.connect(
-            lambda: self.controller.show_frame("PageSettings") if self.controller else None
-        )
-
-        tabs_layout.addWidget(self._btn_auto)
-        tabs_layout.addWidget(self._btn_manual)
-        tabs_layout.addWidget(self._btn_settings)
-        main_layout.addWidget(tabs_widget)
-
-        # Apply initial highlight
+        tabs = QFrame(self)
+        tabs.setStyleSheet(f"QFrame {{ background: {ROW_BG}; border: 1px solid {PANEL_BORDER}; border-radius: 9px; }}")
+        tab_layout = QHBoxLayout(tabs)
+        tab_layout.setContentsMargins(4, 4, 4, 4)
+        tab_layout.setSpacing(4)
+        self._buttons = {}
+        for name, text, icon in (("PageAuto", "AUTO MODE", "play"), ("PageManual", "MANUAL MODE", "target"), ("PageSettings", "SETTINGS", "settings")):
+            button = QPushButton(text, tabs)
+            title = {"PageAuto": "Automation overview", "PageManual": "Manual workspace", "PageSettings": "System configuration"}[name]
+            set_help(button, text, SECTION_HELP[title])
+            button.setFixedSize(132, 34)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda checked=False, page=name: self.controller.show_frame(page) if self.controller else None)
+            button.setProperty("iconName", icon)
+            self._buttons[name] = button
+            tab_layout.addWidget(button)
+        self._btn_auto = self._buttons["PageAuto"]
+        self._btn_manual = self._buttons["PageManual"]
+        self._btn_settings = self._buttons["PageSettings"]
+        layout.addWidget(tabs)
         self.update_active_tab(current_page)
 
-    def update_active_tab(self, page_name: str) -> None:
-        """Update tab highlighting based on current page (active tab glows cyan)."""
-        active_css = btn_style(
-            bg=VAA_ACCENT, hover=VAA_ACCENT, text=VAA_PRIMARY, radius=9, font_size=12
-        )
-        inactive_css = btn_style(
-            bg=VAA_SECONDARY, hover="#274B75", text=VAA_TEXT, radius=9, font_size=12
-        )
-
-        for name, button in (("PageAuto", self._btn_auto),
-                             ("PageManual", self._btn_manual),
-                             ("PageSettings", self._btn_settings)):
-            button.setStyleSheet(active_css if page_name == name else inactive_css)
-
+    def update_active_tab(self, page_name):
+        for name, button in self._buttons.items():
+            active = name == page_name
+            button.setStyleSheet(btn_style(
+                bg="#243D42" if active else "transparent", hover="#233345",
+                text=ACCENT if active else TEXT_SECONDARY, radius=6, font_size=11,
+                padding="4px 8px", border="1px solid #31564F" if active else "1px solid transparent"))
+            button.setIcon(line_icon(button.property("iconName"), ACCENT if active else TEXT_SECONDARY, 16))
 
 
 class VAAFooter(QWidget):
-    """
-    Professional footer with status indicators and version info.
-    """
+    """Persistent, compact connection indicators."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(40)
-        self.setStyleSheet(f"background-color: {VAA_PRIMARY};")
-
-        self._build_layout()
-
-    @staticmethod
-    def _chip(text: str, color: str = DANGER) -> QLabel:
-        """Create one status chip label."""
-        lbl = QLabel(text)
-        lbl.setStyleSheet(
-            f"color: {color}; font-size: 11px; font-weight: bold; border: none;"
-        )
-        return lbl
-
-    def _build_layout(self) -> None:
+        self.setObjectName("AppFooter")
+        self.setFixedHeight(34)
+        self.setStyleSheet(f"QWidget#AppFooter {{ background: {HEADER_BG}; border-top: 1px solid {PANEL_BORDER}; }}")
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(20, 0, 20, 0)
-        layout.setSpacing(20)
-
-        # Left status indicators
-        self.lbl_status = self._chip("● SYSTEM READY", SUCCESS)
-        layout.addWidget(self.lbl_status)
-
-        self.lbl_plc = self._chip("PLC: DISCONNECTED", DANGER)
-        layout.addWidget(self.lbl_plc)
-
-        self.lbl_camera = self._chip("CAM: OFFLINE", DANGER)
-        layout.addWidget(self.lbl_camera)
-
+        layout.setContentsMargins(24, 0, 24, 0)
+        layout.setSpacing(24)
+        self.lbl_status, self.lbl_plc, self.lbl_camera = QLabel(), QLabel(), QLabel()
+        set_help(self.lbl_status, "Trạng thái tổng quát", STATUS_HELP)
+        set_help(self.lbl_plc, "Kết nối PLC", "CONNECTED: ứng dụng đang kết nối PLC. OFFLINE: không có kết nối hoặc chưa đọc được trạng thái; kiểm tra nguồn PLC, cáp mạng và cấu hình địa chỉ.")
+        set_help(self.lbl_camera, "Kết nối camera", "ACTIVE: camera đang hoạt động. OFFLINE: camera chưa mở hoặc bị ngắt; kiểm tra thiết bị và chọn nguồn ở Source.")
+        for label in (self.lbl_status, self.lbl_plc, self.lbl_camera):
+            layout.addWidget(label)
         layout.addStretch()
+        version = QLabel("4 AXIS  /  S7-1200     ·     VAA ROBOT SYSTEM")
+        version.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px; letter-spacing: 1px;")
+        layout.addWidget(version)
+        self.update_status(False, False, False)
 
-        # Right version label
-        lbl_version = QLabel("v2.0.0 | VAA Robot System", self)
-        lbl_version.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 10px; border: none;"
-        )
-        layout.addWidget(lbl_version)
-
-    def update_status(
-        self, plc_connected: bool, camera_active: bool, system_ok: bool
-    ) -> None:
-        """Update footer status indicators."""
-        if system_ok:
-            self.lbl_status.setText("● SYSTEM READY")
-            self.lbl_status.setStyleSheet(
-                f"color: {SUCCESS}; font-size: 11px; font-weight: bold; border: none;"
-            )
-        else:
-            self.lbl_status.setText("● SYSTEM ERROR")
-            self.lbl_status.setStyleSheet(
-                f"color: {DANGER}; font-size: 11px; font-weight: bold; border: none;"
-            )
-
-        if plc_connected:
-            self.lbl_plc.setText("PLC: CONNECTED")
-            self.lbl_plc.setStyleSheet(
-                f"color: {SUCCESS}; font-size: 11px; font-weight: bold; border: none;"
-            )
-        else:
-            self.lbl_plc.setText("PLC: DISCONNECTED")
-            self.lbl_plc.setStyleSheet(
-                f"color: {DANGER}; font-size: 11px; font-weight: bold; border: none;"
-            )
-
-        if camera_active:
-            self.lbl_camera.setText("CAM: ACTIVE")
-            self.lbl_camera.setStyleSheet(
-                f"color: {SUCCESS}; font-size: 11px; font-weight: bold; border: none;"
-            )
-        else:
-            self.lbl_camera.setText("CAM: OFFLINE")
-            self.lbl_camera.setStyleSheet(
-                f"color: {DANGER}; font-size: 11px; font-weight: bold; border: none;"
-            )
+    def update_status(self, plc_connected, camera_active, system_ok):
+        state = "SYSTEM READY" if system_ok else ("SYSTEM OFFLINE" if not plc_connected else "ATTENTION REQUIRED")
+        for label, text, color in (
+            (self.lbl_status, state, SUCCESS if system_ok else WARNING),
+            (self.lbl_plc, "PLC CONNECTED" if plc_connected else "PLC OFFLINE", SUCCESS if plc_connected else TEXT_DIM),
+            (self.lbl_camera, "CAMERA ACTIVE" if camera_active else "CAMERA OFFLINE", SUCCESS if camera_active else TEXT_DIM),
+        ):
+            label.setText("●  " + text)
+            label.setStyleSheet(f"color: {color}; font-size: 10px; font-weight: 600; border: none; background: transparent;")

@@ -26,13 +26,15 @@ client itself is NOT thread-safe.
 from __future__ import annotations
 
 import logging
+import math
 import threading
+import time
 from typing import Any, Callable
 
 import snap7
 from snap7.util import get_bool, get_real, set_bool, set_real
 
-from src.config_loader import PLCConfig, PLCOffsets, compute_db_read_size
+from src.config_loader import PLCConfig, PLCOffsets, compute_db_read_size, validate_motion_layout
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +111,10 @@ class PLCController:
         self._client: snap7.client.Client = snap7.client.Client()
         self._db_read_size: int = max(80, compute_db_read_size(cfg.offsets))
         self._lock: threading.RLock = threading.RLock()
+        # Reconnect must wait until disconnect has joined the old pulse worker.
+        self._lifecycle_lock = threading.Lock()
         self._is_connected_cached: bool = False
+        self._needs_connect = False
         # TTL cache for is_connected() – avoids calling get_connected() on every poll
         self._connection_cache_time: float = 0.0
         self._CONNECTION_CACHE_TTL: float = 0.5
@@ -121,6 +126,9 @@ class PLCController:
         self._pulse_timers: dict[tuple[int, int], tuple[Any, int]] = {}
         self._pulse_generations: dict[tuple[int, int], int] = {}
         self._pulse_expiries: dict[tuple[int, int], float] = {}
+        self._pulse_starts: dict[tuple[int, int], tuple[float, int]] = {}
+        self._pulse_low_since: dict[tuple[int, int], float] = {}
+        self._motion_inhibited = False
         self._pulse_worker_event = threading.Event()
         self._pulse_worker_stop = threading.Event()
         self._pulse_thread = threading.Thread(
@@ -152,46 +160,66 @@ class PLCController:
         bool
             ``True`` on success.
         """
-        if self.is_connected():
-            return True
-
-        try:
-            self._client.connect(
-                self._cfg.ip,
-                self._cfg.rack,
-                self._cfg.slot,
-            )
-            connected: bool = bool(self._client.get_connected())
-            self._is_connected_cached = connected
-            if connected:
-                log.info("PLC connected (%s).", self._cfg.ip)
-            else:
-                log.warning(
-                    "PLC connection handshake failed (%s).",
-                    self._cfg.ip,
-                )
-            return connected
-        except Exception as exc:
-            log.error("PLC connection failed (%s): %s", self._cfg.ip, exc)
-            self._is_connected_cached = False
-            return False
+        with self._lifecycle_lock, self._lock:
+            try:
+                # A previous disconnect can still be finishing a blocked I/O.
+                # Never accept commands when no worker can clear their pulses.
+                if self._pulse_worker_stop.is_set():
+                    if self._pulse_thread.is_alive():
+                        log.warning("PLC reconnect deferred: previous pulse worker is still stopping.")
+                        return False
+                    self._pulse_worker_stop.clear()
+                    self._pulse_thread = threading.Thread(
+                        target=self._pulse_worker_loop, name="PLCPulseWorker", daemon=True
+                    )
+                    self._pulse_thread.start()
+                if self.is_connected():
+                    return True
+                if self._needs_connect:
+                    try:
+                        self._client.disconnect()
+                    except Exception:
+                        log.debug("Discarding failed PLC transport before reconnect.", exc_info=True)
+                self._client.connect(self._cfg.ip, self._cfg.rack, self._cfg.slot)
+                connected = bool(self._client.get_connected())
+                self._is_connected_cached = connected
+                self._needs_connect = not connected
+                self._connection_cache_time = time.monotonic()
+                if connected:
+                    log.info("PLC connected (%s).", self._cfg.ip)
+                else:
+                    log.warning("PLC connection handshake failed (%s).", self._cfg.ip)
+                return connected
+            except Exception as exc:
+                log.error("PLC connection failed (%s): %s", self._cfg.ip, exc)
+                self._mark_disconnected()
+                return False
 
     def disconnect(self) -> None:
         """Gracefully disconnect from the PLC and cancel pending pulses."""
-        with self._lock:
-            for handle, _generation in list(self._pulse_timers.values()):
-                if hasattr(handle, "cancel"):
-                    handle.cancel()
-            self._pulse_timers.clear()
-            self._pulse_generations.clear()
-            self._pulse_expiries.clear()
-            self._pulse_worker_event.set()
-            try:
-                self._client.disconnect()
-                self._is_connected_cached = False
-                log.info("PLC disconnected.")
-            except Exception as exc:
-                log.warning("Error during PLC disconnect: %s", exc)
+        with self._lifecycle_lock:
+            with self._lock:
+                self._pulse_worker_stop.set()
+                for handle, _generation in list(self._pulse_timers.values()):
+                    if hasattr(handle, "cancel"):
+                        handle.cancel()
+                self._pulse_timers.clear()
+                self._pulse_generations.clear()
+                self._pulse_expiries.clear()
+                self._pulse_starts.clear()
+                self._pulse_worker_event.set()
+                try:
+                    self._client.disconnect()
+                    log.info("PLC disconnected.")
+                except Exception as exc:
+                    log.warning("Error during PLC disconnect: %s", exc)
+                finally:
+                    self._is_connected_cached = False
+                    self._needs_connect = True
+                    self._connection_cache_time = time.monotonic()
+
+            if self._pulse_thread is not threading.current_thread():
+                self._pulse_thread.join(timeout=1.0)
 
     def is_connected(self) -> bool:
         """
@@ -204,6 +232,8 @@ class PLCController:
         import time as _time
 
         with self._lock:
+            if self._needs_connect:
+                return False
             now = _time.monotonic()
             if now - self._connection_cache_time < self._CONNECTION_CACHE_TTL:
                 return self._is_connected_cached
@@ -218,7 +248,16 @@ class PLCController:
     def _mark_disconnected(self) -> None:
         """Flag the connection as lost after an I/O error (lock must be held)."""
         self._is_connected_cached = False
+        self._needs_connect = True
         self._connection_cache_time = 0.0  # Invalidate TTL cache immediately
+
+    def _notify_tx(self, message: str) -> None:
+        """A display/log callback must never turn successful I/O into a retry."""
+        if self.tx_callback is not None:
+            try:
+                self.tx_callback(message)
+            except Exception:
+                log.exception("PLC transmit notification failed after successful write.")
 
     # ------------------------------------------------------------------
     # Data Block reads
@@ -226,16 +265,7 @@ class PLCController:
 
     def validate_motion_layout(self) -> None:
         """PC-supervised motion requires dedicated status bits, never REAL bytes."""
-        off = self._cfg.offsets
-        real_names = ("j1_target", "j2_target", "j3_target", "j4_target",
-                      "theta_j1", "theta_j2", "theta_j3", "py_j2_ht", "pz_j3_ht",
-                      "px_j1_ht", "px_j1", "py_j2", "pz_j3", "theta_j2_ht",
-                      "theta_j3_ht", "theta_j1_ht")
-        for flag in ("motion_done_byte", "error_flag_byte"):
-            for name in real_names:
-                offset = getattr(off, name)
-                if offset >= 0 and offset <= getattr(off, flag) < offset + 4:
-                    raise ValueError(f"PLC {flag} overlaps REAL {name}; match dedicated status bytes to the TIA DB before PC-Master motion.")
+        validate_motion_layout(self._cfg.offsets)
 
     def read_status(self) -> dict[str, Any]:
         """
@@ -256,7 +286,7 @@ class PLCController:
                 raw: bytearray = self._client.db_read(
                     self._cfg.db_number, 0, self._db_read_size
                 )
-                return {
+                status = {
                     # AUTO block (offset 0.x)
                     "start_auto": get_bool(raw, *ADDR.START_AUTO),
                     "pause": get_bool(raw, *ADDR.PAUSE),
@@ -307,6 +337,10 @@ class PLCController:
                     "hang_tot": get_bool(raw, off.hang_tot_byte, off.hang_tot_bit),
                     "hang_xau": get_bool(raw, off.hang_xau_byte, off.hang_xau_bit),
                 }
+                if any(isinstance(value, float) and not math.isfinite(value)
+                       for value in status.values()):
+                    raise ValueError("PLC status contains a non-finite REAL value.")
+                return status
             except Exception as exc:
                 log.error("DB read error: %s", exc)
                 self._mark_disconnected()
@@ -332,6 +366,10 @@ class PLCController:
         if not bit_values:
             return True
         with self._lock:
+            if self._motion_inhibited:
+                allowed = {ADDR.STOP_ROBOT, (self._cfg.offsets.error_ack_byte, self._cfg.offsets.error_ack_bit)}
+                if any(value and (byte_offset, bit) not in allowed for bit, value in bit_values.items()):
+                    return False
             if not self.is_connected():
                 return False
             try:
@@ -367,17 +405,31 @@ class PLCController:
         ):
             groups.setdefault(byte_off, {})[bit_off] = value
 
-        for byte_off, bit_values in groups.items():
-            if not self.write_bits(byte_off, bit_values):
-                return False
+        with self._lock:
+            if len(groups) == 1:
+                # Default layout remains a single atomic byte update.
+                byte_off, bit_values = next(iter(groups.items()))
+                if not self.write_bits(byte_off, bit_values):
+                    return False
+            else:
+                # A PLC scan may run between DB writes. Deassert VALID first,
+                # stage every label bit, and assert VALID only after success.
+                trigger = (off.phan_loai_hang_byte, off.phan_loai_hang_bit)
+                if not self.write_bit(*trigger, False):
+                    return False
+                groups[trigger[0]][trigger[1]] = False
+                for byte_off, bit_values in groups.items():
+                    if not self.write_bits(byte_off, bit_values):
+                        return False
+                if not self.write_bit(*trigger, True):
+                    return False
 
         label = "HANG_TOT" if is_good else "HANG_XAU"
-        if self.tx_callback:
-            self.tx_callback(f"Classification written: {label}")
+        self._notify_tx(f"Classification written: {label}")
         log.info("Classification written to PLC: is_good=%s", is_good)
         return True
 
-    def clear_classification(self) -> None:
+    def clear_classification(self) -> bool:
         """Reset all classification bits to False on the PLC."""
         off = self._cfg.offsets
         groups: dict[int, dict[int, bool]] = {}
@@ -388,98 +440,141 @@ class PLCController:
         ):
             groups.setdefault(byte_off, {})[bit_off] = False
 
-        for byte_off, bit_values in groups.items():
-            self.write_bits(byte_off, bit_values)
-
-        log.info("Classification bits cleared on PLC.")
+        with self._lock:
+            # Preserve insertion order: the classification-valid bit is first.
+            results = [self.write_bits(byte_off, bit_values)
+                       for byte_off, bit_values in groups.items()]
+        cleared = all(results)
+        if cleared:
+            log.info("Classification bits cleared on PLC.")
+        return cleared
 
     def _pulse_worker_loop(self) -> None:
-        """Background daemon: sequentially handles pulse falling edges without thread creation."""
-        import time as _time
-
+        """Schedule both pulse edges; never sleep with the client lock held."""
+        import time
         while not self._pulse_worker_stop.is_set():
-            now = _time.monotonic()
-            due: list[tuple[int, int, int]] = []
-
-            with self._lock:
-                # Find all expired pulses
-                for key, expiry in list(self._pulse_expiries.items()):
-                    if now >= expiry:
-                        gen = self._pulse_generations.get(key, 0)
-                        due.append((key[0], key[1], gen))
-                        self._pulse_expiries.pop(key, None)
-
-            for byte_off, bit_off, gen in due:
-                self._finish_pulse(byte_off, bit_off, gen)
-
-            # Determine next sleep duration
-            timeout = 0.5
-            with self._lock:
-                if self._pulse_expiries:
-                    earliest = min(self._pulse_expiries.values())
-                    timeout = max(0.01, earliest - _time.monotonic())
-
-            self._pulse_worker_event.wait(timeout)
             self._pulse_worker_event.clear()
+            with self._lock:
+                now = time.monotonic()
+                for key, (due, generation) in list(self._pulse_starts.items()):
+                    if now >= due:
+                        self._start_pulse(*key, generation)
+                for key, due in list(self._pulse_expiries.items()):
+                    if now >= due:
+                        self._finish_pulse(*key, self._pulse_generations.get(key, 0))
+                deadlines = list(self._pulse_expiries.values())
+                deadlines += [due for due, _ in self._pulse_starts.values()]
+                timeout = max(0.001, min(deadlines) - time.monotonic()) if deadlines else 0.5
+            self._pulse_worker_event.wait(timeout)
 
     def send_pulse(self, byte_offset: int, bit_offset: int) -> bool:
-        """
-        Simulate a push-button press: write True immediately, then reset to
-        False after :data:`PULSE_WIDTH_S` seconds via a single worker thread.
+        """Accept a pulse; repeated pulses rise after a scheduled 50 ms LOW gap.
 
-        A repeated pulse on the same bit cancels the pending reset first,
-        so pulses never stack up threads or leave a bit stuck at True.
-        Generation counters guarantee a stale reset callback can never
-        truncate the rising edge of a newer pulse.
+        True means the first edge was written or a repeated edge was queued.
+        Later I/O failures are logged and observed by motion status supervision.
+        STOP uses stop_motion() so disconnect cannot truncate its assertion.
         """
-        import time as _time
-
+        import time
         key = (byte_offset, bit_offset)
-
+        if key == ADDR.STOP_ROBOT:
+            return self.stop_motion()
         with self._lock:
-            previous = self._pulse_timers.pop(key, None)
+            if self._pulse_worker_stop.is_set():
+                return False
+            ack = (self._cfg.offsets.error_ack_byte, self._cfg.offsets.error_ack_bit)
+            if self._motion_inhibited and key != ack:
+                return False
+            active = key in self._pulse_timers
+            if active and not self.write_bit(*key, False):
+                return False
+            if active:
+                self._pulse_low_since[key] = time.monotonic()
+            self._pulse_starts.pop(key, None)
+            self._pulse_expiries.pop(key, None)
             generation = self._pulse_generations.get(key, 0) + 1
             self._pulse_generations[key] = generation
-            if previous is not None and hasattr(previous[0], "cancel"):
-                previous[0].cancel()
-
-            # A repeated command needs an observable LOW before the next edge.
-            if previous is not None:
-                threading.Event().wait(0.05)
-            if not self.write_bit(byte_offset, bit_offset, True):
-                self._pulse_expiries.pop(key, None)
-                return False
-            self._pulse_expiries[key] = _time.monotonic() + self.PULSE_WIDTH_S
-            handle = _PulseHandle(lambda b=byte_offset, o=bit_offset: self.cancel_pulse(b, o))
+            handle = _PulseHandle(lambda: self._finish_pulse(*key, generation))
             self._pulse_timers[key] = (handle, generation)
+            due = self._pulse_low_since.get(key, -1.0) + 0.05
+            if due > time.monotonic():
+                self._pulse_starts[key] = (due, generation)
+                accepted = True
+            else:
+                accepted = self._start_pulse(*key, generation)
+            self._pulse_worker_event.set()
+            return accepted
 
-        self._pulse_worker_event.set()
-        return True
-
-    def cancel_pulse(self, byte_offset: int, bit_offset: int) -> None:
-        """Immediately cancel a pending pulse and reset the bit to False."""
-        key = (byte_offset, bit_offset)
-        with self._lock:
-            self._pulse_timers.pop(key, None)
-            self._pulse_expiries.pop(key, None)
-            self.write_bit(byte_offset, bit_offset, False)
-
-    def _finish_pulse(self, byte_offset: int, bit_offset: int, generation: int) -> None:
-        """
-        Complete a pulse by resetting the bit (runs sequentially or on demand).
-
-        Skips the reset when superseded by a newer pulse on the same bit —
-        otherwise the stale ``False`` write would erase the new pulse's
-        ``True`` edge before the PLC has sampled it.
-        """
+    def _start_pulse(self, byte_offset: int, bit_offset: int, generation: int) -> bool:
+        import time
         key = (byte_offset, bit_offset)
         with self._lock:
             entry = self._pulse_timers.get(key)
             if entry is None or entry[1] != generation:
-                return  # Superseded by a newer pulse – do not reset.
+                return False
+            self._pulse_starts.pop(key, None)
+            if not self.write_bit(*key, True):
+                self._pulse_timers.pop(key, None)
+                return False
+            self._pulse_expiries[key] = time.monotonic() + self.PULSE_WIDTH_S
+            return True
+
+    def cancel_pulse(self, byte_offset: int, bit_offset: int) -> None:
+        import time
+        key = (byte_offset, bit_offset)
+        with self._lock:
             self._pulse_timers.pop(key, None)
+            self._pulse_starts.pop(key, None)
             self._pulse_expiries.pop(key, None)
-            self.write_bit(byte_offset, bit_offset, False)
+            self.write_bit(*key, False)
+            self._pulse_low_since[key] = time.monotonic()
+
+    def _finish_pulse(self, byte_offset: int, bit_offset: int, generation: int) -> None:
+        key = (byte_offset, bit_offset)
+        with self._lock:
+            entry = self._pulse_timers.get(key)
+            if entry is None or entry[1] != generation:
+                return
+            self.cancel_pulse(*key)
+
+    def stop_motion(self) -> bool:
+        """Inhibit further commands and latch STOP; retain gripper state.
+
+        STOP remains asserted through disconnect until an explicit healthy reset.
+        This is a software stop request, not proof that the machine has stopped.
+        """
+        with self._lock:
+            self._motion_inhibited = True
+            for key in list(self._pulse_timers):
+                self.cancel_pulse(*key)
+            self._pulse_starts.clear()
+            self._pulse_expiries.clear()
+            jog_cleared = self.write_bits(80, {bit: False for bit in range(6)})
+            ok = self.write_bit(*ADDR.STOP_ROBOT, True)
+            if not jog_cleared:
+                log.error("Could not clear JOG commands while requesting STOP.")
+            self._pulse_worker_event.set()
+            return ok
+
+    def resume_commands(self) -> bool:
+        with self._lock:
+            # Clear level-held motion inputs before releasing STOP. In
+            # particular, a failed JOG clear at stop time must not restart JOG.
+            for byte, bits in ((0, {0: False, 1: False}),
+                               (16, {1: False, 2: False, 3: False, 5: False, 6: False}),
+                               (80, {bit: False for bit in range(6)})):
+                if not self.write_bits(byte, bits):
+                    return False
+            if not self.write_bit(*ADDR.STOP_ROBOT, False):
+                return False
+            self._motion_inhibited = False
+            return True
+
+    def acknowledge_error(self) -> bool:
+        off = self._cfg.offsets
+        if off.error_ack_byte < 0:
+            log.warning("No PLC error-ack bit configured; acknowledge the fault on the PLC.")
+            return False
+        return self.send_pulse(off.error_ack_byte, off.error_ack_bit)
 
     def send_command(self, cmd: int) -> bool:
         """
@@ -526,11 +621,16 @@ class PLCController:
             ``True`` when db_write succeeds; ``False`` when the PLC is not
             connected, no valid offset is configured, or the write raises.
         """
-        import math
-        if not all(math.isfinite(value) for value in (j1, j2, j3, j4)):
+        try:
+            valid = all(math.isfinite(value) for value in (j1, j2, j3, j4))
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
             log.error("Non-finite joint targets rejected.")
             return False
         with self._lock:
+            if self._motion_inhibited:
+                return False
             if not self.is_connected():
                 log.warning("write_joint_targets skipped – PLC not connected.")
                 return False
@@ -562,11 +662,21 @@ class PLCController:
                         groups[-1].append((offset, value))
                     else:
                         groups.append([(offset, value)])
+                encoded = []
                 for group in groups:
                     buf = bytearray(4 * len(group))
                     for index, (_, value) in enumerate(group):
                         set_real(buf, 4 * index, value)
-                    self._client.db_write(self._cfg.db_number, group[0][0], buf)
+                    encoded.append((group[0][0], buf))
+            except (TypeError, ValueError, OverflowError) as exc:
+                log.error("Invalid PLC REAL target: %s", exc)
+                return False
+
+            try:
+                # Encode the entire request before the first write. A bad last
+                # joint must not leave earlier groups partially updated.
+                for offset, buf in encoded:
+                    self._client.db_write(self._cfg.db_number, offset, buf)
                 min_offset = targets[0][0]
                 buf_len = 4 * len(targets)
 
@@ -583,12 +693,12 @@ class PLCController:
                 )
                 if self.tx_callback:
                     if off.j4_target >= 0:
-                        self.tx_callback(
+                        self._notify_tx(
                             f"Write Targets: J1={j1:.2f}°, J2={j2:.2f}°, "
                             f"J3={j3:.2f}°, J4={j4:.2f}°"
                         )
                     else:
-                        self.tx_callback(
+                        self._notify_tx(
                             f"Write Targets (3-DOF): J1={j1:.2f}°, J2={j2:.2f}°, "
                             f"J3={j3:.2f}°"
                         )
@@ -612,24 +722,25 @@ class PLCController:
         For the QR autonomous mode use :meth:`write_joint_targets` instead –
         it writes the same data but does **not** pulse any command bit.
         """
-        wrote = self.write_joint_targets(j1, j2, j3, j4)
-        if wrote:
-            # Pulse the START_AUTO bit to command motion execution
-            if not self.send_pulse(*ADDR.START_AUTO):
-                return False
-            log.debug(
-                "send_joint_targets: triggered START_AUTO after writing "
-                "J1=%.2f J2=%.2f J3=%.2f J4=%.2f.",
-                j1,
-                j2,
-                j3,
-                j4,
-            )
-        return wrote
+        with self._lock:
+            wrote = self.write_joint_targets(j1, j2, j3, j4)
+            if wrote:
+                # Pulse the START_AUTO bit to command motion execution
+                if not self.send_pulse(*ADDR.START_AUTO):
+                    return False
+                log.debug(
+                    "send_joint_targets: triggered START_AUTO after writing "
+                    "J1=%.2f J2=%.2f J3=%.2f J4=%.2f.",
+                    j1,
+                    j2,
+                    j3,
+                    j4,
+                )
+            return wrote
 
     def send_joint_targets_and_command(
         self, j1: float, j2: float, j3: float, j4: float, cmd: int
-    ) -> None:
+    ) -> bool:
         """
         Write joint targets then issue a specific command pulse.
 
@@ -639,13 +750,41 @@ class PLCController:
         and then calls :meth:`send_command` once – ensuring exactly one pulse
         per move command regardless of which variant the caller uses.
         """
-        if cmd == self._cfg.commands.move:
-            # START_AUTO is already included in send_joint_targets
-            self.send_joint_targets(j1, j2, j3, j4)
-        else:
-            # Write targets without START_AUTO, then pulse the requested command
-            if self.write_joint_targets(j1, j2, j3, j4):
-                self.send_command(cmd)
+        with self._lock:
+            if cmd == self._cfg.commands.move:
+                # START_AUTO is already included in send_joint_targets
+                return self.send_joint_targets(j1, j2, j3, j4)
+            else:
+                # Write targets without START_AUTO, then pulse the requested command
+                if self.write_joint_targets(j1, j2, j3, j4):
+                    return self.send_command(cmd)
+                return False
+
+    def _write_real_fields(self, fields: tuple[tuple[int, float], ...], label: str) -> bool:
+        """Validate the complete payload before any DB write or motion trigger."""
+        try:
+            encoded = []
+            for offset, value in fields:
+                if not math.isfinite(value):
+                    raise ValueError("values must be finite")
+                buf = bytearray(4)
+                set_real(buf, 0, value)
+                encoded.append((offset, buf))
+        except (TypeError, ValueError, OverflowError) as exc:
+            log.error("Invalid %s payload: %s", label, exc)
+            return False
+        with self._lock:
+            if self._motion_inhibited or not self.is_connected():
+                return False
+            try:
+                for offset, buf in encoded:
+                    self._client.db_write(self._cfg.db_number, offset, buf)
+            except Exception as exc:
+                log.error("Failed to send %s data: %s", label, exc)
+                self._mark_disconnected()
+                return False
+        log.info("Sent %s data.", label)
+        return True
 
     def send_forward_kinematics_data(
         self,
@@ -655,37 +794,13 @@ class PLCController:
         x: float,
         y: float,
         z: float,
-    ) -> None:
+    ) -> bool:
         """Write THETA_J1, THETA_J2, THETA_J3, Py_J2_HT, Pz_J3_HT, Px_J1_HT to PLC."""
-        with self._lock:
-            if not self.is_connected():
-                return
-            try:
-                off = self._cfg.offsets
-                for offset, value in (
-                    (off.theta_j1, j1),
-                    (off.theta_j2, j2),
-                    (off.theta_j3, j3),
-                    (off.py_j2_ht, y),
-                    (off.pz_j3_ht, z),
-                    (off.px_j1_ht, x),
-                ):
-                    buf = bytearray(4)
-                    set_real(buf, 0, value)
-                    self._client.db_write(self._cfg.db_number, offset, buf)
-
-                log.info(
-                    "Sent FK data: Theta=[%.2f, %.2f, %.2f], XYZ=[%.2f, %.2f, %.2f]",
-                    j1,
-                    j2,
-                    j3,
-                    x,
-                    y,
-                    z,
-                )
-            except Exception as exc:
-                log.error("Failed to send FK data: %s", exc)
-                self._mark_disconnected()
+        off = self._cfg.offsets
+        return self._write_real_fields((
+            (off.theta_j1, j1), (off.theta_j2, j2), (off.theta_j3, j3),
+            (off.py_j2_ht, y), (off.pz_j3_ht, z), (off.px_j1_ht, x),
+        ), "FK")
 
     def send_inverse_kinematics_data(
         self,
@@ -695,34 +810,10 @@ class PLCController:
         j1: float,
         j2: float,
         j3: float,
-    ) -> None:
+    ) -> bool:
         """Write PX_J1, PY_J2, PZ_J3, THETA_J2_HT, THETA_J3_HT, THETA_J1_HT to PLC."""
-        with self._lock:
-            if not self.is_connected():
-                return
-            try:
-                off = self._cfg.offsets
-                for offset, value in (
-                    (off.px_j1, x),
-                    (off.py_j2, y),
-                    (off.pz_j3, z),
-                    (off.theta_j2_ht, j2),
-                    (off.theta_j3_ht, j3),
-                    (off.theta_j1_ht, j1),
-                ):
-                    buf = bytearray(4)
-                    set_real(buf, 0, value)
-                    self._client.db_write(self._cfg.db_number, offset, buf)
-
-                log.info(
-                    "Sent IK data: XYZ=[%.2f, %.2f, %.2f], Theta=[%.2f, %.2f, %.2f]",
-                    x,
-                    y,
-                    z,
-                    j1,
-                    j2,
-                    j3,
-                )
-            except Exception as exc:
-                log.error("Failed to send IK data: %s", exc)
-                self._mark_disconnected()
+        off = self._cfg.offsets
+        return self._write_real_fields((
+            (off.px_j1, x), (off.py_j2, y), (off.pz_j3, z),
+            (off.theta_j2_ht, j2), (off.theta_j3_ht, j3), (off.theta_j1_ht, j1),
+        ), "IK")

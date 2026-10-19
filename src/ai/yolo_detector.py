@@ -119,19 +119,13 @@ class YOLODetector:
         camera_read_timeout: float = 2.0,
         calibration_path: str = "",
         class_quality: dict[str, str] | None = None,
+        lazy_model: bool = False,
     ) -> None:
-        resolved = self._resolve_model_path(model_path)
-        self.model: YOLO = YOLO(resolved, task="detect")
-
-        # Fail fast if the loaded model's task doesn't match 'detect'.
-        # Note: in test/mock contexts, model.task may be a MagicMock
-        # (non-string) — skip validation in that case.
-        model_task = getattr(self.model, "task", "detect")
-        if isinstance(model_task, str) and model_task != "detect":
-            raise ValueError(
-                f"YOLO model at '{resolved}' has task='{model_task}' but "
-                f"'detect' is required. Check model_path or retrain for detection."
-            )
+        self._model_path = model_path
+        self._model = None
+        self._model_lock = threading.Lock()
+        if not lazy_model:
+            self.model  # Validate weights immediately for Vision startup.
 
         self.class_quality = {"0": "BAD", "1": "GOOD"} if class_quality is None else dict(class_quality)
         self.thresh: float = float(thresh)
@@ -142,6 +136,7 @@ class YOLODetector:
         self.inference_height: int = inference_height
         self.camera_read_timeout: float = camera_read_timeout
         self._cap: cv2.VideoCapture | None = None
+        self._camera_lock = threading.RLock()
         self._current_idx: int = 0
         self._last_robot_x: float | None = None
         self._last_robot_y: float | None = None
@@ -168,7 +163,7 @@ class YOLODetector:
         log.info(
             "YOLODetector initialised – model=%s thresh=%.2f px2mm=%.3f "
             "inference=%dx%d timeout=%.1fs calibration=%s",
-            resolved,
+            model_path,
             thresh,
             px2mm,
             inference_width,
@@ -177,13 +172,32 @@ class YOLODetector:
             "loaded" if self._calibration_loaded else "none (px2mm fallback)",
         )
 
+    @property
+    def model(self):
+        """QR mode does not need detection weights until Vision is requested."""
+        if self._model is not None:
+            return self._model
+        with self._model_lock:
+            if self._model is None:
+                resolved = self._resolve_model_path(self._model_path)
+                model = YOLO(resolved, task="detect")
+                model_task = getattr(model, "task", "detect")
+                if isinstance(model_task, str) and model_task != "detect":
+                    raise ValueError(f"YOLO model at '{resolved}' has task='{model_task}'; 'detect' is required.")
+                self._model = model
+            return self._model
+
+    @model.setter
+    def model(self, value):
+        self._model = value
+
     def _load_calibration(self, path: str) -> None:
         """
         Load camera intrinsics from an OpenCV-format YAML/JSON calibration file.
 
         Expected keys: ``camera_matrix`` and ``distortion_coefficients``
         (as produced by ``cv2.calibrateCamera`` and ``cv2.FileStorage``).
-        Falls back silently to px2mm when the file is missing or malformed.
+        Logs a warning and falls back to px2mm for a missing or malformed file.
         """
         root = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.join(os.path.dirname(__file__), "..", "..")
         resolved = os.path.abspath(os.path.join(root, path))
@@ -192,6 +206,7 @@ class YOLODetector:
                 "Calibration file not found: %s – falling back to px2mm.", resolved
             )
             return
+        fs = None
         try:
             fs = cv2.FileStorage(resolved, cv2.FILE_STORAGE_READ)
             cam_node = fs.getNode("camera_matrix")
@@ -201,15 +216,22 @@ class YOLODetector:
                     "Calibration file missing camera_matrix or "
                     "distortion_coefficients – falling back to px2mm."
                 )
-                fs.release()
                 return
-            self._camera_matrix = cam_node.mat()
-            self._dist_coeffs = dist_node.mat()
+            matrix, distortion = cam_node.mat(), dist_node.mat()
+            if (matrix is None or matrix.shape != (3, 3) or not np.isfinite(matrix).all()
+                    or distortion is None or distortion.size not in (4, 5, 8, 12, 14)
+                    or not np.isfinite(distortion).all()
+                    or matrix[0, 0] <= 0 or matrix[1, 1] <= 0):
+                raise ValueError("Invalid camera matrix or distortion coefficients.")
+            self._camera_matrix = matrix
+            self._dist_coeffs = distortion
             self._calibration_loaded = True
-            fs.release()
             log.info("Camera calibration loaded from %s", resolved)
         except Exception as exc:
             log.warning("Failed to load calibration from %s: %s", resolved, exc)
+        finally:
+            if fs is not None:
+                fs.release()
 
     def _probe_cameras_background(self) -> None:
         """Probe available cameras in a background thread to prevent UI freezing."""
@@ -265,97 +287,48 @@ class YOLODetector:
     # ------------------------------------------------------------------
 
     def start_camera(self, usb_idx: int = 0) -> bool:
-        """
-        Open a USB camera device and start the background read thread.
-
-        Parameters
-        ----------
-        usb_idx:
-            OpenCV device index (0 = first USB camera).
-
-        Returns
-        -------
-        bool
-            ``True`` if the camera opened successfully.
-        """
-        self._stop_read_thread()
-        # Wait for camera probe to finish to avoid DSHOW resource contention
-        self._camera_probe_done.wait(timeout=3.0)
-        with YOLODetector._probe_lock:
-            self._current_idx = usb_idx
-            self._cap = cv2.VideoCapture(usb_idx, _CAM_BACKEND)
-
-            # Retry once if first open attempt fails (DSHOW can be finicky)
-            if not self._cap.isOpened():
-                log.warning(
-                    "First open attempt failed for camera %d, retrying...", usb_idx
-                )
-                time.sleep(0.5)
-                self._cap = cv2.VideoCapture(usb_idx, _CAM_BACKEND)
-
-            if not self._cap.isOpened():
-                log.error("Failed to open camera at index %d.", usb_idx)
-                # Release the failed handle – repeated retries would leak
-                # DSHOW device handles otherwise.
-                self._release_capture()
+        """Open a camera without reusing a capture still owned by a reader."""
+        with self._camera_lock:
+            if not self._stop_read_thread():
+                log.error("Camera switch deferred: previous driver read is still blocked.")
                 return False
-
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        # Test read: some DSHOW cameras report isOpened()=True but fail to
-        # produce frames immediately. Try a quick read to verify.
-        test_ok = False
-        try:
-            for attempt in range(3):
-                ret, test_frame = self._cap.read()
-                if ret and test_frame is not None:
-                    test_ok = True
+            self._release_capture()
+            while True:
+                try:
+                    self._read_queue.get_nowait()
+                except queue.Empty:
                     break
-                time.sleep(0.3)
-        except Exception:
-            # Mock/test environments may not support unpacking cap.read()
-            pass
-
-        if not test_ok:
-            log.warning(
-                "Camera %d opened but test frame read failed. "
-                "Starting read thread anyway (DSHOW may need warm-up time).",
-                usb_idx,
+            self._camera_probe_done.wait(timeout=3.0)
+            with YOLODetector._probe_lock:
+                self._current_idx = usb_idx
+                for attempt in range(2):
+                    self._cap = cv2.VideoCapture(usb_idx, _CAM_BACKEND)
+                    if self._cap.isOpened():
+                        break
+                    self._release_capture()
+                    if attempt == 0:
+                        time.sleep(0.5)
+                else:
+                    log.error("Failed to open camera at index %d.", usb_idx)
+                    return False
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self._undistort_map1 = self._undistort_map2 = None
+            self._undistort_frame_size = None
+            self._last_robot_x = self._last_robot_y = None
+            # Each worker owns a capture and cancellation event for its entire
+            # lifetime. A slow old reader can never use a newly opened camera.
+            self._read_stop = threading.Event()
+            self._read_thread = threading.Thread(
+                target=self._camera_read_loop,
+                args=(self._cap, self._read_stop),
+                name="CameraReadThread", daemon=True,
             )
-
-        self._read_stop.clear()
-        self._read_thread = threading.Thread(
-            target=self._camera_read_loop,
-            name="CameraReadThread",
-            daemon=True,
-        )
-        self._read_thread.start()
-        log.info("Camera %d opened successfully.", usb_idx)
-        return True
+            self._read_thread.start()
+            log.info("Camera %d opened successfully.", usb_idx)
+            return True
 
     def switch_camera(self, new_idx: int) -> bool:
-        """
-        Release the current camera and open a new one.
-
-        Parameters
-        ----------
-        new_idx:
-            OpenCV device index for the replacement camera.
-
-        Returns
-        -------
-        bool
-            ``True`` if the new camera opened successfully.
-        """
-        self._stop_read_thread()
-        # Drain queue to discard old frames
-        while not self._read_queue.empty():
-            try:
-                self._read_queue.get_nowait()
-            except queue.Empty:
-                break
-        self._release_capture()
-        log.info("Switching camera → index %d", new_idx)
+        """Stop the current reader before opening the requested camera."""
         return self.start_camera(new_idx)
 
     def available_cameras(self, max_index: int = 2) -> list[int]:
@@ -374,20 +347,22 @@ class YOLODetector:
         return [idx for idx in cameras if idx <= max_index]
 
     def stop(self) -> None:
-        """Stop the read thread and release the camera device."""
-        self._stop_read_thread()
-        # Poison pill to unblock read_frame; evict any stale frame first so
-        # the pill cannot be dropped by queue.Full.
-        try:
-            self._read_queue.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self._read_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        self._release_capture()
-        log.info("YOLODetector stopped.")
+        """Cancel reads; a blocked driver retains ownership until it returns."""
+        with self._camera_lock:
+            stopped = self._stop_read_thread()
+            try:
+                self._read_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._read_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            if stopped:
+                self._release_capture()
+                log.info("YOLODetector stopped.")
+            else:
+                log.warning("Camera driver still reading; capture will release when it returns.")
 
     def is_camera_active(self) -> bool:
         """Check if camera is currently active and readable."""
@@ -428,6 +403,9 @@ class YOLODetector:
         frame: np.ndarray,
         inference_w: int | None = None,
         inference_h: int | None = None,
+        *,
+        pixel_offset: tuple[float, float] = (0.0, 0.0),
+        pixel_origin: tuple[float, float] | None = None,
     ) -> DetectionResult:
         """
         Run YOLO inference on *frame* and return a detection result.
@@ -439,6 +417,9 @@ class YOLODetector:
         ----------
         frame:
             BGR frame captured from :meth:`read_frame`.
+        pixel_offset, pixel_origin:
+            Crop offset and calibration origin in ORIGINAL image pixels. With
+            no explicit origin, home_x/home_y correspond to the crop centre.
         inference_w, inference_h:
             Inference resolution override. When ``None`` the instance
             defaults (``inference_width`` / ``inference_height``) are used.
@@ -472,7 +453,10 @@ class YOLODetector:
         # clean image (the crosshair was previously drawn before inference,
         # which could subtly interfere with detection).
         has_defect, robot_x, robot_y, class_id, class_name = self._run_inference(
-            inference_frame, frame_cx, frame_cy
+            inference_frame, frame_cx, frame_cy,
+            pixel_scale=(w_orig / w, h_orig / h),
+            pixel_offset=pixel_offset,
+            pixel_origin=pixel_origin or (pixel_offset[0] + w_orig / 2.0, pixel_offset[1] + h_orig / 2.0),
         )
 
         # Draw centre crosshair AFTER inference
@@ -519,81 +503,91 @@ class YOLODetector:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _camera_read_loop(self) -> None:
+    def _camera_read_loop(self, capture, stop_event) -> None:
         """Background thread: continuously read frames into the queue."""
-        while not self._read_stop.is_set():
-            if self._cap is None or not self._cap.isOpened():
-                time.sleep(0.1)  # Throttle CPU when camera is inactive/opening
-                continue
-            try:
-                ret, frame = self._cap.read()
-            except Exception as exc:
-                if self._read_stop.is_set():
+        try:
+            while not stop_event.is_set():
+                if capture is None or not capture.isOpened():
+                    stop_event.wait(0.1)  # Throttle CPU when camera is inactive/opening
+                    continue
+                try:
+                    ret, frame = capture.read()
+                except Exception as exc:
+                    if stop_event.is_set():
+                        break
+                    log.warning("OpenCV camera read exception: %s", exc)
+                    stop_event.wait(0.1)
+                    continue
+                if stop_event.is_set():
                     break
-                log.warning("OpenCV camera read exception: %s", exc)
-                time.sleep(0.1)
-                continue
-            if not ret or frame is None:
-                time.sleep(0.01)  # Throttle CPU on transient read failures
-                continue
+                if not ret or frame is None:
+                    stop_event.wait(0.01)  # Throttle CPU on transient read failures
+                    continue
 
-            # Apply undistortion when camera calibration is loaded
-            if self._calibration_loaded and self._camera_matrix is not None:
-                if self._undistort_map1 is None:
+                # Apply undistortion when camera calibration is loaded
+                if self._calibration_loaded and self._camera_matrix is not None:
                     h, w = frame.shape[:2]
-                    new_mtx, _roi = cv2.getOptimalNewCameraMatrix(
-                        self._camera_matrix, self._dist_coeffs, (w, h), 1, (w, h)
-                    )
-                    self._undistort_map1, self._undistort_map2 = (
-                        cv2.initUndistortRectifyMap(
-                            self._camera_matrix,
-                            self._dist_coeffs,
-                            None,
-                            new_mtx,
-                            (w, h),
-                            cv2.CV_16SC2,
+                    if self._undistort_map1 is None or self._undistort_frame_size != (w, h):
+                        self._undistort_frame_size = (w, h)
+                        new_mtx, _roi = cv2.getOptimalNewCameraMatrix(
+                            self._camera_matrix, self._dist_coeffs, (w, h), 1, (w, h)
                         )
+                        self._undistort_map1, self._undistort_map2 = (
+                            cv2.initUndistortRectifyMap(
+                                self._camera_matrix,
+                                self._dist_coeffs,
+                                None,
+                                new_mtx,
+                                (w, h),
+                                cv2.CV_16SC2,
+                            )
+                        )
+                    frame = cv2.remap(
+                        frame,
+                        self._undistort_map1,
+                        self._undistort_map2,
+                        cv2.INTER_LINEAR,
                     )
-                frame = cv2.remap(
-                    frame,
-                    self._undistort_map1,
-                    self._undistort_map2,
-                    cv2.INTER_LINEAR,
-                )
 
-            # Keep-Newest frame queue: evict stale frame if queue is full
-            try:
-                self._read_queue.get_nowait()
-            except queue.Empty:
-                pass
+                # Keep-Newest frame queue: evict stale frame if queue is full
+                try:
+                    self._read_queue.get_nowait()
+                except queue.Empty:
+                    pass
 
-            try:
-                self._read_queue.put_nowait(frame)
-                self._dropped_frames = 0
-            except queue.Full:
-                self._dropped_frames += 1
-                # Log warning every 5 seconds if frames are being dropped
-                current_time = time.time()
-                if (
-                    self._dropped_frames > 10
-                    and (current_time - self._last_drop_warning) > 5.0
-                ):
-                    log.warning(
-                        "Frame drops detected (%d consecutive). Consider reducing inference load.",
-                        self._dropped_frames,
-                    )
-                    self._last_drop_warning = current_time
+                try:
+                    self._read_queue.put_nowait(frame)
+                    self._dropped_frames = 0
+                except queue.Full:
+                    self._dropped_frames += 1
+                    # Log warning every 5 seconds if frames are being dropped
+                    current_time = time.time()
+                    if (
+                        self._dropped_frames > 10
+                        and (current_time - self._last_drop_warning) > 5.0
+                    ):
+                        log.warning(
+                            "Frame drops detected (%d consecutive). Consider reducing inference load.",
+                            self._dropped_frames,
+                        )
+                        self._last_drop_warning = current_time
+        finally:
+            capture.release()
 
-    def _stop_read_thread(self) -> None:
-        """Signal and join the camera read thread."""
+    def _stop_read_thread(self) -> bool:
+        """Do not forget a worker that remains blocked inside a device driver."""
         if self._read_thread is not None:
             self._read_stop.set()
             self._read_thread.join(timeout=3.0)
+            if self._read_thread.is_alive():
+                return False
             self._read_thread = None
+            self._cap = None  # Released by the worker's finally block.
+        return True
 
     def _release_capture(self) -> None:
-        if self._cap is not None and self._cap.isOpened():
-            self._cap.release()
+        if self._cap is not None:
+            self._cap.release()  # Failed opens also own native resources.
         self._cap = None
 
     def _draw_crosshair(self, frame: np.ndarray) -> np.ndarray:
@@ -618,7 +612,10 @@ class YOLODetector:
         return frame
 
     def _run_inference(
-        self, frame: np.ndarray, frame_cx: float, frame_cy: float
+        self, frame: np.ndarray, frame_cx: float, frame_cy: float,
+        *, pixel_scale: tuple[float, float] = (1.0, 1.0),
+        pixel_offset: tuple[float, float] = (0.0, 0.0),
+        pixel_origin: tuple[float, float] | None = None,
     ) -> tuple[bool, float, float, int, str]:
         """
         Execute YOLO inference on *frame* and return detection results.
@@ -637,6 +634,11 @@ class YOLODetector:
         -------
         has_defect, robot_x, robot_y, class_id, class_name
         """
+        origin_x, origin_y = pixel_origin if pixel_origin is not None else (frame_cx, frame_cy)
+        geometry = (pixel_scale, pixel_offset, (origin_x, origin_y))
+        if getattr(self, "_last_geometry", None) != geometry:
+            self._last_robot_x = self._last_robot_y = None
+            self._last_geometry = geometry
         results = self.model(frame, verbose=False, conf=self.thresh)
         boxes = results[0].boxes
 
@@ -673,15 +675,17 @@ class YOLODetector:
 
             # Per-box coordinates for the overlay label (robot_x/robot_y keep
             # the FIRST detection's values as the returned pick target).
-            box_robot_x = self.home_x + (defect_cx - frame_cx) * self.px2mm
-            box_robot_y = self.home_y + (defect_cy - frame_cy) * self.px2mm
+            source_x = pixel_offset[0] + defect_cx * pixel_scale[0]
+            source_y = pixel_offset[1] + defect_cy * pixel_scale[1]
+            box_robot_x = self.home_x + (source_x - origin_x) * self.px2mm
+            box_robot_y = self.home_y + (source_y - origin_y) * self.px2mm
 
             # Apply coordinate hysteresis to stabilize stationary objects (reduce UI jitter)
             if self._last_robot_x is not None and self._last_robot_y is not None:
                 if abs(box_robot_x - self._last_robot_x) < 3.0 and abs(box_robot_y - self._last_robot_y) < 3.0:
                     box_robot_x = self._last_robot_x
                     box_robot_y = self._last_robot_y
-            
+
             # Store the stabilized coordinates of the first detected object to use as hysteresis center
             if not has_defect_hysteresis_set:
                 self._last_robot_x = box_robot_x

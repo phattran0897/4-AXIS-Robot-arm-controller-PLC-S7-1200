@@ -51,7 +51,6 @@ Usage
 from __future__ import annotations
 
 import math
-import threading
 
 
 # ── DH link parameters (mm) – defaults; overridden via configure() ──────────
@@ -64,11 +63,12 @@ A4: float = 74.0  # link-4 / end-effector length (a₄)
 # ── Joint limits – imported from central module src.kinematics.joint_limits ──
 from src.kinematics.joint_limits import (
     JOINT_LIMITS,
+    _limits_lock,
     configure_joint_limits,
     validate_joint_angles,
 )
 
-_cfg_lock = threading.Lock()
+_cfg_lock = _limits_lock
 
 
 def configure(
@@ -97,19 +97,23 @@ def configure(
             "a3": A3 if a3 is None else float(a3),
             "a4": A4 if a4 is None else float(a4),
         }
+        if not all(math.isfinite(value) for value in new_values.values()):
+            raise ValueError("Link parameters must be finite.")
+        if new_values["a1"] < 0:
+            raise ValueError("Link parameter a1 must be non-negative.")
         for key in ("d1", "a2", "a3", "a4"):
             if new_values[key] <= 0.0:
                 raise ValueError(
                     f"Link parameter {key} must be positive "
                     f"(got {new_values[key]})."
                 )
+        if limits is not None:
+            configure_joint_limits(limits)
         A1 = new_values["a1"]
         D1 = new_values["d1"]
         A2 = new_values["a2"]
         A3 = new_values["a3"]
         A4 = new_values["a4"]
-        if limits:
-            configure_joint_limits(limits)
 
 
 class InverseKinematicsError(Exception):
@@ -195,12 +199,15 @@ def forward_kinematics(
     t23 = math.radians(j2 + j3)
     t234 = math.radians(j2 + j3 + j4)
 
+    with _cfg_lock:
+        a1, d1, a2, a3, a4 = A1, D1, A2, A3, A4
+
     # Horizontal projection (radial distance from Z-axis)
-    r = A4 * math.cos(t234) + A3 * math.cos(t23) + A2 * math.cos(t2) + A1
+    r = a4 * math.cos(t234) + a3 * math.cos(t23) + a2 * math.cos(t2) + a1
 
     px = r * math.cos(t1)
     py = r * math.sin(t1)
-    pz = D1 + A3 * math.sin(t23) + A2 * math.sin(t2) + A4 * math.sin(t234)
+    pz = d1 + a3 * math.sin(t23) + a2 * math.sin(t2) + a4 * math.sin(t234)
     pitch = j2 + j3 + j4
 
     return px, py, pz, pitch
@@ -252,7 +259,7 @@ def inverse_kinematics(
 
     Examples
     --------
-    >>> j1, j2, j3, j4 = inverse_kinematics(405.0, 0.0, 300.0, phi=0.0)
+    >>> j1, j2, j3, j4 = inverse_kinematics(454.0, 0.0, 189.6, phi=0.0)
     >>> round(j1, 1), round(j2, 1), round(j3, 1), round(j4, 1)
     (0.0, 0.0, 0.0, 0.0)
     """
@@ -270,6 +277,12 @@ def _inverse_kinematics_impl(
     check_limits: bool = True,
 ) -> tuple[float, float, float, float]:
     """Internal IK implementation (shared by ``inverse_kinematics`` and ``reachable``)."""
+    with _cfg_lock:
+        return _solve_inverse(x, y, z, phi, elbow, check_limits)
+
+
+def _solve_inverse(x, y, z, phi, elbow, check_limits):
+    """Solve against a consistent geometry and joint-limit configuration."""
 
     if not all(math.isfinite(value) for value in (x, y, z, phi)):
         raise WorkspaceError("IK coordinates and pitch must be finite.")

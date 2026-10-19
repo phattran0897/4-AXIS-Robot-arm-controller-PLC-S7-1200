@@ -391,6 +391,7 @@ class TestPLCController(unittest.TestCase):
 
         cfg = _make_robot_config().plc
         ctrl = PLCController(cfg)
+        self.addCleanup(ctrl.disconnect)
         mock_client = MagicMock()
         ctrl._client = mock_client
         return ctrl, mock_client
@@ -625,6 +626,7 @@ class TestYOLODetector(unittest.TestCase):
                 detector = YOLODetector(model_path="fake.pt", thresh=0.5)
             detector._cap = old_cap
             detector.switch_camera(1)
+            self.addCleanup(detector.stop)
 
         old_cap.release.assert_called_once()
 
@@ -1088,6 +1090,7 @@ class TestPulseRaceRegression(unittest.TestCase):
 
         cfg = _make_robot_config().plc
         ctrl = PLCController(cfg)
+        self.addCleanup(ctrl.disconnect)
         mock_client = MagicMock()
         mock_client.get_connected.return_value = True
         ctrl._client = mock_client
@@ -1620,6 +1623,7 @@ class TestPLCBufferContents(unittest.TestCase):
 
         cfg = _make_robot_config().plc
         ctrl = PLCController(cfg)
+        self.addCleanup(ctrl.disconnect)
         mock_client = MagicMock()
         mock_client.get_connected.return_value = True
         mock_client.db_read.return_value = bytearray(1)
@@ -1665,6 +1669,7 @@ class TestPLCBufferContents(unittest.TestCase):
             j4_target=-1,
         )
         ctrl = PLCController(cfg)
+        self.addCleanup(ctrl.disconnect)
         mock_client = MagicMock()
         mock_client.get_connected.return_value = True
         mock_client.db_read.return_value = bytearray(1)
@@ -1700,6 +1705,7 @@ class TestPLCBufferContents(unittest.TestCase):
             j4_target=-1,
         )
         ctrl = PLCController(cfg)
+        self.addCleanup(ctrl.disconnect)
         mock_client = MagicMock()
         mock_client.get_connected.return_value = True
         mock_client.db_read.return_value = bytearray(1)

@@ -68,14 +68,17 @@ class StabilityTracker:
             if dist > self.threshold_mm:
                 self.reset()
                 self._last_x, self._last_y = x, y
-                self._has_previous = True
-                return False
+                return self.update(x, y)
             return True
 
         if not self._has_previous:
             self._last_x, self._last_y = x, y
             self._has_previous = True
             self._stable_count = 1
+            if self.required_frames <= 1:
+                self._locked = True
+                self._locked_x, self._locked_y = x, y
+                return True
             return False
 
         dist = math.hypot(x - self._last_x, y - self._last_y)

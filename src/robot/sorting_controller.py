@@ -70,6 +70,9 @@ class SortingController:
         self.plc_commands: PLCCommands = plc_commands
 
         self._qr_lock = threading.RLock()
+        self._action_lock = threading.RLock()
+        self._cycle_running = False
+        self._cancel_event = threading.Event()
         self._state: RobotState = RobotState.IDLE
         self._counter_good: int = 0
         self._counter_bad: int = 0
@@ -87,7 +90,7 @@ class SortingController:
         self._previous_joints: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
 
         # Synchronization event used for precise, mockable delays (avoiding bare time.sleep)
-        self._wait_event: threading.Event = threading.Event()
+        self._wait_event: threading.Event = self._cancel_event
 
         self._validate_waypoints()
 
@@ -156,7 +159,8 @@ class SortingController:
 
     def is_idle(self) -> bool:
         """Check if robot state is IDLE (ready for next task)."""
-        return self._state == RobotState.IDLE
+        with self._action_lock:
+            return self._state == RobotState.IDLE and not self._cycle_running
 
     @property
     def current_joints(self) -> tuple[float, float, float, float]:
@@ -178,13 +182,109 @@ class SortingController:
         log.info("Sorting counters reset to zero.")
 
     def clear_error(self) -> None:
-        """Reset the internal controller state to IDLE after an error has been resolved."""
-        self._state = RobotState.IDLE
-        self._last_sort_result = None
-        with self._qr_lock:
-            self._last_qr_value = None
-            self._last_qr_retry_time = 0.0
+        """Reset local state only when no cycle is still executing."""
+        with self._action_lock:
+            if self._cycle_running:
+                raise RuntimeError("Cannot reset a running sorting cycle.")
+            self._cancel_event.clear()
+            self._wait_event.clear()
+            self._state = RobotState.IDLE
+            self._last_sort_result = None
+            with self._qr_lock:
+                self._last_qr_value = None
+                self._last_qr_retry_time = 0.0
         log.info("SortingController error state cleared; reset to IDLE.")
+
+    def request_stop(self) -> bool:
+        """Cancel waits immediately and fence subsequent motion/gripper commands."""
+        self._cancel_event.set()
+        self._wait_event.set()
+        with self._action_lock:
+            self._state = RobotState.ERROR
+            return self.plc.stop_motion()
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_event.is_set():
+            raise RuntimeError("Sorting cancelled; explicit reset required.")
+
+    def _begin_cycle(self) -> None:
+        with self._action_lock:
+            self._check_cancelled()
+            if self._cycle_running or self._state != RobotState.IDLE:
+                raise RuntimeError("Sorting controller is not ready for a new cycle.")
+            self._cycle_running = True
+            self._state = RobotState.MOVING_PICK
+
+    def _end_cycle(self) -> None:
+        with self._action_lock:
+            self._cycle_running = False
+
+    def _set_cycle_state(self, state: RobotState) -> None:
+        with self._action_lock:
+            self._check_cancelled()
+            self._state = state
+
+    def _complete_cycle(self, result: SortResult) -> None:
+        """Publish success only after PLC cleanup and before accepting new work."""
+        with self._action_lock:
+            self._dispatch(self.plc.clear_classification)
+            self._check_cancelled()
+            with self._qr_lock:
+                if result == SortResult.GOOD:
+                    self._counter_good += 1
+                else:
+                    self._counter_bad += 1
+            self._state = RobotState.IDLE
+
+    def _abort_cycle(self, error: Exception) -> None:
+        self._state = RobotState.ERROR
+        try:
+            self.request_stop()
+            self.plc.clear_classification()
+        except Exception:
+            log.exception("Best-effort PLC stop/cleanup failed after %s", error)
+
+    def _dispatch(self, operation, *args) -> None:
+        with self._action_lock:
+            self._check_cancelled()
+            if operation(*args) is False:
+                raise RuntimeError(f"PLC {getattr(operation, '__name__', getattr(operation, '_mock_name', 'write/command'))} failed; cycle aborted.")
+
+    def _delay(self, seconds: float) -> None:
+        self._check_cancelled()
+        self._wait_event.wait(seconds)
+        self._check_cancelled()
+
+    def _wait_for_motion(self, timeout: float, interval: float = 0.05) -> None:
+        """Accept fresh LOW/HIGH; tolerate at most two missing status samples.
+
+        Read recovery never sends a new command. A missing sample invalidates
+        the busy observation, so recovery must observe LOW again before HIGH.
+        The original deadline is retained across retries.
+        """
+        deadline = time.monotonic() + timeout
+        saw_busy = False
+        failures = 0
+        while True:
+            self._check_cancelled()
+            status = self.plc.read_status()
+            self._check_cancelled()
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Motion timed out after {timeout:.1f}s without a fresh motion_done transition.")
+            if not status or not isinstance(status.get("motion_done"), bool):
+                failures += 1
+                saw_busy = False
+                if failures >= 3:
+                    raise RuntimeError("PLC offline during active pick-and-place motion (3 failed reads).")
+            else:
+                failures = 0
+                if status.get("error_flag", False):
+                    raise RuntimeError("PLC error flag activated during active motion.")
+                if not status.get("motion_done", False):
+                    saw_busy = True
+                elif saw_busy:
+                    return
+            self._delay(min(interval, max(0, deadline - time.monotonic())))
 
     def _ik(self, x: float, y: float, z: float) -> tuple[float, float, float, float]:
         """
@@ -209,8 +309,14 @@ class SortingController:
             return self._last_qr_value == qr_value
 
     def process_qr_target(self, qr_value: str) -> bool:
-        with self._qr_lock:
-            return self._process_qr_target(qr_value)
+        with self._action_lock:
+            if qr_value != "CLEAR" and (
+                self._cancel_event.is_set() or self._cycle_running
+                or self._state != RobotState.IDLE
+            ):
+                return False
+            with self._qr_lock:
+                return self._process_qr_target(qr_value)
 
     def _process_qr_target(self, qr_value: str) -> bool:
         """
@@ -289,6 +395,7 @@ class SortingController:
             result.name,
         )
 
+        self._begin_cycle()
         try:
             # Reject an invalid DB layout before writing any cycle trigger bits.
             self.plc.validate_motion_layout()
@@ -296,37 +403,30 @@ class SortingController:
             self._last_sort_result = result
 
             # 0. Write classification to PLC (atomic bit-group write)
-            if self.plc.write_classification(result == SortResult.GOOD) is False:
-                raise RuntimeError("Failed to write classification; cycle aborted.")
+            self._dispatch(self.plc.write_classification, result == SortResult.GOOD)
 
             # 1. Pick (approach -> lower -> close gripper -> retreat)
-            self._state = RobotState.MOVING_PICK
+            self._set_cycle_state(RobotState.MOVING_PICK)
             self._pick(pick_x, pick_y)
 
             # 2. Place (approach bin -> lower -> open gripper -> retreat)
-            self._state = RobotState.MOVING_PLACE
+            self._set_cycle_state(RobotState.MOVING_PLACE)
             self._place(result)
 
             # 3. Return Home
-            self._state = RobotState.RETURNING
+            self._set_cycle_state(RobotState.RETURNING)
             self._return_home()
 
-            # Increment Statistics
-            if result == SortResult.GOOD:
-                self._counter_good += 1
-            else:
-                self._counter_bad += 1
-
-            # 4. Clear classification bits after cycle complete
-            self.plc.clear_classification()
+            self._complete_cycle(result)
 
             log.info("PC Master sort cycle completed successfully.")
 
         except Exception as exc:
-            self._state = RobotState.ERROR
-            self.plc.clear_classification()
+            self._abort_cycle(exc)
             log.error("Error during sorting cycle: %s", exc)
             raise
+        finally:
+            self._end_cycle()
 
     def execute_sort_plc_sequence(
         self, pick_x: float, pick_y: float, result: SortResult
@@ -341,41 +441,23 @@ class SortingController:
             pick_y,
             result.name,
         )
+        self._begin_cycle()
         try:
             self.plc.validate_motion_layout()
             self._last_sort_result = result
-            if self.plc.write_classification(result == SortResult.GOOD) is False:
-                raise RuntimeError("Failed to write classification; cycle aborted.")
-            if self.plc.send_pulse(*ADDR.START_AUTO) is False:
-                raise RuntimeError("Failed to dispatch sequence command.")
-            self._state = RobotState.MOVING_PICK
+            self._dispatch(self.plc.write_classification, result == SortResult.GOOD)
+            self._dispatch(self.plc.send_pulse, *ADDR.START_AUTO)
+            self._set_cycle_state(RobotState.MOVING_PICK)
 
-            # Wait for PLC sequence to complete
-            deadline = time.monotonic() + 60.0
-            saw_busy = False
-            while True:
-                status = self.plc.read_status()
-                if not status or status.get("error_flag", False):
-                    raise RuntimeError("PLC error during autonomous sequence.")
-                if not status.get("motion_done", False):
-                    saw_busy = True
-                elif saw_busy:
-                    break
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("PLC autonomous sequence timed out.")
-                self._wait_event.wait(0.1)
+            self._wait_for_motion(60.0, interval=0.1)
 
-            if result == SortResult.GOOD:
-                self._counter_good += 1
-            else:
-                self._counter_bad += 1
-            self.plc.clear_classification()
-            self._state = RobotState.IDLE
+            self._complete_cycle(result)
         except Exception as exc:
-            self._state = RobotState.ERROR
-            self.plc.clear_classification()
+            self._abort_cycle(exc)
             log.error("PLC sequence cycle failed: %s", exc)
             raise
+        finally:
+            self._end_cycle()
 
     def _pick(self, x: float, y: float) -> None:
         """Mirror pick waypoints, monitor PLC health, actuate the gripper."""
@@ -399,14 +481,13 @@ class SortingController:
         )
 
         # Actuate gripper close
-        self._state = RobotState.GRIPPING
+        self._set_cycle_state(RobotState.GRIPPING)
         log.info("Closing gripper (GRIP = True)")
-        if self.plc.write_bit(*ADDR.GRIP, True) is False:
-            raise RuntimeError("Failed to close gripper.")
-        self._wait_event.wait(self.positions.gripper_delay)
+        self._dispatch(self.plc.write_bit, *ADDR.GRIP, True)
+        self._delay(self.positions.gripper_delay)
 
         # Raise back to z_up linearly
-        self._state = RobotState.MOVING_PICK
+        self._set_cycle_state(RobotState.MOVING_PICK)
         self._move_l_and_wait(
             x, y, self.positions.pick_z_down,
             x, y, self.positions.pick_z_up,
@@ -439,14 +520,13 @@ class SortingController:
         )
 
         # Actuate gripper open
-        self._state = RobotState.RELEASING
+        self._set_cycle_state(RobotState.RELEASING)
         log.info("Opening gripper (GRIP = False)")
-        if self.plc.write_bit(*ADDR.GRIP, False) is False:
-            raise RuntimeError("Failed to open gripper.")
-        self._wait_event.wait(self.positions.gripper_delay)
+        self._dispatch(self.plc.write_bit, *ADDR.GRIP, False)
+        self._delay(self.positions.gripper_delay)
 
         # Raise back to z_up linearly
-        self._state = RobotState.MOVING_PLACE
+        self._set_cycle_state(RobotState.MOVING_PLACE)
         self._move_l_and_wait(
             target.x, target.y, target.z_down,
             target.x, target.y, target.z_up,
@@ -457,7 +537,6 @@ class SortingController:
         """Bring all joints back to home coordinates and idle state."""
         log.info("Returning to home (0,0,0,0)")
         self._move_and_wait(0.0, 0.0, 0.0, 0.0, cmd=self.plc_commands.home)
-        self._state = RobotState.IDLE
 
     def _move_l_and_wait(
         self,
@@ -521,10 +600,11 @@ class SortingController:
             Absolute upper bound on the wait in seconds.
         """
         self.plc.validate_motion_layout()
-        if timeout <= 0:
+        self._check_cancelled()
+        import math
+        if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Motion timeout must be positive.")
         target = (j1, j2, j3, j4)
-        self._current_joints = target
         log.info(
             "Waypoint (commanded): J1=%.2f J2=%.2f J3=%.2f J4=%.2f",
             j1,
@@ -533,43 +613,15 @@ class SortingController:
             j4,
         )
 
-        # 1. Transmit joint targets to PLC
-        if cmd is not None:
-            # Write targets WITHOUT START_AUTO, then fire the specific command pulse
-            # (e.g. MOVE_TO_HOME).  This guarantees exactly one pulse per move.
-            if self.plc.write_joint_targets(j1, j2, j3, j4) is False:
-                raise RuntimeError("Failed to write joint targets; command suppressed.")
-            if self.plc.send_command(cmd) is False:
-                raise RuntimeError("Failed to dispatch motion command.")
-        else:
-            # Standard vision/auto mode: write targets + pulse START_AUTO (one combined call)
-            if self.plc.send_joint_targets(j1, j2, j3, j4) is False:
-                raise RuntimeError("Failed to send joint targets.")
-
-        deadline = time.monotonic() + timeout
-
-        # Allow brief settling time for PLC to register motion start
-        self._wait_event.wait(0.05)
-
-        # PLC contract: each command must hold motion_done LOW until the PC
-        # observes it, then raise it only after this waypoint is reached.
-        # A stale HIGH must never authorize the next gripper action.
-        saw_busy = False
-        while True:
-            status = self.plc.read_status()
-            if not status:
-                raise RuntimeError("PLC offline during active pick-and-place motion.")
-            if status.get("error_flag", False):
-                raise RuntimeError("PLC error flag activated during active motion.")
-            if not status.get("motion_done", False):
-                saw_busy = True
-            elif saw_busy:
-                break
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Motion to targets (J1={j1:.1f}°, J2={j2:.1f}°, J3={j3:.1f}°, J4={j4:.1f}°) "
-                    f"timed out after {timeout:.1f}s without a fresh motion_done transition."
-                )
-            self._wait_event.wait(0.05)
-
+        # Fence target and command together against concurrent STOP.
+        with self._action_lock:
+            self._check_cancelled()
+            if cmd is not None:
+                if self.plc.write_joint_targets(j1, j2, j3, j4) is False:
+                    raise RuntimeError("Failed to write joint targets; command suppressed.")
+                self._dispatch(self.plc.send_command, cmd)
+            else:
+                self._dispatch(self.plc.send_joint_targets, j1, j2, j3, j4)
+            self._current_joints = target
+        self._wait_for_motion(timeout)
         self._previous_joints = target
